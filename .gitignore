@@ -1,0 +1,18 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+data/state/
+config/feishu_tables.toml
+.tmp-wheel/
+.tmp-workbook-analysis/
+*.sqlite
+*.db
+
+# IDE / venv / logs
+.venv/
+.idea/
+*.log

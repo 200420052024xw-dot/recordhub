@@ -1,0 +1,66 @@
+# 所有时间都按这里的时区解释。修改后重启服务生效。
+timezone = "Asia/Shanghai"
+
+# Workflow1 只在次日启动一次；后续阶段由确认事件推进。
+[workflows.workflow1_daily]
+enabled = true
+schedule_type = "daily"
+time = "08:10"
+material_days_ago = 1
+
+# 从 anchor_date 起每三天执行一次，分析最近三个完整自然日。
+[workflows.s04_progress]
+enabled = true
+schedule_type = "interval_days"
+time = "09:00"
+every_days = 3
+anchor_date = "2026-01-01"
+material_days = 3
+
+# 月度流程默认每月 1 日运行，材料范围为上一自然月。
+[workflows.s05_people_suggestions]
+enabled = true
+schedule_type = "monthly"
+time = "09:30"
+day = 1
+material_period = "previous_month"
+
+[workflows.s06_ideas]
+enabled = true
+schedule_type = "monthly"
+time = "10:00"
+day = 1
+material_period = "previous_month"
+
+[workflows.s07_meeting_focus]
+enabled = true
+schedule_type = "monthly"
+time = "10:30"
+day = 1
+material_period = "previous_month"
+
+# weekly 的 weekday 使用 mon/tue/wed/thu/fri/sat/sun。
+[workflows.s08_public_technology]
+enabled = true
+schedule_type = "weekly"
+time = "09:00"
+weekday = "mon"
+material_period = "previous_week"
+
+[workflows.s09_public_training]
+enabled = true
+schedule_type = "weekly"
+time = "09:30"
+weekday = "mon"
+material_period = "previous_week"
+
+# 提醒流程和业务流程分开配置，方便只调整提醒时刻。
+[workflows.daily_log_reminder]
+enabled = true
+schedule_type = "daily"
+time = "20:00"
+
+[workflows.pending_confirmation_reminder]
+enabled = true
+schedule_type = "daily"
+time = "16:00"
