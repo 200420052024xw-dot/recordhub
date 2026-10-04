@@ -14,6 +14,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import Depends, FastAPI, Header, HTTPException
 
 from config import AppSettings, load_env_file, load_schedule_config
+from analysis.models import AnalysisRequest, AnalysisConfirmation, NotificationReconciliation
+from analysis.periods import PERIODIC_CODES
 from config.schedules import ScheduleConfig, WorkflowSchedule
 from schema import Organization, PersonCreateRequest, PersonUpdateRequest
 from service.bitable_events import BitableEventStream
@@ -146,6 +148,58 @@ def _register_routes(app: FastAPI, runtime: Runtime, settings: AppSettings) -> N
         return _organization_payload(organization)
 
 
+    def analysis_workflow():
+        if runtime.analysis is None:
+            raise HTTPException(status_code=503, detail="Analysis pipeline is not registered")
+        return runtime.analysis
+
+    def analysis_error(exc):
+        if isinstance(exc, HTTPException):
+            return exc
+        return HTTPException(status_code=403 if isinstance(exc, PermissionError) else 400,
+                             detail=str(exc))
+
+    @app.post("/admin/analyses", dependencies=[Depends(require_admin)])
+    def run_analysis(request: AnalysisRequest) -> dict:
+        try:
+            return analysis_workflow().run(request).model_dump(mode="json")
+        except Exception as exc:
+            raise analysis_error(exc) from exc
+
+    @app.get("/admin/analyses/{run_id}", dependencies=[Depends(require_admin)])
+    def get_analysis(run_id: str) -> dict:
+        try:
+            run = analysis_workflow().store.load(run_id)
+            if run is None:
+                raise ValueError("分析任务不存在")
+            return run.model_dump(mode="json")
+        except Exception as exc:
+            raise analysis_error(exc) from exc
+
+    @app.post("/admin/analyses/{run_id}/resume", dependencies=[Depends(require_admin)])
+    def resume_analysis(run_id: str) -> dict:
+        try:
+            return analysis_workflow().resume(run_id).model_dump(mode="json")
+        except Exception as exc:
+            raise analysis_error(exc) from exc
+
+    @app.post("/admin/analyses/{run_id}/confirm", dependencies=[Depends(require_admin)])
+    def confirm_analysis(run_id: str, request: AnalysisConfirmation) -> dict:
+        try:
+            return analysis_workflow().confirm(run_id, user_id=request.user_id,
+                content=request.content).model_dump(mode="json")
+        except Exception as exc:
+            raise analysis_error(exc) from exc
+
+    @app.post("/admin/analyses/{run_id}/notifications/reconcile", dependencies=[Depends(require_admin)])
+    def reconcile_analysis_notification(run_id: str, request: NotificationReconciliation) -> dict:
+        try:
+            return analysis_workflow().reconcile_notification(run_id,
+                message_id=request.message_id, blocked=request.blocked).model_dump(mode="json")
+        except Exception as exc:
+            raise analysis_error(exc) from exc
+
+
 def _organization_payload(organization: Organization) -> dict:
     return {
         "team_leader_id": organization.team_leader_id,
@@ -189,6 +243,9 @@ def _make_lifespan(runtime: Runtime, settings: AppSettings, schedules: ScheduleC
             logger.exception("organization_refresh_failed_using_persisted_cache")
         for binding in runtime.workflows.values():
             binding.workflow.recover_incomplete()
+        if settings.analysis_enabled and runtime.analysis is not None:
+            runtime.analysis.recover()
+            runtime.analysis.catch_up(schedules)
         if settings.event_stream_enabled:
             stream = BitableEventStream(
                 handlers=_event_handlers(runtime),
@@ -264,4 +321,28 @@ def _build_scheduler(
         cleanup, "cron", hour=3, minute=30, id="snapshot_cleanup",
         replace_existing=True, max_instances=1, coalesce=True,
     )
+    if settings.analysis_enabled and runtime.analysis is not None:
+        def run_periodic(name: str) -> None:
+            today = datetime.now(ZoneInfo(schedules.timezone)).date()
+            runtime.analysis.dispatch(schedules.workflows[name], today)
+
+        def recover_analysis() -> None:
+            runtime.analysis.recover()
+            runtime.analysis.catch_up(schedules)
+
+        for name in PERIODIC_CODES:
+            item = schedules.workflows.get(name)
+            if item is None or not item.enabled:
+                continue
+            hour, minute = map(int, item.time.split(":"))
+            options = {}
+            if item.schedule_type == "weekly":
+                options["day_of_week"] = item.options["weekday"]
+            elif item.schedule_type == "monthly":
+                options["day"] = item.options["day"]
+            scheduler.add_job(run_periodic, "cron", args=[name],
+                hour=hour, minute=minute, **options, id=name,
+                replace_existing=True, max_instances=1, coalesce=True)
+        scheduler.add_job(recover_analysis, "interval", minutes=15,
+            id="analysis_recovery", replace_existing=True, max_instances=1, coalesce=True)
     return scheduler
