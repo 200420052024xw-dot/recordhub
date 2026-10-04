@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from schema.base import StrictModel, TableDefinition
 
@@ -51,6 +51,18 @@ class Organization(StrictModel):
         return result
 
 
+class LogResource(StrictModel):
+    resource_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    category: Literal["课程", "技术"]
+    description: str = ""
+
+    @field_validator("resource_id", "name", "description", mode="before")
+    @classmethod
+    def clean_text(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
 class WorkLog(StrictModel):
     log_id: str
     source_record_id: str | None = None
@@ -61,6 +73,8 @@ class WorkLog(StrictModel):
     reflection: str = ""
     other: str = ""
     full_log: str = ""
+    achievement_refs: list[str] = Field(default_factory=list)
+    resources: list[LogResource] = Field(default_factory=list)
 
     def content(self) -> str:
         if not any((self.progress, self.difficulties, self.reflection, self.other)):

@@ -2,11 +2,11 @@
 
 from schema.base import JsonDict, StrictModel, TableDefinition
 from schema.domain import (CloudObject, Department, FinalEvaluation, Organization,
-                           Person, PersonCreateRequest, PersonUpdateRequest,
+                           LogResource, Person, PersonCreateRequest, PersonUpdateRequest,
                            SubmissionStatus, TableConfig, WorkLog, WorkflowRun)
 
 __all__ = [
     "CloudObject", "Department", "FinalEvaluation", "JsonDict", "Organization",
-    "Person", "PersonCreateRequest", "PersonUpdateRequest", "StrictModel",
+    "LogResource", "Person", "PersonCreateRequest", "PersonUpdateRequest", "StrictModel",
     "SubmissionStatus", "TableConfig", "TableDefinition", "WorkLog", "WorkflowRun",
 ]
