@@ -101,6 +101,7 @@ class Workflow1:
                         raise ValueError("组织关系异常：" + "；".join(organization.anomalies))
                     logs, read_issues = self.log_repository.get_logs_by_date(
                         target_date, organization=organization)
+                    self.log_repository.backfill_full_logs(logs)
                     snapshot = SnapshotBuilder().build(
                         workflow_run_id=run.workflow_run_id, target_date=target_date,
                         organization=organization, logs=logs, now=utc_now())

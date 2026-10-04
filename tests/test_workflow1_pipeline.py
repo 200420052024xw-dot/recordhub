@@ -119,7 +119,20 @@ class Workflow1PipelineTests(unittest.TestCase):
         self.assertEqual(first[1], {})
         self.assertEqual(len(bitable.created), 3)
         self.assertEqual(set(bitable.created[0]), set(fields.values()) - {"评价人"})
-        self.assertIsInstance(bitable.created[0]["工作日志"], str)
+        self.assertEqual(bitable.created[0]["工作日志"], "第一条")
+
+    def test_log_content_uses_four_sections_without_blank_lines(self):
+        log = WorkLog(
+            log_id="L", person_id="M", submitted_at=datetime.now(UTC),
+            progress="完成资料核对", difficulties="两条记录缺少编号",
+            reflection="应先校验数据再归档", other="明天补齐编号",
+            full_log="旧格式",
+        )
+        self.assertEqual(log.content(),
+            "工作进展:完成资料核对\n"
+            "工作困难:两条记录缺少编号\n"
+            "心得反思:应先校验数据再归档\n"
+            "其他:明天补齐编号")
 
     def test_report_index_uses_existing_columns_and_document_url(self):
         snapshot = sample_snapshot()

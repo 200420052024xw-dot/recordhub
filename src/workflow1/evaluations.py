@@ -29,6 +29,28 @@ class AiEvaluationRepository:
         self.table = config.tables["evaluations"]
         self.store = store
 
+    def backfill_source_logs(self, snapshot: DailySnapshot) -> int:
+        """Correct existing AI rows identified by the saved snapshot."""
+        field = self.table.fields["source_log"]
+        records = {
+            str(record.get("record_id", "")): record
+            for record in self.bitable.list_records(self.table.table_id)
+        }
+        updates = []
+        for log in snapshot.logs:
+            state = snapshot.log_evaluations.get(log.log_id)
+            if state is None or not state.record_id:
+                continue
+            record = records.get(state.record_id)
+            if record is None:
+                raise ValueError(f"AI 评价记录 {state.record_id} 不存在")
+            if scalar(record_fields(record).get(field)) != log.content():
+                updates.append({"record_id": state.record_id,
+                                "fields": {field: log.content()}})
+        for offset in range(0, len(updates), 500):
+            self.bitable.batch_update(self.table.table_id, updates[offset:offset + 500])
+        return len(updates)
+
     def publish(
         self, snapshot: DailySnapshot
     ) -> tuple[dict[str, tuple[str, str]], dict[str, str]]:
@@ -44,6 +66,7 @@ class AiEvaluationRepository:
         people = snapshot.organization.person_map()
         issues: dict[str, str] = {}
         existing = self.bitable.list_records(self.table.table_id)
+        existing_by_id = {str(record.get("record_id", "")): record for record in existing}
         by_evaluation: dict[str, tuple[str, str]] = {}
         source_rows: dict[str, list[dict]] = defaultdict(list)
         for record in existing:
@@ -52,8 +75,9 @@ class AiEvaluationRepository:
             evaluation_id = scalar(fields.get(f["evaluation_id"]))
             if record_id and evaluation_id:
                 by_evaluation[evaluation_id] = (record_id, evaluation_id)
-            for reference in references(fields.get(f["source_log"])):
-                source_rows[reference].append(record)
+            source = scalar(fields.get(f["source_log"]))
+            if source:
+                source_rows[source].append(record)
         mapped: dict[str, tuple[str, str]] = {}
         # log_id is None for marker rows, which need no local mapping.
         creates: list[tuple[str | None, dict]] = []
@@ -82,10 +106,14 @@ class AiEvaluationRepository:
                 snapshot.target_date, state.evaluator_id, state.log_id)
             hit = by_evaluation.get(key)
             if hit is not None:
+                if scalar(record_fields(existing_by_id[hit[0]]).get(f["source_log"])) != log.content():
+                    self.bitable.update_record(self.table.table_id, hit[0],
+                        {f["source_log"]: log.content()})
                 mapped[state.log_id] = hit
                 continue
             matches = []
-            for record in source_rows.get(log.source_record_id, []):
+            candidates = source_rows.get(log.source_record_id, []) + source_rows.get(log.content(), [])
+            for record in candidates:
                 if person.open_id not in references(
                         record_fields(record).get(f["person_ref"])):
                     raise ValueError(f"AI 评价表中日志 {log.log_id} 已有关联但人员不匹配")
@@ -98,12 +126,15 @@ class AiEvaluationRepository:
                 evaluation_id = scalar(record_fields(record).get(f["evaluation_id"]))
                 if not record_id or not evaluation_id:
                     raise ValueError(f"AI 评价表中日志 {log.log_id} 缺少评价编号")
+                if scalar(record_fields(record).get(f["source_log"])) != log.content():
+                    self.bitable.update_record(self.table.table_id, record_id,
+                        {f["source_log"]: log.content()})
                 mapped[state.log_id] = (record_id, evaluation_id)
                 continue
             creates.append((state.log_id, {
                 f["evaluation_id"]: key,
                 f["person_ref"]: [{"id": person.open_id}],
-                f["source_log"]: log.source_record_id,
+                f["source_log"]: log.content(),
                 f["evaluated_at"]: int(datetime.now().timestamp() * 1000),
                 f["positive_ai"]: state.positive_ai,
                 f["improvement_ai"]: state.improvement_ai,

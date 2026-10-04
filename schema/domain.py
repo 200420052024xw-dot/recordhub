@@ -63,14 +63,15 @@ class WorkLog(StrictModel):
     full_log: str = ""
 
     def content(self) -> str:
-        if self.full_log.strip():
+        if not any((self.progress, self.difficulties, self.reflection, self.other)):
             return self.full_log.strip()
-        return "\n\n".join(
-            (
-                f"工作进展：\n{self.progress or '未填写'}",
-                f"工作困难：\n{self.difficulties or '未填写'}",
-                f"心得反思：\n{self.reflection or '未填写'}",
-                f"其他：\n{self.other or '未填写'}",
+        return "\n".join(
+            f"{label}:{value.strip() or '未填写'}"
+            for label, value in (
+                ("工作进展", self.progress),
+                ("工作困难", self.difficulties),
+                ("心得反思", self.reflection),
+                ("其他", self.other),
             )
         )
 

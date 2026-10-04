@@ -318,6 +318,19 @@ class LogRepository:
         self.table = config.tables["logs"]
         self.organization_cache = organization_cache
 
+    def backfill_full_logs(self, logs: list[WorkLog]) -> int:
+        """Write the composed text to the source table when it differs."""
+        field = self.table.fields["full_log"]
+        updates = [
+            {"record_id": log.source_record_id,
+             "fields": {field: log.content()}}
+            for log in logs
+            if log.source_record_id and log.content() != log.full_log
+        ]
+        for offset in range(0, len(updates), 500):
+            self.bitable.batch_update(self.table.table_id, updates[offset:offset + 500])
+        return len(updates)
+
     def get_logs_by_date(
         self, target_date: date,
         organization: Organization | None = None,
@@ -426,4 +439,3 @@ class LogRepository:
             raise
         except Exception as exc:
             raise FeishuReadError(f"Unable to load logs for {target_date}") from exc
-
