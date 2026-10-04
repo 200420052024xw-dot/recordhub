@@ -5,9 +5,16 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 
-from data.repositories import SHANGHAI, _datetime, _fields, _references, _scalar
 from data.store import FileStateStore
-from schema import DailySnapshot, FinalEvaluation, TableConfig, UnitStatus
+from tool.bitable_fields import (
+    SHANGHAI,
+    field_datetime,
+    record_fields,
+    references,
+    scalar,
+)
+from schema import FinalEvaluation, TableConfig
+from workflow1.models import DailySnapshot, UnitStatus
 from tool.feishu import BitableService
 
 
@@ -40,12 +47,12 @@ class AiEvaluationRepository:
         by_evaluation: dict[str, tuple[str, str]] = {}
         source_rows: dict[str, list[dict]] = defaultdict(list)
         for record in existing:
-            fields = _fields(record)
+            fields = record_fields(record)
             record_id = str(record.get("record_id", ""))
-            evaluation_id = _scalar(fields.get(f["evaluation_id"]))
+            evaluation_id = scalar(fields.get(f["evaluation_id"]))
             if record_id and evaluation_id:
                 by_evaluation[evaluation_id] = (record_id, evaluation_id)
-            for reference in _references(fields.get(f["source_log"])):
+            for reference in references(fields.get(f["source_log"])):
                 source_rows[reference].append(record)
         mapped: dict[str, tuple[str, str]] = {}
         # log_id is None for marker rows, which need no local mapping.
@@ -79,8 +86,8 @@ class AiEvaluationRepository:
                 continue
             matches = []
             for record in source_rows.get(log.source_record_id, []):
-                if person.open_id not in _references(
-                        _fields(record).get(f["person_ref"])):
+                if person.open_id not in references(
+                        record_fields(record).get(f["person_ref"])):
                     raise ValueError(f"AI 评价表中日志 {log.log_id} 已有关联但人员不匹配")
                 matches.append(record)
             if len(matches) > 1:
@@ -88,7 +95,7 @@ class AiEvaluationRepository:
             if matches:
                 record = matches[0]
                 record_id = str(record.get("record_id", ""))
-                evaluation_id = _scalar(_fields(record).get(f["evaluation_id"]))
+                evaluation_id = scalar(record_fields(record).get(f["evaluation_id"]))
                 if not record_id or not evaluation_id:
                     raise ValueError(f"AI 评价表中日志 {log.log_id} 缺少评价编号")
                 mapped[state.log_id] = (record_id, evaluation_id)
@@ -130,7 +137,7 @@ class AiEvaluationRepository:
                 record_id = str(record.get("record_id", ""))
                 if not record_id:
                     raise ValueError(f"日志 {log_id} 创建后没有记录 ID")
-                evaluation_id = _scalar(_fields(record).get(f["evaluation_id"])) \
+                evaluation_id = scalar(record_fields(record).get(f["evaluation_id"])) \
                     or fields_sent[f["evaluation_id"]]
                 if log_id is not None:
                     mapped[log_id] = (record_id, evaluation_id)
@@ -143,7 +150,7 @@ class HumanEvaluationRepository:
         self.table = config.tables["human_evaluations"]
 
     def load_record_fields(self, record_id: str) -> dict:
-        return _fields(self.bitable.get_record(self.table.table_id, record_id))
+        return record_fields(self.bitable.get_record(self.table.table_id, record_id))
 
     def for_date(self, snapshot: DailySnapshot) -> list[dict]:
         records = self.bitable.list_records(self.table.table_id)
@@ -153,22 +160,22 @@ class HumanEvaluationRepository:
         end = datetime.combine(snapshot.target_date + timedelta(days=2),
                                datetime.min.time(), SHANGHAI)
         return [record for record in records
-                if _fields(record).get(field)
-                and snapshot.created_at <= _datetime(_fields(record)[field]) < end]
+                if record_fields(record).get(field)
+                and snapshot.created_at <= field_datetime(record_fields(record)[field]) < end]
 
     def parse(self, snapshot: DailySnapshot,
               record: dict) -> tuple[str, FinalEvaluation] | None:
         f = self.table.fields
-        values = _fields(record)
-        evaluation_id = _scalar(values.get(f["evaluation_id"]))
+        values = record_fields(record)
+        evaluation_id = scalar(values.get(f["evaluation_id"]))
         if not evaluation_id:
             return None
         matches = [state for state in snapshot.log_evaluations.values()
                    if state.evaluation_id == evaluation_id]
         if not matches:
             people = snapshot.organization.person_map()
-            person_refs = set(_references(values.get(f["person_ref"])))
-            authors = set(_references(values.get(f["submitted_by"])))
+            person_refs = set(references(values.get(f["person_ref"])))
+            authors = set(references(values.get(f["submitted_by"])))
             matches = [state for state in snapshot.log_evaluations.values()
                        if state.evaluator_id
                        and people[state.person_id].open_id in person_refs
@@ -181,22 +188,22 @@ class HumanEvaluationRepository:
         people = snapshot.organization.person_map()
         person = people[state.person_id]
         evaluator = people[state.evaluator_id]
-        supplied = set(_references(values.get(f["person_ref"])))
+        supplied = set(references(values.get(f["person_ref"])))
         if not supplied.intersection({person.person_id, person.name,
                                       person.open_id, person.source_record_id}):
             raise ValueError(f"人工评价 {evaluation_id} 的 person_ref 与快照不符")
-        evaluator_refs = set(_references(values.get(f["evaluator_ref"])))
+        evaluator_refs = set(references(values.get(f["evaluator_ref"])))
         if evaluator_refs and not evaluator_refs.intersection(
                 {evaluator.person_id, evaluator.name, evaluator.open_id,
                  evaluator.source_record_id}):
             raise ValueError(f"人工评价 {evaluation_id} 的 evaluator_ref 与快照不符")
-        authors = set(_references(values.get(f["submitted_by"])))
+        authors = set(references(values.get(f["submitted_by"])))
         allowed = {evaluator.person_id, evaluator.name,
                    evaluator.open_id, evaluator.source_record_id}
         if not authors.intersection(allowed):
             raise ValueError(f"人工评价 {evaluation_id} 的填写人不是直属评价人")
-        positive = _scalar(values.get(f["positive_final"])).strip()
-        improvement = _scalar(values.get(f["improvement_final"])).strip()
+        positive = scalar(values.get(f["positive_final"])).strip()
+        improvement = scalar(values.get(f["improvement_final"])).strip()
         if not positive or not improvement:
             return None
         key = evaluation_key(snapshot.target_date, state.evaluator_id, state.log_id)

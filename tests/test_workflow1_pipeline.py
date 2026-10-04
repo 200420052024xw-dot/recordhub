@@ -13,14 +13,15 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from data import FileStateStore
-from data.snapshot import SnapshotBuilder
-from schema import CloudObject, Department, Organization, Person, TableConfig, UnitStatus, WorkLog
+from workflow1.snapshot import SnapshotBuilder
+from schema import CloudObject, Department, Organization, Person, TableConfig, WorkLog
+from workflow1.models import DailySnapshot, UnitStatus
 from workflow1.documents import DailyDocuments
-from data.workflow1_evaluations import (AiEvaluationRepository,
+from workflow1.evaluations import (AiEvaluationRepository,
                                         HumanEvaluationRepository, evaluation_key)
 from workflow1.workflow import Workflow1
-from data.workflow1_reports import WorkflowReportRepository
-from schema import LogPromptOutput, WorkflowStatus
+from workflow1.reports import WorkflowReportRepository
+from workflow1.models import LogPromptOutput, WorkflowStatus
 
 DAY = date(2026, 10, 3)
 
@@ -142,7 +143,7 @@ class Workflow1PipelineTests(unittest.TestCase):
                 return created
         bitable = Bitable()
         with tempfile.TemporaryDirectory() as directory:
-            store = FileStateStore(directory)
+            store = FileStateStore(directory, snapshot_model=DailySnapshot)
             store.get_or_create_workflow(DAY)
             repo = WorkflowReportRepository(bitable, config, store)
             item = CloudObject(business_key=f"{DAY}:TEAM", token="doc1",
@@ -175,7 +176,7 @@ class Workflow1PipelineTests(unittest.TestCase):
                 return created
         bitable = Bitable()
         with tempfile.TemporaryDirectory() as directory:
-            store = FileStateStore(directory)
+            store = FileStateStore(directory, snapshot_model=DailySnapshot)
             store.get_or_create_workflow(DAY)
             repo = WorkflowReportRepository(bitable, config, store)
             item = CloudObject(business_key=f"{DAY}:TEAM", token="doc1",
@@ -221,7 +222,7 @@ class Workflow1PipelineTests(unittest.TestCase):
         for progress in snapshot.evaluators.values():
             progress.closed = True
         with tempfile.TemporaryDirectory() as directory:
-            store = FileStateStore(directory)
+            store = FileStateStore(directory, snapshot_model=DailySnapshot)
             store.get_or_create_workflow(DAY)
             store.save_snapshot(snapshot)
             fake = FakeDocs()
@@ -262,8 +263,8 @@ class Workflow1PipelineTests(unittest.TestCase):
         docs.advance.return_value = {}
         reports = Mock()
         reports.publish.return_value = {}
-        notifications = Mock()
-        notifications.messages.send_text.return_value = {"message_id": "msg"}
+        messages = Mock()
+        messages.send_text.return_value = {"message_id": "msg"}
         calls = []
         failed_once = {"L2": True}
 
@@ -276,14 +277,14 @@ class Workflow1PipelineTests(unittest.TestCase):
             return LogPromptOutput(positive="好", improvement="继续")
 
         with tempfile.TemporaryDirectory() as directory:
-            store = FileStateStore(directory)
+            store = FileStateStore(directory, snapshot_model=DailySnapshot)
             prompt = Mock()
             prompt.execute.side_effect = execute
             workflow = Workflow1(
                 store=store, organization_cache=cache,
                 log_repository=logs, ai_evaluations=ai,
                 human_evaluations=human, prompt_service=prompt,
-                notifications=notifications, documents=docs, reports=reports,
+                messages=messages, documents=docs, reports=reports,
                 llm_concurrency=2, auto_advance_at="",
                 prompt_path="prompts/S01.txt", admin_open_id="ou_admin")
             first = workflow.start(DAY)
@@ -296,14 +297,14 @@ class Workflow1PipelineTests(unittest.TestCase):
             workflow.recover_incomplete()  # 自动恢复路径不碰 FAILED
             self.assertEqual(calls.count("L2"), 1)
             admin_msgs = [call for call in
-                          notifications.messages.send_text.call_args_list
+                          messages.send_text.call_args_list
                           if call.args and call.args[0] == "ou_admin"]
             self.assertEqual(len(admin_msgs), 1)
             # 自动重入（非 resume）绝不重评失败项。
             workflow.start(DAY)
             self.assertEqual(calls.count("L2"), 1)
             self.assertEqual(len([c for c in
-                                  notifications.messages.send_text.call_args_list
+                                  messages.send_text.call_args_list
                                   if c.args and c.args[0] == "ou_admin"]), 1)
             # resume（重评接口）只重置并重跑失败项。
             second = workflow.resume(DAY)

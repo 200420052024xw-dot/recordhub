@@ -10,7 +10,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from service.event_stream import ConfirmationEventStream
+from service.bitable_events import BitableEventStream
 
 
 class EventStreamTests(unittest.TestCase):
@@ -18,10 +18,8 @@ class EventStreamTests(unittest.TestCase):
         workflow = Mock()
         bitable = Mock()
         bitable.app_token = "base"
-        human = Mock()
-        human.table.table_id = "human"
-        stream = ConfirmationEventStream(
-            workflow=workflow, bitable=bitable, human_evaluations=human,
+        stream = BitableEventStream(
+            handlers={"human": workflow.handle_human_record}, bitable=bitable,
             settings=Mock())
         for table_id, record_id in [("persons", "p1"), ("departments", "d1")]:
             event = SimpleNamespace(event=SimpleNamespace(
@@ -38,10 +36,8 @@ class EventStreamTests(unittest.TestCase):
         workflow = Mock()
         bitable = Mock()
         bitable.app_token = "base"
-        human = Mock()
-        human.table.table_id = "human"
-        stream = ConfirmationEventStream(
-            workflow=workflow, bitable=bitable, human_evaluations=human,
+        stream = BitableEventStream(
+            handlers={"human": workflow.handle_human_record}, bitable=bitable,
             settings=Mock())
         event = SimpleNamespace(event=SimpleNamespace(
             file_token="base", table_id="human",

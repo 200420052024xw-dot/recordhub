@@ -11,15 +11,15 @@ from zoneinfo import ZoneInfo
 
 from data import FileStateStore, utc_now
 from data.repositories import LogRepository, OrganizationCache
-from data.snapshot import SnapshotBuilder
+from workflow1.snapshot import SnapshotBuilder
 from llm import PromptService
-from schema import (ConfirmationRequest, DailySnapshot, LogPromptInput,
-                    LogPromptOutput, PromptConfig, UnitStatus, WorkflowRun, WorkflowStatus)
-from tool.notifications import NotificationService
+from schema import WorkflowRun
+from workflow1.models import ConfirmationRequest, DailySnapshot, LogPromptInput, LogPromptOutput, UnitStatus, WorkflowStatus
+from tool.feishu import MessageService
 from tool.errors import FeishuApiError
 from workflow1.documents import DailyDocuments
-from data.workflow1_evaluations import AiEvaluationRepository, HumanEvaluationRepository
-from data.workflow1_reports import WorkflowReportRepository
+from workflow1.evaluations import AiEvaluationRepository, HumanEvaluationRepository
+from workflow1.reports import WorkflowReportRepository
 
 logger = logging.getLogger(__name__)
 FORM_URL = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcn4Atuvh0rgPngi5TMQCoxmg"
@@ -43,7 +43,7 @@ class Workflow1:
                  ai_evaluations: AiEvaluationRepository,
                  human_evaluations: HumanEvaluationRepository,
                  prompt_service: PromptService,
-                 notifications: NotificationService,
+                 messages: MessageService,
                  documents: DailyDocuments,
                  reports: WorkflowReportRepository,
                  llm_concurrency: int = 3,
@@ -56,7 +56,7 @@ class Workflow1:
         self.ai_evaluations = ai_evaluations
         self.human_evaluations = human_evaluations
         self.prompt_service = prompt_service
-        self.notifications = notifications
+        self.messages = messages
         self.documents = documents
         self.reports = reports
         self.llm_concurrency = llm_concurrency
@@ -77,7 +77,7 @@ class Workflow1:
         if not added or not self.admin_open_id:
             return
         try:
-            self.notifications.messages.send_text(
+            self.messages.send_text(
                 self.admin_open_id,
                 f"【Workflow1 异常】{target_date}\n{reason}",
                 idempotency_key=f"issue:{target_date}:{key}",
@@ -163,15 +163,13 @@ class Workflow1:
         template = self.prompt_path.read_text(encoding="utf-8").strip()
         if not template:
             raise ValueError(f"Workflow1 prompt 为空：{self.prompt_path}")
-        prompt = PromptConfig(config_id=str(self.prompt_path), prompt_code="LOG",
-            version="1", scope_type="TEAM", scope_id="TEAM", template=template)
         logs = {log.log_id: log for log in snapshot.logs}
 
         def process(log_id: str) -> tuple[str, str, str]:
             state = snapshot.log_evaluations[log_id]
             log = logs[log_id]
             output = self.prompt_service.execute(
-                prompt_code="LOG", prompt_config=prompt,
+                prompt_code="LOG", template=template,
                 input_data=LogPromptInput(target_date=target_date,
                     person_id=state.person_id, log_id=log_id, log=log.content()),
                 output_model=LogPromptOutput)
@@ -213,7 +211,7 @@ class Workflow1:
         if not self.store.reserve_notification(target_date, key):
             return
         try:
-            result = self.notifications.messages.send_text(
+            result = self.messages.send_text(
                 open_id, message, idempotency_key=key)
         except FeishuApiError:
             self.store.release_notification(target_date, key)

@@ -1,39 +1,34 @@
+"""HTTP app, lifecycle and scheduling for registered workflows."""
+
 from __future__ import annotations
 
-import hmac
 import logging
+import hmac
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
-from typing import Annotated, AsyncIterator
+from typing import Annotated, Any, AsyncIterator
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import Depends, FastAPI, Header, HTTPException
 
-from schema import (
-    ConfirmationRequest,
-    Organization,
-    PersonCreateRequest,
-    PersonUpdateRequest,
-)
-from service.event_stream import ConfirmationEventStream
-from service.runtime import Runtime, build_runtime
 from config import AppSettings, load_env_file, load_schedule_config
+from config.schedules import ScheduleConfig, WorkflowSchedule
+from schema import Organization, PersonCreateRequest, PersonUpdateRequest
+from service.bitable_events import BitableEventStream
+from service.runtime import Runtime, WorkflowBinding, build_runtime
+from workflow1.models import ConfirmationRequest
 
 logger = logging.getLogger(__name__)
-
-
-def _bearer_token(authorization: str | None) -> str:
-    prefix = "Bearer "
-    if not authorization or not authorization.startswith(prefix):
-        return ""
-    return authorization[len(prefix) :]
 
 
 def _require_token(expected: str, authorization: str | None) -> None:
     if not expected:
         raise HTTPException(status_code=503, detail="Endpoint token is not configured")
-    if not hmac.compare_digest(_bearer_token(authorization), expected):
+    prefix = "Bearer "
+    supplied = authorization[len(prefix):] if authorization and authorization.startswith(prefix) else ""
+    if not hmac.compare_digest(supplied, expected):
         raise HTTPException(status_code=401, detail="Invalid bearer token")
 
 
@@ -46,115 +41,12 @@ def create_app(
     active_runtime = runtime or build_runtime(settings)
     schedules = load_schedule_config(settings.schedule_config_path)
     app = FastAPI(
-        title="RecordHub Workflow1",
+        title="RecordHub",
         version="0.2.0",
         lifespan=_make_lifespan(active_runtime, settings, schedules),
     )
     app.state.runtime = active_runtime
-    _register_public_routes(app, active_runtime, settings)
-    _register_admin_routes(app, active_runtime, settings)
-    return app
 
-
-def _make_lifespan(runtime, settings, schedules):
-    scheduler: BackgroundScheduler | None = None
-    stream: ConfirmationEventStream | None = None
-
-    def run_daily() -> None:
-        schedule = schedules.workflows["workflow1_daily"]
-        days_ago = int(schedule.options.get("material_days_ago", 1))
-        today = datetime.now(ZoneInfo(schedules.timezone)).date()
-        runtime.workflow.start(today - timedelta(days=days_ago))
-
-    def cleanup() -> None:
-        today = datetime.now(ZoneInfo(schedules.timezone)).date()
-        runtime.store.cleanup_completed(settings.snapshot_retention_days, today=today)
-
-    def auto_advance() -> None:
-        for run in runtime.store.list_incomplete_workflows():
-            result = runtime.workflow.finalize_pending_confirmations(run.target_date)
-            logger.info("auto_advance_result", extra={"result": result})
-
-    @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        nonlocal scheduler, stream
-        try:
-            runtime.organization_cache.refresh()
-        except Exception:
-            # Restart reads the Feishu tables once; if that fails, keep the
-            # persisted cache as the runtime master data instead of dying.
-            if runtime.store.load_cache("organization") is None:
-                raise
-            logger.exception(
-                "organization_refresh_failed_using_persisted_cache"
-            )
-        runtime.workflow.recover_incomplete()
-        if settings.event_stream_enabled:
-            stream = ConfirmationEventStream(
-                workflow=runtime.workflow,
-                bitable=runtime.infrastructure.bitable,
-                human_evaluations=runtime.human_evaluations,
-                settings=settings,
-            )
-            stream.start()
-        if settings.scheduler_enabled:
-            scheduler = _build_scheduler(
-                schedules, run_daily, cleanup, auto_advance, settings.auto_advance_at
-            )
-            scheduler.start()
-        try:
-            yield
-        finally:
-            if stream:
-                stream.stop()
-            if scheduler:
-                scheduler.shutdown(wait=False)
-
-    return lifespan
-
-
-def _build_scheduler(schedules, run_daily, cleanup, auto_advance, auto_advance_at):
-    schedule = schedules.workflows["workflow1_daily"]
-    hour, minute = (int(value) for value in schedule.time.split(":", 1))
-    scheduler = BackgroundScheduler(timezone=schedules.timezone)
-    scheduler.add_job(
-        run_daily,
-        "cron",
-        hour=hour,
-        minute=minute,
-        id="workflow1_daily",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
-    if auto_advance_at:
-        deadline_hour, deadline_minute = (
-            int(value) for value in auto_advance_at.split(":", 1)
-        )
-        scheduler.add_job(
-            auto_advance,
-            "cron",
-            hour=deadline_hour,
-            minute=deadline_minute,
-            id="confirmation_auto_advance",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-        )
-    scheduler.add_job(
-        cleanup,
-        "cron",
-        hour=3,
-        minute=30,
-        id="snapshot_cleanup",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
-    return scheduler
-
-
-def _register_public_routes(app, runtime, settings):
     @app.get("/health/live")
     def live() -> dict[str, str]:
         return {"status": "ok"}
@@ -163,48 +55,49 @@ def _register_public_routes(app, runtime, settings):
     def ready() -> dict[str, str]:
         return {"status": "ready"}
 
+    _register_routes(app, active_runtime, settings)
+    return app
+
+
+def _register_routes(app: FastAPI, runtime: Runtime, settings: AppSettings) -> None:
+    """Keep the public and admin HTTP API in one place."""
+    workflow1 = runtime.workflows["workflow1_daily"]
+
+    def require_admin(authorization: Annotated[str | None, Header()] = None) -> None:
+        _require_token(settings.admin_token, authorization)
+
     @app.post("/webhooks/feishu/confirmations")
     def confirmation(
         request: ConfirmationRequest,
         authorization: Annotated[str | None, Header()] = None,
     ) -> dict:
-        _require_token(settings.confirmation_webhook_token, authorization)
+        _require_token(workflow1.confirmation_webhook_token, authorization)
         try:
-            return runtime.workflow.handle_confirmation(request)
+            return workflow1.workflow.handle_confirmation(request)
         except Exception as exc:
             logger.warning("confirmation_rejected", extra={"error": str(exc)})
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-
-def _register_admin_routes(app, runtime, settings):
-    def require_admin(
-        authorization: Annotated[str | None, Header()] = None,
-    ) -> None:
-        _require_token(settings.admin_token, authorization)
-
     @app.post("/admin/workflows/daily/{target_date}", dependencies=[Depends(require_admin)])
     def run_workflow(target_date: date) -> dict:
-        return runtime.workflow.start(target_date).model_dump(mode="json")
+        return workflow1.workflow.start(target_date).model_dump(mode="json")
 
     @app.post(
         "/admin/workflows/{target_date}/resume", dependencies=[Depends(require_admin)]
     )
     def resume_workflow(target_date: date) -> dict:
-        """重评接口：只重跑标记为失败或尚未处理的日志，已有结果的不动。"""
-        return runtime.workflow.resume(target_date).model_dump(mode="json")
+        return workflow1.workflow.resume(target_date).model_dump(mode="json")
 
     @app.get(
         "/admin/workflows/{target_date}/issues", dependencies=[Depends(require_admin)]
     )
     def workflow_issues(target_date: date) -> dict:
-        snapshot = runtime.store.load_snapshot(target_date)
+        snapshot = workflow1.store.load_snapshot(target_date)
         if snapshot is None:
             raise HTTPException(status_code=404, detail=f"{target_date} 没有当日快照")
         return {"target_date": target_date.isoformat(), "issues": snapshot.issues}
 
-    @app.post(
-        "/admin/cache/organization/refresh", dependencies=[Depends(require_admin)]
-    )
+    @app.post("/admin/cache/organization/refresh", dependencies=[Depends(require_admin)])
     def refresh_organization() -> dict:
         organization = runtime.organization_cache.refresh()
         return {
@@ -258,10 +151,7 @@ def _organization_payload(organization: Organization) -> dict:
         "team_leader_id": organization.team_leader_id,
         "anomalies": organization.anomalies,
         "persons": [person.model_dump(mode="json") for person in organization.persons],
-        "departments": [
-            department.model_dump(mode="json")
-            for department in organization.departments
-        ],
+        "departments": [department.model_dump(mode="json") for department in organization.departments],
     }
 
 
@@ -273,4 +163,105 @@ def _raise_organization_error(exc: Exception) -> None:
     raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _event_handlers(runtime: Runtime) -> dict[str, Callable[[str], Any]]:
+    handlers: dict[str, Callable[[str], Any]] = {}
+    for binding in runtime.workflows.values():
+        for table_id, handler in binding.record_handlers.items():
+            if table_id in handlers:
+                raise ValueError(f"Duplicate event handler for table {table_id}")
+            handlers[table_id] = handler
+    return handlers
 
+
+def _make_lifespan(runtime: Runtime, settings: AppSettings, schedules: ScheduleConfig):
+    scheduler: BackgroundScheduler | None = None
+    stream: BitableEventStream | None = None
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        nonlocal scheduler, stream
+        try:
+            runtime.organization_cache.refresh()
+        except Exception:
+            # Use the persisted organization cache if startup refresh fails.
+            if runtime.organization_cache.store.load_cache("organization") is None:
+                raise
+            logger.exception("organization_refresh_failed_using_persisted_cache")
+        for binding in runtime.workflows.values():
+            binding.workflow.recover_incomplete()
+        if settings.event_stream_enabled:
+            stream = BitableEventStream(
+                handlers=_event_handlers(runtime),
+                bitable=runtime.infrastructure.bitable,
+                settings=settings,
+            )
+            stream.start()
+        if settings.scheduler_enabled:
+            scheduler = _build_scheduler(schedules, runtime, settings)
+            scheduler.start()
+        try:
+            yield
+        finally:
+            if stream:
+                stream.stop()
+            if scheduler:
+                scheduler.shutdown(wait=False)
+
+    return lifespan
+
+
+def _schedule_daily(
+    scheduler: BackgroundScheduler,
+    schedules: ScheduleConfig,
+    schedule: WorkflowSchedule,
+    binding: WorkflowBinding,
+) -> None:
+    if schedule.schedule_type != "daily":
+        raise ValueError(f"Registered workflow {binding.name} must have a daily schedule")
+    hour, minute = (int(value) for value in schedule.time.split(":", 1))
+
+    def run_daily() -> None:
+        days_ago = int(schedule.options.get("material_days_ago", 1))
+        today = datetime.now(ZoneInfo(schedules.timezone)).date()
+        binding.workflow.start(today - timedelta(days=days_ago))
+
+    scheduler.add_job(
+        run_daily, "cron", hour=hour, minute=minute, id=binding.name,
+        replace_existing=True, max_instances=1, coalesce=True,
+    )
+
+
+def _build_scheduler(
+    schedules: ScheduleConfig, runtime: Runtime, settings: AppSettings
+) -> BackgroundScheduler:
+    scheduler = BackgroundScheduler(timezone=schedules.timezone)
+    for name, binding in runtime.workflows.items():
+        schedule = schedules.workflows.get(name)
+        if schedule is None:
+            raise ValueError(f"Missing schedule for registered workflow {name}")
+        if schedule.enabled:
+            _schedule_daily(scheduler, schedules, schedule, binding)
+        if binding.auto_advance_at:
+            hour, minute = (int(value) for value in binding.auto_advance_at.split(":", 1))
+
+            def auto_advance(one: WorkflowBinding = binding) -> None:
+                for run in one.store.list_incomplete_workflows():
+                    result = one.workflow.finalize_pending_confirmations(run.target_date)
+                    logger.info("auto_advance_result", extra={"result": result})
+
+            scheduler.add_job(
+                auto_advance, "cron", hour=hour, minute=minute,
+                id=f"{name}_confirmation_auto_advance", replace_existing=True,
+                max_instances=1, coalesce=True,
+            )
+
+    def cleanup() -> None:
+        today = datetime.now(ZoneInfo(schedules.timezone)).date()
+        for binding in runtime.workflows.values():
+            binding.store.cleanup_completed(settings.snapshot_retention_days, today=today)
+
+    scheduler.add_job(
+        cleanup, "cron", hour=3, minute=30, id="snapshot_cleanup",
+        replace_existing=True, max_instances=1, coalesce=True,
+    )
+    return scheduler

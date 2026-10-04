@@ -10,12 +10,8 @@ from pathlib import Path
 from typing import Any, TypeVar
 from uuid import uuid4
 
-from errors import WorkflowStateError
-from schema import (
-    DailySnapshot,
-    WorkflowRun,
-    WorkflowStatus,
-)
+from data.errors import WorkflowStateError
+from schema import WorkflowRun
 
 T = TypeVar("T")
 
@@ -24,16 +20,68 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _rmdir_if_empty(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
 class FileStateStore:
-    """Single-process durable state using one atomically replaced JSON file per day."""
+    """Single-process durable state.
+
+    One atomically replaced JSON file per day and workflow under
+    ``<state>/<workflow_type>/<date>.json``; shared caches (the organization
+    master) sit at the state root because they belong to no single workflow.
+    ``snapshot_model`` is injected so this engine never imports a workflow's
+    schema.
+    """
 
     schema_version = 1
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        workflow_type: str = "workflow1",
+        snapshot_model: type | None = None,
+    ) -> None:
         self.root = Path(root)
-        self.workflows_dir = self.root / "workflows"
-        self.cache_dir = self.root / "cache"
+        self.workflow_type = workflow_type
+        self.runs_dir = self.root / workflow_type
+        self._snapshot_model = snapshot_model
         self._lock = threading.RLock()
+        self._migrate_legacy_layout()
+
+    def _migrate_legacy_layout(self) -> None:
+        """One-shot move from the pre-split layout.
+
+        ``workflows/<date>.json`` held the only Workflow1 runs, so those files
+        become ``<workflow_type>/<date>.json``; ``cache/<key>.json`` becomes
+        ``<key>.json`` at the state root.
+        """
+        legacy_runs = self.root / "workflows"
+        if legacy_runs.is_dir() and self.workflow_type == "workflow1":
+            self.runs_dir.mkdir(parents=True, exist_ok=True)
+            for path in legacy_runs.glob("*.json"):
+                target = self.runs_dir / path.name
+                if not target.exists():
+                    os.replace(path, target)
+            _rmdir_if_empty(legacy_runs)
+        legacy_cache = self.root / "cache"
+        if legacy_cache.is_dir():
+            for path in legacy_cache.glob("*.json"):
+                target = self.root / path.name
+                if not target.exists():
+                    os.replace(path, target)
+            _rmdir_if_empty(legacy_cache)
+
+    def _snapshot_class(self) -> type:
+        if self._snapshot_model is None:
+            raise WorkflowStateError(
+                "FileStateStore was created without snapshot_model"
+            )
+        return self._snapshot_model
 
     def get_or_create_workflow(self, target_date: date) -> WorkflowRun:
         with self._lock:
@@ -43,10 +91,10 @@ class FileStateStore:
             now = utc_now()
             run = WorkflowRun(
                 workflow_run_id=str(uuid4()),
-                workflow_type="DAILY",
+                workflow_type=self.workflow_type,
                 target_date=target_date,
-                status=WorkflowStatus.INITIALIZING,
-                current_stage=WorkflowStatus.INITIALIZING.value,
+                status="INITIALIZING",
+                current_stage="INITIALIZING",
                 started_at=now,
                 updated_at=now,
             )
@@ -72,60 +120,60 @@ class FileStateStore:
 
     def list_incomplete_workflows(self) -> list[WorkflowRun]:
         with self._lock:
-            if not self.workflows_dir.exists():
+            if not self.runs_dir.exists():
                 return []
             runs: list[WorkflowRun] = []
-            for path in sorted(self.workflows_dir.glob("*.json")):
+            for path in sorted(self.runs_dir.glob("*.json")):
                 document = self._read_json(path)
                 run = WorkflowRun.model_validate(document["run"])
-                if run.status != WorkflowStatus.COMPLETED:
+                if run.status != "COMPLETED":
                     runs.append(run)
             return runs
 
     def set_status(
         self,
         target_date: date,
-        status: WorkflowStatus,
+        status: str,
         *,
         error: str | None = None,
     ) -> WorkflowRun:
         def mutate(document: dict[str, Any]) -> WorkflowRun:
             run = WorkflowRun.model_validate(document["run"])
             now = utc_now()
-            run.status = status
-            run.current_stage = status.value
+            run.status = str(status)
+            run.current_stage = str(status)
             run.updated_at = now
             run.last_error = error
             if error:
                 run.retry_count += 1
-            if status == WorkflowStatus.COMPLETED:
+            if status == "COMPLETED":
                 run.completed_at = now
             document["run"] = run.model_dump(mode="json")
             return run
 
         return self._mutate_document(target_date, mutate)
 
-    def save_snapshot(self, snapshot: DailySnapshot) -> None:
+    def save_snapshot(self, snapshot: Any) -> None:
         def mutate(document: dict[str, Any]) -> None:
             snapshot.updated_at = utc_now()
             document["snapshot"] = snapshot.model_dump(mode="json")
 
         self._mutate_document(snapshot.target_date, mutate)
 
-    def load_snapshot(self, target_date: date) -> DailySnapshot | None:
+    def load_snapshot(self, target_date: date) -> Any:
         with self._lock:
             document = self._load_document(target_date)
             raw = document.get("snapshot")
-            return DailySnapshot.model_validate(raw) if raw else None
+            return self._snapshot_class().model_validate(raw) if raw else None
 
     def update_snapshot(
-        self, target_date: date, mutator: Callable[[DailySnapshot], T]
+        self, target_date: date, mutator: Callable[[Any], T]
     ) -> T:
         def mutate(document: dict[str, Any]) -> T:
             raw = document.get("snapshot")
             if raw is None:
                 raise WorkflowStateError(f"Snapshot is missing for {target_date}")
-            snapshot = DailySnapshot.model_validate(raw)
+            snapshot = self._snapshot_class().model_validate(raw)
             result = mutator(snapshot)
             snapshot.updated_at = utc_now()
             document["snapshot"] = snapshot.model_dump(mode="json")
@@ -211,7 +259,7 @@ class FileStateStore:
     def save_cache(self, key: str, payload: Any) -> None:
         with self._lock:
             self._atomic_write(
-                self.cache_dir / f"{key}.json",
+                self.root / f"{key}.json",
                 {
                     "schema_version": self.schema_version,
                     "updated_at": utc_now().isoformat(),
@@ -221,7 +269,7 @@ class FileStateStore:
 
     def load_cache(self, key: str) -> Any | None:
         with self._lock:
-            path = self.cache_dir / f"{key}.json"
+            path = self.root / f"{key}.json"
             if not path.exists():
                 return None
             return self._read_json(path).get("payload")
@@ -230,12 +278,12 @@ class FileStateStore:
         cutoff = (today or date.today()) - timedelta(days=retention_days)
         removed = 0
         with self._lock:
-            if not self.workflows_dir.exists():
+            if not self.runs_dir.exists():
                 return 0
-            for path in self.workflows_dir.glob("*.json"):
+            for path in self.runs_dir.glob("*.json"):
                 document = self._read_json(path)
                 run = WorkflowRun.model_validate(document["run"])
-                if run.status == WorkflowStatus.COMPLETED and run.target_date < cutoff:
+                if run.status == "COMPLETED" and run.target_date < cutoff:
                     path.unlink()
                     removed += 1
         return removed
@@ -267,7 +315,7 @@ class FileStateStore:
         self._atomic_write(self._workflow_path(target_date), document)
 
     def _workflow_path(self, target_date: date) -> Path:
-        return self.workflows_dir / f"{target_date.isoformat()}.json"
+        return self.runs_dir / f"{target_date.isoformat()}.json"
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:

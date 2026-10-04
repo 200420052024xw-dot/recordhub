@@ -69,7 +69,8 @@ def load_table_config(path: str | Path) -> TableConfig:
     if not config_path.exists():
         raise ValueError(
             f"Feishu table configuration does not exist: {config_path}. "
-            "Copy config/feishu_tables.example.toml and fill in table IDs."
+            "Create it with the table registry from "
+            "tests/test_existing_bitable_layout.py and fill in table IDs."
         )
     with config_path.open("rb") as stream:
         config = TableConfig.model_validate(tomllib.load(stream))

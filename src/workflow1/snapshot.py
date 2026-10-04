@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date, datetime
 
-from schema import (DailySnapshot, EvaluatorProgress, LogEvaluationState,
-                    Organization, SubmissionStatus, WorkLog)
+from schema import Organization, SubmissionStatus, WorkLog
+from workflow1.models import DailySnapshot, EvaluatorProgress, LogEvaluationState
 
 
 class SnapshotBuilder:

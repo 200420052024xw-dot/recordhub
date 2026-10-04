@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,36 +13,30 @@ import lark_oapi as lark
 
 from config.settings import AppSettings
 from tool.feishu import BitableService
-from data.workflow1_evaluations import HumanEvaluationRepository
-from workflow1.workflow import Workflow1
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class _Job:
-    table_name: str
+    table_id: str
     record_id: str
 
 
-class ConfirmationEventStream:
-    """Routes questionnaire record changes only.
+class BitableEventStream:
+    """Routes registered Bitable record changes.
 
     Organization tables are never re-read on events; the cached copy is the
     runtime master data (see OrganizationCache) and refreshes happen only on
     startup or via the admin API.
     """
 
-    def __init__(self, *, workflow: Workflow1, bitable: BitableService,
-                 human_evaluations: HumanEvaluationRepository,
+    def __init__(self, *, handlers: Mapping[str, Callable[[str], Any]],
+                 bitable: BitableService,
                  settings: AppSettings) -> None:
-        self.workflow = workflow
+        self.handlers = dict(handlers)
         self.bitable = bitable
-        self.human = human_evaluations
         self.settings = settings
-        self.table_ids = {
-            human_evaluations.table.table_id: "human_evaluations",
-        }
         self.queue: queue.Queue[_Job | None] = queue.Queue()
         self.pending: set[tuple[str, str]] = set()
         self.lock = threading.Lock()
@@ -73,19 +68,19 @@ class ConfirmationEventStream:
             event = getattr(data, "event", None)
             if event is None or event.file_token != self.bitable.app_token:
                 return
-            table_name = self.table_ids.get(event.table_id or "")
-            if table_name is None:
+            table_id = event.table_id or ""
+            if table_id not in self.handlers:
                 return
             for action in event.action_list or []:
                 if action.action not in {"record_edited", "record_added"}:
                     continue
                 record_id = action.record_id or ""
-                key = (table_name, record_id)
+                key = (table_id, record_id)
                 with self.lock:
                     if key in self.pending:
                         continue
                     self.pending.add(key)
-                self.queue.put(_Job(table_name, record_id))
+                self.queue.put(_Job(table_id, record_id))
         except Exception:
             logger.exception("feishu_event_callback_failed")
 
@@ -105,9 +100,9 @@ class ConfirmationEventStream:
             if job is None:
                 return
             try:
-                self.workflow.handle_human_record(job.record_id)
+                self.handlers[job.table_id](job.record_id)
             except Exception:
                 logger.exception("feishu_event_worker_failed")
             finally:
                 with self.lock:
-                    self.pending.discard((job.table_name, job.record_id))
+                    self.pending.discard((job.table_id, job.record_id))

@@ -7,6 +7,8 @@ from config.settings import (
     FeishuSettings,
     load_env_file,
 )
+from config.tables import load_table_config
+
 __all__ = [
     "AppSettings",
     "DeepSeekSettings",
@@ -17,10 +19,3 @@ __all__ = [
     "load_schedule_config",
     "load_table_config",
 ]
-
-
-def load_table_config(path):
-    """Load table mappings lazily to keep config usable without business deps."""
-    from config.tables import load_table_config as loader
-
-    return loader(path)

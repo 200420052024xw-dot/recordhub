@@ -17,6 +17,9 @@ from config import AppSettings, load_env_file, load_schedule_config, load_table_
 
 def check_config(settings: AppSettings) -> int:
     schedules = load_schedule_config(settings.schedule_config_path)
+    from workflow1.settings import W1Settings
+
+    w1 = W1Settings.from_env()
     missing = settings.missing_variables()
     table_config_error = ""
     try:
@@ -37,6 +40,10 @@ def check_config(settings: AppSettings) -> int:
         "enabled_schedules": [
             name for name, item in schedules.workflows.items() if item.enabled
         ],
+        "workflow1": {
+            "auto_advance_at": w1.auto_advance_at or None,
+            "confirmation_webhook_configured": bool(w1.confirmation_webhook_token),
+        },
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if not missing and not table_config_error else 1
@@ -82,18 +89,19 @@ def main() -> int:
     from service.runtime import build_runtime
 
     runtime = build_runtime(settings)
+    workflow1 = runtime.workflows["workflow1_daily"]
     if command == "run-workflow":
-        result = runtime.workflow.start(args.date)
+        result = workflow1.workflow.start(args.date)
     elif command == "resume-workflow":
-        result = runtime.workflow.resume(args.date)
+        result = workflow1.workflow.resume(args.date)
     elif command == "finalize-confirmations":
         dates = (
             [args.date]
             if args.date
-            else [run.target_date for run in runtime.store.list_incomplete_workflows()]
+            else [run.target_date for run in workflow1.store.list_incomplete_workflows()]
         )
         results = [
-            runtime.workflow.finalize_pending_confirmations(one) for one in dates
+            workflow1.workflow.finalize_pending_confirmations(one) for one in dates
         ]
         print(json.dumps(results, ensure_ascii=False, indent=2))
         return 0

@@ -27,7 +27,7 @@ packages = [
     "llm",
 ]
 package-dir = {workflow1 = "src/workflow1", service = "service", tool = "tool", llm = "llm"}
-py-modules = ["main", "errors"]
+py-modules = ["main"]
 
 [project.scripts]
 recordhub = "main:main"

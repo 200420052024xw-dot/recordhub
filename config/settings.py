@@ -44,19 +44,16 @@ class AppSettings:
     deepseek: DeepSeekSettings
     http_timeout_seconds: float = 30.0
     state_dir: str = "data/state"
-    table_config_path: str = "config/feishu_tables.toml"
+    table_config_path: str = "config/tables.toml"
     schedule_config_path: str = "config/schedules.toml"
-    confirmation_webhook_token: str = ""
     admin_token: str = ""
     admin_open_id: str = ""
     message_override_open_id: str = ""
     llm_concurrency: int = 3
     llm_max_attempts: int = 3
-    external_max_attempts: int = 3
     snapshot_retention_days: int = 2
     scheduler_enabled: bool = True
     event_stream_enabled: bool = True
-    auto_advance_at: str = "12:00"
     archive_parent_folder_token: str = ""
 
     @classmethod
@@ -82,28 +79,21 @@ class AppSettings:
             ),
             state_dir=os.getenv("RECORDHUB_STATE_DIR", "data/state"),
             table_config_path=os.getenv(
-                "RECORDHUB_TABLE_CONFIG", "config/feishu_tables.toml"
+                "RECORDHUB_TABLE_CONFIG", "config/tables.toml"
             ),
             schedule_config_path=os.getenv(
                 "RECORDHUB_SCHEDULE_CONFIG", "config/schedules.toml"
-            ),
-            confirmation_webhook_token=os.getenv(
-                "RECORDHUB_CONFIRMATION_WEBHOOK_TOKEN", ""
             ),
             admin_token=os.getenv("RECORDHUB_ADMIN_TOKEN", ""),
             admin_open_id=os.getenv("RECORDHUB_ADMIN_OPEN_ID", ""),
             message_override_open_id=os.getenv("RECORDHUB_MESSAGE_OVERRIDE_OPEN_ID", ""),
             llm_concurrency=_positive_int("RECORDHUB_LLM_CONCURRENCY", 3),
             llm_max_attempts=_positive_int("RECORDHUB_LLM_MAX_ATTEMPTS", 3),
-            external_max_attempts=_positive_int(
-                "RECORDHUB_EXTERNAL_MAX_ATTEMPTS", 3
-            ),
             snapshot_retention_days=_positive_int(
                 "RECORDHUB_SNAPSHOT_RETENTION_DAYS", 2
             ),
             scheduler_enabled=_boolean("RECORDHUB_SCHEDULER_ENABLED", True),
             event_stream_enabled=_boolean("RECORDHUB_EVENT_STREAM_ENABLED", True),
-            auto_advance_at=os.getenv("RECORDHUB_AUTO_ADVANCE_AT", "12:00").strip(),
             archive_parent_folder_token=os.getenv(
                 "RECORDHUB_ARCHIVE_PARENT_FOLDER_TOKEN", "").strip(),
         )

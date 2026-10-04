@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from data.repositories import _fields, _scalar
+from tool.bitable_fields import record_fields, scalar
 from data.store import FileStateStore
-from schema import CloudObject, DailySnapshot, TableConfig
+from schema import CloudObject, TableConfig
+from workflow1.models import DailySnapshot
 from tool.feishu import BitableService
 
 
@@ -36,9 +37,9 @@ class WorkflowReportRepository:
         existing = self.bitable.list_records(self.table.table_id)
         urls: dict[str, str] = {}
         for record in existing:
-            fields = _fields(record)
-            url = (_scalar(fields.get(f["document_url"])) if url_type else
-                   _scalar(fields.get(f["title"])))
+            fields = record_fields(record)
+            url = (scalar(fields.get(f["document_url"])) if url_type else
+                   scalar(fields.get(f["title"])))
             record_id = str(record.get("record_id", ""))
             if url in urls and urls[url] != record_id:
                 raise ValueError(f"报告表中存在重复文档链接：{url}")

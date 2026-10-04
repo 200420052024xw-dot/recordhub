@@ -16,7 +16,8 @@ from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
 from data.store import FileStateStore
-from schema import CloudObject, DailySnapshot, Department, Person, UnitStatus
+from schema import CloudObject, Department, Person
+from workflow1.models import DailySnapshot, UnitStatus
 from tool.cloud_docs import CloudDocsService, divider_block, text_block
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")

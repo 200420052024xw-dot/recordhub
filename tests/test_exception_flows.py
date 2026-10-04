@@ -15,10 +15,10 @@ if str(_SRC) not in sys.path:
 
 from data import FileStateStore
 from data.repositories import LogRepository
-from data.snapshot import SnapshotBuilder
-from data.workflow1_evaluations import AiEvaluationRepository
-from schema import (Department, LogPromptOutput, Organization, Person,
-                    TableConfig, UnitStatus, WorkLog)
+from workflow1.snapshot import SnapshotBuilder
+from workflow1.evaluations import AiEvaluationRepository
+from schema import Department, Organization, Person, TableConfig, WorkLog
+from workflow1.models import DailySnapshot, LogPromptOutput, UnitStatus
 from tool.cloud_docs import text_block
 from workflow1.documents import DailyDocuments
 from workflow1.workflow import Workflow1
@@ -191,7 +191,7 @@ class DocumentConflictTests(unittest.TestCase):
         for progress in snapshot.evaluators.values():
             progress.closed = True
         with tempfile.TemporaryDirectory() as directory:
-            store = FileStateStore(directory)
+            store = FileStateStore(directory, snapshot_model=DailySnapshot)
             store.get_or_create_workflow(DAY)
             store.save_snapshot(snapshot)
             fake = self.EditedDocs(edited_titles={"10-03 骨干同学小组日志"})
@@ -227,22 +227,22 @@ class NotifySkipTests(unittest.TestCase):
         docs.advance.return_value = {}
         reports = Mock()
         reports.publish.return_value = {}
-        notifications = Mock()
+        messages = Mock()
         prompt = Mock()
         prompt.execute.return_value = LogPromptOutput(positive="好", improvement="继续")
         with tempfile.TemporaryDirectory() as directory:
             workflow = Workflow1(
-                store=FileStateStore(directory), organization_cache=cache,
+                store=FileStateStore(directory, snapshot_model=DailySnapshot), organization_cache=cache,
                 log_repository=logs_repository, ai_evaluations=ai,
                 human_evaluations=human, prompt_service=prompt,
-                notifications=notifications, documents=docs, reports=reports,
+                messages=messages, documents=docs, reports=reports,
                 llm_concurrency=1, auto_advance_at="",
                 prompt_path="prompts/S01.txt")
             workflow.start(DAY)
             stored = workflow.store.load_snapshot(DAY)
             self.assertIn("person:P2:missing-open-id", stored.issues)
             self.assertTrue(stored.evaluators["P2"].notified)
-            notifications.messages.send_text.assert_not_called()
+            messages.send_text.assert_not_called()
 
 
 class MessageFormatTests(unittest.TestCase):
@@ -268,21 +268,21 @@ class MessageFormatTests(unittest.TestCase):
         docs.advance.return_value = {}
         reports = Mock()
         reports.publish.return_value = {}
-        notifications = Mock()
-        notifications.messages.send_text.return_value = {"message_id": "msg"}
+        messages = Mock()
+        messages.send_text.return_value = {"message_id": "msg"}
         prompt = Mock()
         prompt.execute.return_value = LogPromptOutput(positive="好", improvement="继续")
         with tempfile.TemporaryDirectory() as directory:
             workflow = Workflow1(
-                store=FileStateStore(directory), organization_cache=cache,
+                store=FileStateStore(directory, snapshot_model=DailySnapshot), organization_cache=cache,
                 log_repository=logs_repository, ai_evaluations=ai,
                 human_evaluations=human, prompt_service=prompt,
-                notifications=notifications, documents=docs, reports=reports,
+                messages=messages, documents=docs, reports=reports,
                 llm_concurrency=1, auto_advance_at="",
                 prompt_path="prompts/S01.txt")
             workflow.start(DAY)
         messages = {call.args[0]: call.args[1]
-                    for call in notifications.messages.send_text.call_args_list}
+                    for call in messages.send_text.call_args_list}
         self.assertTrue(messages["ou_p2"].startswith("骨干同学，请评价以下成员 10月3日 的工作日志"))
         self.assertIn("成员", messages["ou_p2"])
         self.assertTrue(messages["ou_p3"].startswith("部长老师，请评价以下骨干 10月3日 的工作日志"))

@@ -31,12 +31,108 @@ class StaticBitable:
         return self.records
 
 
+# 原 config/feishu_tables.example.toml 已删除；此内嵌模板是表注册中心的唯一
+# 参照：六张基础服务表 + Workflow1 输出表 + S04-S09 预留表。新建部署时按它
+# 手写 config/tables.toml（该文件不入库）。
+_TABLE_REGISTRY_TOML = '''
+# Person-type fields (提交人/评价人/被评价日志提交人/报告人 etc.) are read and
+# written as OpenID. The application resolves each person's 手机号 to OpenID
+# through contact/v3/users/batch_get_id when refreshing the organization cache.
+
+[tables.departments]
+table_id = ""
+[tables.departments.fields]
+department_id = "部门编号"
+minister_ref = "部门部长"
+backbone_refs = "部门骨干"
+name = "部门名称"
+
+[tables.persons]
+table_id = ""
+[tables.persons.fields]
+person_id = "人员编号"
+name = "姓名"
+role = "角色"
+leader_ref = "直属上级"
+minister_ref = "本部部长"
+department_ref = "所属部门"
+remark = "备注"
+mobile = "手机号"
+
+[tables.logs]
+table_id = ""
+[tables.logs.fields]
+log_id = "自动编号"
+submitted_at = "提交时间"
+submitter_ref = "提交人"
+progress = "工作进展："
+difficulties = "工作困难："
+reflection = "心得反思："
+other = "其他："
+full_log = "完整日志"
+
+[tables.evaluations]
+table_id = ""
+[tables.evaluations.fields]
+evaluation_id = "评价编号"
+person_ref = "被评价日志提交人"
+evaluator_ref = "评价人"
+source_log = "工作日志"
+evaluated_at = "评价时间"
+positive_ai = "肯定之处_AI"
+improvement_ai = "改进之处_AI"
+
+[tables.human_evaluations]
+table_id = ""
+[tables.human_evaluations.fields]
+evaluation_id = "评价编号"
+person_ref = "被评价日志提交人"
+evaluator_ref = "评价人"
+evaluated_at = "评价时间"
+positive_final = "肯定之处_人工"
+improvement_final = "改进之处_人工"
+submitted_by = "填写人"
+
+[tables.check_details]
+table_id = ""
+[tables.check_details.fields]
+title = "文本"
+reporter_ref = "报告人"
+role = "角色"
+reported_at = "报告时间"
+submitted = "已交人数"
+missing = "未交认数"
+
+[tables.reports]
+table_id = ""
+[tables.reports.fields]
+title = "文本"
+reporter_ref = "报告人"
+role = "角色"
+reported_at = "报告时间"
+
+[tables.prompts]
+table_id = ""
+[tables.prompts.fields]
+config_id = "文本"
+user_ref = "使用人"
+role = "角色"
+template = "分析skill"
+modified_at = "修改日期"
+
+[tables.department_analysis]
+table_id = ""
+[tables.department_analysis.fields]
+
+[tables.team_analysis]
+table_id = ""
+[tables.team_analysis.fields]
+'''
+
+
 class ExistingBitableLayoutTests(unittest.TestCase):
-    def test_example_config_covers_split_evaluation_tables(self) -> None:
-        source = Path("config/feishu_tables.example.toml").read_text(
-            encoding="utf-8"
-        )
-        populated = source.replace('table_id = ""', 'table_id = "tbl_test"')
+    def test_table_registry_covers_split_evaluation_tables(self) -> None:
+        populated = _TABLE_REGISTRY_TOML.replace('table_id = ""', 'table_id = "tbl_test"')
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tables.toml"
             path.write_text(populated, encoding="utf-8")

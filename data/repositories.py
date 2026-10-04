@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Iterable, Mapping
-from datetime import UTC, date, datetime, time, timedelta
+from collections.abc import Callable, Mapping
+from datetime import date, datetime, time, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
 
-from errors import FeishuReadError
+from data.errors import FeishuReadError
 from schema import (
     Department,
     Organization,
@@ -15,123 +14,18 @@ from schema import (
     WorkLog,
 )
 from data import FileStateStore
+from tool.bitable_fields import (
+    SHANGHAI,
+    alias_index,
+    display_name,
+    field_boolean,
+    field_datetime,
+    record_fields,
+    references,
+    resolve_reference,
+    scalar,
+)
 from tool.feishu import BitableService, ContactService
-
-
-SHANGHAI = ZoneInfo("Asia/Shanghai")
-
-
-def _fields(record: Mapping[str, Any]) -> dict[str, Any]:
-    value = record.get("fields", {})
-    return dict(value) if isinstance(value, Mapping) else {}
-
-
-def _scalar(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, list):
-        return _scalar(value[0]) if value else ""
-    if isinstance(value, Mapping):
-        for key in (
-            "record_id",
-            "id",
-            "open_id",
-            "user_id",
-            "link",
-            "text",
-            "texts",
-            "mobile",
-            "name",
-            "value",
-        ):
-            if key in value:
-                return _scalar(value[key])
-    return str(value)
-
-
-def _display_name(value: Any) -> str:
-    if isinstance(value, list):
-        return _display_name(value[0]) if value else ""
-    if isinstance(value, Mapping) and value.get("name"):
-        return str(value["name"])
-    return _scalar(value)
-
-
-def _references(value: Any) -> list[str]:
-    """Return every usable identifier exposed by a Feishu relation/person field."""
-    if value is None:
-        return []
-    if isinstance(value, (str, int, float)):
-        text = str(value).strip()
-        return [text] if text else []
-    if isinstance(value, list):
-        result: list[str] = []
-        for item in value:
-            result.extend(_references(item))
-        return list(dict.fromkeys(result))
-    if isinstance(value, Mapping):
-        result = []
-        for key in (
-            "record_ids",
-            "record_id",
-            "id",
-            "person_id",
-            "open_id",
-            "user_id",
-            "text",
-            "name",
-            "value",
-        ):
-            if key in value:
-                result.extend(_references(value[key]))
-        return list(dict.fromkeys(result))
-    return [str(value)]
-
-
-def _alias_index(rows: Iterable[tuple[str, Iterable[str]]]) -> dict[str, str]:
-    """Build an alias map while rejecting ambiguous duplicate display names."""
-    aliases: dict[str, str | None] = {}
-    for canonical_id, candidates in rows:
-        if not canonical_id:
-            continue
-        for candidate in candidates:
-            alias = str(candidate).strip()
-            if not alias:
-                continue
-            if alias in aliases and aliases[alias] != canonical_id:
-                aliases[alias] = None
-            else:
-                aliases[alias] = canonical_id
-    return {alias: target for alias, target in aliases.items() if target}
-
-
-def _resolve_reference(value: Any, aliases: Mapping[str, str]) -> str:
-    for candidate in _references(value):
-        if candidate in aliases:
-            return aliases[candidate]
-    return ""
-
-
-def _boolean(value: Any, *, default: bool = True) -> bool:
-    text = _scalar(value).strip().lower()
-    if not text:
-        return default
-    return text in {"true", "1", "yes", "是", "有效", "启用"}
-
-
-def _datetime(value: Any) -> datetime:
-    if isinstance(value, (int, float)):
-        seconds = value / 1000 if value > 10_000_000_000 else value
-        return datetime.fromtimestamp(seconds, tz=UTC)
-    text = _scalar(value)
-    if not text:
-        raise ValueError("datetime field is empty")
-    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=SHANGHAI)
 
 
 class OrganizationRepository:
@@ -167,7 +61,7 @@ class OrganizationRepository:
                 )
             mobile_field = persons_table.fields["mobile"]
             person_mobiles = [
-                (record, _scalar(_fields(record).get(mobile_field)).strip())
+                (record, scalar(record_fields(record).get(mobile_field)).strip())
                 for record in person_records
             ]
             person_mobiles = [(record, mobile) for record, mobile in person_mobiles
@@ -209,24 +103,24 @@ class OrganizationRepository:
         mobile_open_ids = mobile_open_ids or {}
         def person_open_id(item, values) -> str:
             if use_person_field_ids:
-                return _scalar(values.get(person_fields["name"])).strip()
+                return scalar(values.get(person_fields["name"])).strip()
             return mobile_open_ids.get(
-                _scalar(values.get(person_fields["mobile"])).strip(), ""
+                scalar(values.get(person_fields["mobile"])).strip(), ""
             )
         department_rows = []
         for item in department_records:
-            values = _fields(item)
-            department_id = _scalar(
+            values = record_fields(item)
+            department_id = scalar(
                 values.get(department_fields["department_id"])
             ).strip()
             department_rows.append((item, values, department_id))
-        department_aliases = _alias_index(
+        department_aliases = alias_index(
             (
                 department_id,
                 (
                     department_id,
                     str(item.get("record_id", "")),
-                    _scalar(values.get(department_fields["name"])),
+                    scalar(values.get(department_fields["name"])),
                 ),
             )
             for item, values, department_id in department_rows
@@ -234,17 +128,17 @@ class OrganizationRepository:
 
         person_rows = []
         for item in person_records:
-            values = _fields(item)
-            person_id = (_scalar(values.get(person_fields["person_id"])).strip()
+            values = record_fields(item)
+            person_id = (scalar(values.get(person_fields["person_id"])).strip()
                          or str(item.get("record_id", "")))
             person_rows.append((item, values, person_id))
-        person_aliases = _alias_index(
+        person_aliases = alias_index(
             (
                 person_id,
                 (
                     person_id,
                     str(item.get("record_id", "")),
-                    _display_name(values.get(person_fields["name"])),
+                    display_name(values.get(person_fields["name"])),
                     person_open_id(item, values),
                 ),
             )
@@ -253,20 +147,20 @@ class OrganizationRepository:
 
         persons = []
         for item, values, person_id in person_rows:
-            role = _scalar(values.get(person_fields["role"]))
-            leader_id = _resolve_reference(
+            role = scalar(values.get(person_fields["role"]))
+            leader_id = resolve_reference(
                 values.get(person_fields["leader_ref"]), person_aliases
             )
             if not leader_id and role == "骨干学生":
-                leader_id = _resolve_reference(
+                leader_id = resolve_reference(
                     values.get(person_fields["minister_ref"]), person_aliases
                 )
             persons.append(
                 Person(
                     person_id=person_id,
-                    name=_display_name(values.get(person_fields["name"])),
+                    name=display_name(values.get(person_fields["name"])),
                     role=role,
-                    department_id=_resolve_reference(
+                    department_id=resolve_reference(
                         values.get(person_fields["department_ref"]),
                         department_aliases,
                     )
@@ -274,13 +168,13 @@ class OrganizationRepository:
                     leader_id=leader_id or None,
                     open_id=person_open_id(item, values) or None,
                     source_record_id=str(item.get("record_id", "")) or None,
-                    active=_boolean(values.get(person_fields.get("active"))),
+                    active=field_boolean(values.get(person_fields.get("active"))),
                 )
             )
 
         departments = []
         for item, values, department_id in department_rows:
-            minister_id = _resolve_reference(
+            minister_id = resolve_reference(
                 values.get(department_fields["minister_ref"]), person_aliases
             )
             if not minister_id:
@@ -295,11 +189,11 @@ class OrganizationRepository:
             departments.append(
                 Department(
                     department_id=department_id,
-                    name=_scalar(values.get(department_fields["name"]))
+                    name=scalar(values.get(department_fields["name"]))
                     or department_id,
                     minister_id=minister_id or None,
                     source_record_id=str(item.get("record_id", "")) or None,
-                    active=_boolean(values.get(department_fields.get("active"))),
+                    active=field_boolean(values.get(department_fields.get("active"))),
                 )
             )
         return departments, persons
@@ -440,7 +334,7 @@ class LogRepository:
         issues: dict[str, str] = {}
         try:
             organization = organization or self.organization_cache.get()
-            person_aliases = _alias_index(
+            person_aliases = alias_index(
                 (
                     person.person_id,
                     (
@@ -459,12 +353,12 @@ class LogRepository:
             f = self.table.fields
             rows: list[dict] = []
             for item in records:
-                values = _fields(item)
-                log_id = _scalar(values.get(f["log_id"])) or str(
+                values = record_fields(item)
+                log_id = scalar(values.get(f["log_id"])) or str(
                     item.get("record_id", "")
                 )
                 try:
-                    submitted_at = _datetime(values.get(f["submitted_at"]))
+                    submitted_at = field_datetime(values.get(f["submitted_at"]))
                 except (ValueError, TypeError):
                     submitted_at = None
                 rows.append({
@@ -490,10 +384,10 @@ class LogRepository:
             for row, submitted_at in zip(rows, resolved):
                 if not start <= submitted_at < end:
                     continue
-                person_id = _resolve_reference(
+                person_id = resolve_reference(
                     row["values"].get(f["submitter_ref"]), person_aliases)
                 if not person_id:
-                    name = _display_name(row["values"].get(f["submitter_ref"]))
+                    name = display_name(row["values"].get(f["submitter_ref"]))
                     issues[f"log:{row['log_id']}:unknown-submitter"] = (
                         f"日志 {row['log_id']} 的提交人「{name or '未知'}」"
                         "不在人员表，本条已跳过；请补录人员或改派")
@@ -504,11 +398,11 @@ class LogRepository:
                         source_record_id=str(row["item"].get("record_id", "")) or None,
                         submitted_at=submitted_at,
                         person_id=person_id,
-                        progress=_scalar(row["values"].get(f["progress"])),
-                        difficulties=_scalar(row["values"].get(f["difficulties"])),
-                        reflection=_scalar(row["values"].get(f["reflection"])),
-                        other=_scalar(row["values"].get(f["other"])),
-                        full_log=_scalar(row["values"].get(f["full_log"])),
+                        progress=scalar(row["values"].get(f["progress"])),
+                        difficulties=scalar(row["values"].get(f["difficulties"])),
+                        reflection=scalar(row["values"].get(f["reflection"])),
+                        other=scalar(row["values"].get(f["other"])),
+                        full_log=scalar(row["values"].get(f["full_log"])),
                     )
                 )
             # One log per person per day: the latest submission wins outright.
@@ -532,5 +426,4 @@ class LogRepository:
             raise
         except Exception as exc:
             raise FeishuReadError(f"Unable to load logs for {target_date}") from exc
-
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from collections import deque
@@ -11,7 +10,6 @@ from llm.client import DeepSeekClient
 from config import DeepSeekSettings, FeishuSettings
 from tool.feishu import BitableService, ContactService, FeishuClient, FeishuTokenProvider, MessageService
 from tool.http import HttpResponse
-from tool.notifications import NotificationService
 from config import load_schedule_config
 
 
@@ -154,22 +152,6 @@ class FoundationTests(unittest.TestCase):
             transport.calls[0]["json_body"]["response_format"],
             {"type": "json_object"},
         )
-
-    def test_pending_notification_uses_standard_text(self) -> None:
-        transport = FakeTransport(
-            [
-                response({"code": 0, "tenant_access_token": "token", "expire": 7200}),
-                response({"code": 0, "data": {"message_id": "m1"}}),
-            ]
-        )
-        messages = MessageService(FeishuClient(self.feishu_settings, transport))
-        result = NotificationService(messages).pending_confirmation(
-            "user", title="昨日检查清单", record_url="https://example.test/record"
-        )
-        self.assertEqual(result["message_id"], "m1")
-        content = json.loads(transport.calls[1]["json_body"]["content"])
-        self.assertIn("待确认", content["text"])
-        self.assertIn("https://example.test/record", content["text"])
 
     def test_message_override_routes_workflow_messages_to_test_open_id(self) -> None:
         transport = FakeTransport(

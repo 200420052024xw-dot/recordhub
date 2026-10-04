@@ -1,18 +1,7 @@
-# RecordHub table mapping template for the existing Feishu Bitable base
-# (exported as docs/学生工作日志层级管理系统 .xlsx).
-#
-# Copy this file to config/feishu_tables.toml, fill every table_id with the
-# bare `tbl...` identifier (no `&view=...` suffix from browser URLs), and
-# use the persons table's 手机号 column.
-#
-# Person-type fields (提交人/评价人/被评价日志提交人/报告人 etc.) are read and
-# written as OpenID. The application resolves each person's 手机号 to OpenID
-# through contact/v3/users/batch_get_id when refreshing the organization cache.
-
 # ---------- Existing source tables ----------
 
 [tables.departments]
-table_id = ""
+table_id = "tblKPnE4xFIqps0f"
 [tables.departments.fields]
 department_id = "部门编号"
 minister_ref = "部门部长"
@@ -20,7 +9,7 @@ backbone_refs = "部门骨干"
 name = "部门名称"
 
 [tables.persons]
-table_id = ""
+table_id = "tblXX3byptRXLU9b"
 [tables.persons.fields]
 person_id = "人员编号"
 name = "姓名"
@@ -29,10 +18,10 @@ leader_ref = "直属上级"
 minister_ref = "本部部长"
 department_ref = "所属部门"
 remark = "备注"
-mobile = "手机号"             # 人员填写的手机号，由程序换取 OpenID
+mobile = "手机号"
 
 [tables.logs]
-table_id = ""
+table_id = "tblwJkYdtcWpA6LR"
 [tables.logs.fields]
 log_id = "自动编号"
 submitted_at = "提交时间"
@@ -46,7 +35,7 @@ full_log = "完整日志"
 # ---------- Workflow1 output and confirmation tables ----------
 
 [tables.evaluations]
-table_id = ""
+table_id = "tbl4B9ZzGLgXvqXO"
 [tables.evaluations.fields]
 evaluation_id = "评价编号"
 person_ref = "被评价日志提交人"
@@ -57,7 +46,7 @@ positive_ai = "肯定之处_AI"
 improvement_ai = "改进之处_AI"
 
 [tables.human_evaluations]
-table_id = ""                    # 填写人工评价表的 tbl... ID
+table_id = "tblUEMS8ljvoE4VC"
 [tables.human_evaluations.fields]
 evaluation_id = "评价编号"
 person_ref = "被评价日志提交人"
@@ -67,9 +56,8 @@ positive_final = "肯定之处_人工"
 improvement_final = "改进之处_人工"
 submitted_by = "填写人"
 
-
 [tables.check_details]
-table_id = ""
+table_id = "tblyjKkCAraVJqPR"
 [tables.check_details.fields]
 title = "文本"
 reporter_ref = "报告人"
@@ -79,19 +67,17 @@ submitted = "已交人数"
 missing = "未交认数"
 
 [tables.reports]
-table_id = ""
+table_id = "tblHG8enRcoNwdqv"
 [tables.reports.fields]
 title = "文本"
 reporter_ref = "报告人"
 role = "角色"
 reported_at = "报告时间"
-# document_url = "飞书文档链接"  # 若报告表有独立链接列，可取消注释
-
 
 # ---------- Skill configuration ----------
 
 [tables.prompts]
-table_id = ""
+table_id = "tblalZE1c1x9JLn4"
 [tables.prompts.fields]
 config_id = "文本"
 user_ref = "使用人"
@@ -103,7 +89,7 @@ modified_at = "修改日期"
 # Workflow1 loads these mappings for schema validation but does not write them.
 
 [tables.department_analysis]
-table_id = ""
+table_id = "tblwD6ULDfqRvL97"
 [tables.department_analysis.fields]
 title = "文本"
 minister_ref = "部长"
@@ -114,7 +100,7 @@ ideas_s06 = "idea 清单"
 meeting_focus_s07 = "学生例会重点人员"
 
 [tables.team_analysis]
-table_id = ""
+table_id = "tblGyxHawUnOOZeO"
 [tables.team_analysis.fields]
 title = "文本"
 technology_s08 = "公共技术"

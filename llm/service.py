@@ -1,4 +1,4 @@
-"""Structured execution of the single Workflow1 prompt."""
+"""Structured prompt execution shared by workflows."""
 
 from __future__ import annotations
 
@@ -9,9 +9,8 @@ from typing import TypeVar
 
 from pydantic import BaseModel
 
-from errors import LLMError, LLMValidationError
 from llm.client import DeepSeekClient
-from schema import PromptConfig
+from llm.errors import LLMError, LLMValidationError
 from tool.errors import DeepSeekApiError, StructuredOutputError
 
 T = TypeVar("T", bound=BaseModel)
@@ -23,7 +22,7 @@ class PromptService:
         self.max_attempts = max_attempts
 
     def execute(
-        self, *, prompt_code: str, prompt_config: PromptConfig,
+        self, *, prompt_code: str, template: str,
         input_data: BaseModel, output_model: type[T],
         semantic_validator: Callable[[T], None] | None = None,
     ) -> T:
@@ -31,7 +30,7 @@ class PromptService:
             {"role": "system", "content": (
                 f"你正在执行 {prompt_code}。只输出一个合法 JSON 对象，不要输出 "
                 "Markdown 代码围栏或额外说明。\n\n"
-                f"{prompt_config.template}\n\n"
+                f"{template}\n\n"
                 "输出必须符合以下 JSON Schema：\n"
                 + json.dumps(output_model.model_json_schema(), ensure_ascii=False)
             )},
