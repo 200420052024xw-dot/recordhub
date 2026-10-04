@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 
 from data.repositories import SHANGHAI, _datetime, _fields, _references, _scalar
@@ -21,32 +22,65 @@ class AiEvaluationRepository:
         self.table = config.tables["evaluations"]
         self.store = store
 
-    def publish(self, snapshot: DailySnapshot) -> dict[str, tuple[str, str]]:
-        """Reconcile by original log relation before creating missing rows."""
+    def publish(
+        self, snapshot: DailySnapshot
+    ) -> tuple[dict[str, tuple[str, str]], dict[str, str]]:
+        """Idempotently write AI rows plus 未填写日志 marker rows.
+
+        Reentrant: units already mapped (``record_id`` set), units still
+        waiting on the LLM, and failed units (already in the issue ledger)
+        are skipped. Rows missing a party's OpenID are skipped and reported
+        through the returned issues instead of failing the whole day.
+        """
         f = self.table.fields
         logs = {log.log_id: log for log in snapshot.logs}
         people = snapshot.organization.person_map()
+        issues: dict[str, str] = {}
         existing = self.bitable.list_records(self.table.table_id)
+        by_evaluation: dict[str, tuple[str, str]] = {}
+        source_rows: dict[str, list[dict]] = defaultdict(list)
+        for record in existing:
+            fields = _fields(record)
+            record_id = str(record.get("record_id", ""))
+            evaluation_id = _scalar(fields.get(f["evaluation_id"]))
+            if record_id and evaluation_id:
+                by_evaluation[evaluation_id] = (record_id, evaluation_id)
+            for reference in _references(fields.get(f["source_log"])):
+                source_rows[reference].append(record)
         mapped: dict[str, tuple[str, str]] = {}
-        creates: list[tuple[str, dict]] = []
+        # log_id is None for marker rows, which need no local mapping.
+        creates: list[tuple[str | None, dict]] = []
         for state in snapshot.log_evaluations.values():
-            if not state.evaluator_id:
+            if state.record_id:
                 continue
-            if state.status not in {UnitStatus.WAITING_CONFIRMATION, UnitStatus.CONFIRMED}:
-                raise ValueError(f"日志 {state.log_id} 尚未完成 AI 处理")
+            if not state.evaluator_id or state.status == UnitStatus.FAILED:
+                continue
+            if state.status not in {UnitStatus.WAITING_CONFIRMATION,
+                                    UnitStatus.CONFIRMED}:
+                continue
             log = logs[state.log_id]
             person = people[state.person_id]
             evaluator = people[state.evaluator_id]
             if not log.source_record_id:
                 raise ValueError(f"日志 {log.log_id} 缺少原始飞书记录 ID")
             if not person.open_id or not evaluator.open_id:
-                raise ValueError(f"日志 {log.log_id} 的提交人或评价人缺少飞书 OpenID")
+                missing_id = state.person_id if not person.open_id else state.evaluator_id
+                role = "提交人" if missing_id == state.person_id else "评价人"
+                who = people[missing_id]
+                issues[f"person:{missing_id}:missing-open-id"] = (
+                    f"日志 {log.log_id} 的{role}「{who.name}」缺少 OpenID，"
+                    "AI 评价行未写回，请补录后调用重评接口")
+                continue
+            key = evaluation_key(
+                snapshot.target_date, state.evaluator_id, state.log_id)
+            hit = by_evaluation.get(key)
+            if hit is not None:
+                mapped[state.log_id] = hit
+                continue
             matches = []
-            for record in existing:
-                fields = _fields(record)
-                if log.source_record_id not in _references(fields.get(f["source_log"])):
-                    continue
-                if person.open_id not in _references(fields.get(f["person_ref"])):
+            for record in source_rows.get(log.source_record_id, []):
+                if person.open_id not in _references(
+                        _fields(record).get(f["person_ref"])):
                     raise ValueError(f"AI 评价表中日志 {log.log_id} 已有关联但人员不匹配")
                 matches.append(record)
             if len(matches) > 1:
@@ -60,13 +94,31 @@ class AiEvaluationRepository:
                 mapped[state.log_id] = (record_id, evaluation_id)
                 continue
             creates.append((state.log_id, {
-                f["evaluation_id"]: evaluation_key(
-                    snapshot.target_date, state.evaluator_id, state.log_id),
+                f["evaluation_id"]: key,
                 f["person_ref"]: [{"id": person.open_id}],
                 f["source_log"]: log.source_record_id,
                 f["evaluated_at"]: int(datetime.now().timestamp() * 1000),
                 f["positive_ai"]: state.positive_ai,
                 f["improvement_ai"]: state.improvement_ai,
+            }))
+        target = snapshot.target_date.isoformat()
+        for person_id in sorted(snapshot.submission_status):
+            if snapshot.submission_status[person_id].submitted:
+                continue
+            person = people[person_id]
+            key = f"{target}:MISSING:{person_id}"
+            if key in by_evaluation:
+                continue
+            if not person.open_id:
+                issues[f"person:{person_id}:missing-open-id"] = (
+                    f"未交人员「{person.name}」缺少 OpenID，未填写日志标注行未写回")
+                continue
+            creates.append((None, {
+                f["evaluation_id"]: key,
+                f["person_ref"]: [{"id": person.open_id}],
+                f["evaluated_at"]: int(datetime.now().timestamp() * 1000),
+                f["positive_ai"]: "未填写日志",
+                f["improvement_ai"]: "未填写日志",
             }))
         for offset in range(0, len(creates), 500):
             chunk = creates[offset:offset + 500]
@@ -74,20 +126,15 @@ class AiEvaluationRepository:
                 self.table.table_id, [fields for _, fields in chunk])
             if len(created) != len(chunk):
                 raise ValueError("飞书批量创建 AI 评价返回数量不一致")
-            for (log_id, _), record in zip(chunk, created, strict=True):
+            for (log_id, fields_sent), record in zip(chunk, created, strict=True):
                 record_id = str(record.get("record_id", ""))
                 if not record_id:
                     raise ValueError(f"日志 {log_id} 创建后没有记录 ID")
-                fields = _fields(record)
-                evaluation_id = _scalar(fields.get(f["evaluation_id"]))
-                if not evaluation_id:
-                    fields = _fields(self.bitable.get_record(
-                        self.table.table_id, record_id))
-                    evaluation_id = _scalar(fields.get(f["evaluation_id"]))
-                if not evaluation_id:
-                    raise ValueError(f"日志 {log_id} 创建后没有评价编号")
-                mapped[log_id] = (record_id, evaluation_id)
-        return mapped
+                evaluation_id = _scalar(_fields(record).get(f["evaluation_id"])) \
+                    or fields_sent[f["evaluation_id"]]
+                if log_id is not None:
+                    mapped[log_id] = (record_id, evaluation_id)
+        return mapped, issues
 
 
 class HumanEvaluationRepository:

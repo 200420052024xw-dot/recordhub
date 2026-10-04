@@ -178,8 +178,9 @@ class ExistingBitableLayoutTests(unittest.TestCase):
             StaticOrganizationCache(organization),
         )
 
-        logs = repository.get_logs_by_date(date(2026, 10, 3))
+        logs, issues = repository.get_logs_by_date(date(2026, 10, 3))
         self.assertEqual(logs[0].person_id, "P003")
+        self.assertEqual(issues, {})
 
 
 

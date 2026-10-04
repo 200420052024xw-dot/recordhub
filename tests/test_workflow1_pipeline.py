@@ -115,6 +115,7 @@ class Workflow1PipelineTests(unittest.TestCase):
             first = repo.publish(snapshot)
             second = repo.publish(snapshot)
         self.assertEqual(first, second)
+        self.assertEqual(first[1], {})
         self.assertEqual(len(bitable.created), 3)
         self.assertEqual(set(bitable.created[0]), set(fields.values()) - {"评价人"})
         self.assertIsInstance(bitable.created[0]["工作日志"], str)
@@ -241,23 +242,26 @@ class Workflow1PipelineTests(unittest.TestCase):
             self.assertNotIn("第一条", department_text)
             self.assertIn("第一条", member_text)
             self.assertIn("第二条", member_text)
-            self.assertIn("rec1", member_text)
+            self.assertIn("-所属部门：dep·一部", member_text)
+            self.assertNotIn("rec1", member_text)
+            self.assertIn("-是否为骨干：否", member_text)
+            self.assertIn("-是否为骨干：是", member_text)
 
-    def test_ai_batch_waits_for_every_log_and_resume_retries_only_failure(self):
+    def test_llm_failure_skips_and_ledger_and_resume_retries_only_failure(self):
         snapshot = sample_snapshot()
         cache = Mock()
         cache.get.return_value = snapshot.organization
         logs = Mock()
-        logs.get_logs_by_date.return_value = snapshot.logs
+        logs.get_logs_by_date.return_value = (snapshot.logs, {})
         ai = Mock()
-        ai.publish.return_value = {"L1": ("rec_ai1", "PJ-1"),
-                                   "L2": ("rec_ai2", "PJ-2"),
-                                   "L3": ("rec_ai3", "PJ-3")}
+        ai.publish.return_value = ({"L1": ("rec_ai1", "PJ-1"),
+                                    "L3": ("rec_ai3", "PJ-3")}, {})
         human = Mock()
         human.for_date.return_value = []
         docs = Mock()
         docs.advance.return_value = {}
         reports = Mock()
+        reports.publish.return_value = {}
         notifications = Mock()
         notifications.messages.send_text.return_value = {"message_id": "msg"}
         calls = []
@@ -281,16 +285,32 @@ class Workflow1PipelineTests(unittest.TestCase):
                 human_evaluations=human, prompt_service=prompt,
                 notifications=notifications, documents=docs, reports=reports,
                 llm_concurrency=2, auto_advance_at="",
-                prompt_path="prompts/S01.txt")
+                prompt_path="prompts/S01.txt", admin_open_id="ou_admin")
             first = workflow.start(DAY)
-            self.assertEqual(first.status, WorkflowStatus.FAILED)
-            ai.publish.assert_not_called()
+            # 失败单元不再拖垮全天：当天流程照常走到等待评价状态。
+            self.assertEqual(first.status, WorkflowStatus.WAITING_EVALUATIONS)
+            stored = store.load_snapshot(DAY)
+            self.assertIn("log:L2:ai-failed", stored.issues)
+            self.assertEqual(stored.log_evaluations["L2"].status, UnitStatus.FAILED)
+            self.assertTrue(stored.evaluations_published)
+            workflow.recover_incomplete()  # 自动恢复路径不碰 FAILED
+            self.assertEqual(calls.count("L2"), 1)
+            admin_msgs = [call for call in
+                          notifications.messages.send_text.call_args_list
+                          if call.args and call.args[0] == "ou_admin"]
+            self.assertEqual(len(admin_msgs), 1)
+            # 自动重入（非 resume）绝不重评失败项。
+            workflow.start(DAY)
+            self.assertEqual(calls.count("L2"), 1)
+            self.assertEqual(len([c for c in
+                                  notifications.messages.send_text.call_args_list
+                                  if c.args and c.args[0] == "ou_admin"]), 1)
+            # resume（重评接口）只重置并重跑失败项。
             second = workflow.resume(DAY)
             self.assertEqual(second.status, WorkflowStatus.WAITING_EVALUATIONS)
-            self.assertEqual(calls.count("L1"), 1)
             self.assertEqual(calls.count("L2"), 2)
+            self.assertEqual(calls.count("L1"), 1)
             self.assertEqual(calls.count("L3"), 1)
-            ai.publish.assert_called_once()
             self.assertEqual(logs.get_logs_by_date.call_count, 1)
 
 

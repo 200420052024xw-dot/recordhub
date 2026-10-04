@@ -93,3 +93,8 @@ def text_block(text: str, *, link: str | None = None, heading: int = 0) -> dict[
             "link": {"url": quote(link, safe="")}}
     return {"block_type": heading + 2 if heading else 2,
             kind: {"elements": [element]}}
+
+
+def divider_block() -> dict[str, Any]:
+    """Feishu docx horizontal divider (block_type 22)."""
+    return {"block_type": 22, "divider": {}}

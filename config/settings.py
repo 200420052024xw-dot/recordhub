@@ -53,7 +53,7 @@ class AppSettings:
     llm_concurrency: int = 3
     llm_max_attempts: int = 3
     external_max_attempts: int = 3
-    snapshot_retention_days: int = 7
+    snapshot_retention_days: int = 2
     scheduler_enabled: bool = True
     event_stream_enabled: bool = True
     auto_advance_at: str = "12:00"
@@ -99,7 +99,7 @@ class AppSettings:
                 "RECORDHUB_EXTERNAL_MAX_ATTEMPTS", 3
             ),
             snapshot_retention_days=_positive_int(
-                "RECORDHUB_SNAPSHOT_RETENTION_DAYS", 7
+                "RECORDHUB_SNAPSHOT_RETENTION_DAYS", 2
             ),
             scheduler_enabled=_boolean("RECORDHUB_SCHEDULER_ENABLED", True),
             event_stream_enabled=_boolean("RECORDHUB_EVENT_STREAM_ENABLED", True),

@@ -14,31 +14,43 @@ from service.event_stream import ConfirmationEventStream
 
 
 class EventStreamTests(unittest.TestCase):
-    def test_callback_only_queues_and_worker_routes_existing_tables(self):
+    def test_organization_tables_no_longer_trigger_any_refresh(self):
         workflow = Mock()
         bitable = Mock()
         bitable.app_token = "base"
         human = Mock()
         human.table.table_id = "human"
-        organization = Mock()
-        organization.repository.config.tables = {
-            "persons": SimpleNamespace(table_id="persons"),
-            "departments": SimpleNamespace(table_id="departments"),
-        }
         stream = ConfirmationEventStream(
             workflow=workflow, bitable=bitable, human_evaluations=human,
-            organization_cache=organization, settings=Mock())
-        for table_id, record_id in [("persons", "p1"), ("human", "h1")]:
+            settings=Mock())
+        for table_id, record_id in [("persons", "p1"), ("departments", "d1")]:
             event = SimpleNamespace(event=SimpleNamespace(
                 file_token="base", table_id=table_id,
                 action_list=[SimpleNamespace(action="record_edited",
                                              record_id=record_id)]))
             stream._on_record_changed(event)
-        organization.refresh.assert_not_called()
+        self.assertTrue(stream.queue.empty())
+        stream.queue.put(None)
+        stream._run_worker()
+        workflow.handle_human_record.assert_not_called()
+
+    def test_callback_only_queues_and_worker_routes_human_records(self):
+        workflow = Mock()
+        bitable = Mock()
+        bitable.app_token = "base"
+        human = Mock()
+        human.table.table_id = "human"
+        stream = ConfirmationEventStream(
+            workflow=workflow, bitable=bitable, human_evaluations=human,
+            settings=Mock())
+        event = SimpleNamespace(event=SimpleNamespace(
+            file_token="base", table_id="human",
+            action_list=[SimpleNamespace(action="record_edited",
+                                         record_id="h1")]))
+        stream._on_record_changed(event)
         workflow.handle_human_record.assert_not_called()
         stream.queue.put(None)
         stream._run_worker()
-        organization.refresh.assert_called_once()
         workflow.handle_human_record.assert_called_once_with("h1")
 
 

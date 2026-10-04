@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+import threading
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -344,23 +345,72 @@ class OrganizationRepository:
 
 
 class OrganizationCache:
+    """Persisted organization master copy.
+
+    The Feishu person/department tables are read only on the first load
+    (service startup or the lazy first call) and via an explicit ``refresh()``.
+    Runtime changes go through the person CRUD helpers below, which mutate
+    only the persisted local cache.
+    """
+
     def __init__(self, store: FileStateStore, repository: OrganizationRepository) -> None:
         self.store = store
         self.repository = repository
+        self._lock = threading.RLock()
 
     def get(self) -> Organization:
-        cached = self.store.load_cache("organization")
-        if cached is not None:
-            organization = Organization.model_validate(cached)
-            if all(not person.open_id or person.open_id.startswith("ou_")
-                   for person in organization.persons):
-                return organization
-        return self.refresh()
+        with self._lock:
+            cached = self.store.load_cache("organization")
+            if cached is not None:
+                return Organization.model_validate(cached)
+            return self.refresh()
 
     def refresh(self) -> Organization:
-        organization = self.repository.load()
-        self.store.save_cache("organization", organization.model_dump(mode="json"))
-        return organization
+        with self._lock:
+            organization = self.repository.load()
+            self.store.save_cache("organization", organization.model_dump(mode="json"))
+            return organization
+
+    def add_person(self, person: Person) -> Organization:
+        def mutate(organization: Organization) -> None:
+            if any(item.person_id == person.person_id for item in organization.persons):
+                raise ValueError(f"人员 {person.person_id} 已存在")
+            organization.persons.append(person)
+
+        return self._mutate(mutate)
+
+    def update_person(self, person_id: str, changes: Mapping[str, Any]) -> Organization:
+        def mutate(organization: Organization) -> None:
+            person = next((item for item in organization.persons
+                           if item.person_id == person_id), None)
+            if person is None:
+                raise LookupError(f"人员 {person_id} 不存在")
+            for field, value in changes.items():
+                setattr(person, field, value)
+
+        return self._mutate(mutate)
+
+    def delete_person(self, person_id: str) -> Organization:
+        def mutate(organization: Organization) -> None:
+            remaining = [item for item in organization.persons
+                         if item.person_id != person_id]
+            if len(remaining) == len(organization.persons):
+                raise LookupError(f"人员 {person_id} 不存在")
+            organization.persons = remaining
+
+        return self._mutate(mutate)
+
+    def _mutate(self, mutator: Callable[[Organization], None]) -> Organization:
+        with self._lock:
+            organization = self.get()
+            mutator(organization)
+            team_leaders = [person.person_id for person in organization.persons
+                            if person.role == "团队负责人"]
+            organization.team_leader_id = team_leaders[0] if len(team_leaders) == 1 else None
+            organization.anomalies = OrganizationRepository._find_anomalies(
+                organization.departments, organization.persons)
+            self.store.save_cache("organization", organization.model_dump(mode="json"))
+            return organization
 
 
 class LogRepository:
@@ -374,10 +424,20 @@ class LogRepository:
         self.table = config.tables["logs"]
         self.organization_cache = organization_cache
 
-    def get_logs_by_date(self, target_date: date,
-                         organization: Organization | None = None) -> list[WorkLog]:
+    def get_logs_by_date(
+        self, target_date: date,
+        organization: Organization | None = None,
+    ) -> tuple[list[WorkLog], dict[str, str]]:
+        """Return the day's logs (one per person, latest wins) plus read issues.
+
+        Broken rows are skipped and reported through the issue ledger instead
+        of failing the whole day: missing timestamps are interpolated from the
+        neighbouring record (tables are created in submission order), and
+        submitters absent from the persons table are recorded and skipped.
+        """
         start = datetime.combine(target_date, time.min, SHANGHAI)
         end = start + timedelta(days=1)
+        issues: dict[str, str] = {}
         try:
             organization = organization or self.organization_cache.get()
             person_aliases = _alias_index(
@@ -396,37 +456,80 @@ class LogRepository:
                 self.table.table_id,
                 field_names=list(self.table.fields.values()),
             )
-            result: list[WorkLog] = []
             f = self.table.fields
+            rows: list[dict] = []
             for item in records:
                 values = _fields(item)
-                submitted_at = _datetime(values.get(f["submitted_at"]))
-                if not start <= submitted_at < end:
-                    continue
                 log_id = _scalar(values.get(f["log_id"])) or str(
                     item.get("record_id", "")
                 )
+                try:
+                    submitted_at = _datetime(values.get(f["submitted_at"]))
+                except (ValueError, TypeError):
+                    submitted_at = None
+                rows.append({
+                    "item": item, "values": values, "log_id": log_id,
+                    "submitted_at": submitted_at,
+                })
+            # Neighbour-based interpolation keeps submission order semantics.
+            resolved: list[datetime | None] = [row["submitted_at"] for row in rows]
+            for index, row in enumerate(rows):
+                if row["submitted_at"] is not None:
+                    continue
+                timestamp = next(
+                    (value for value in reversed(resolved[:index]) if value), None)
+                if timestamp is None:
+                    timestamp = next(
+                        (value for value in resolved[index + 1:] if value), None)
+                if timestamp is None:
+                    timestamp = datetime.now(SHANGHAI)
+                resolved[index] = timestamp
+                issues[f"log:{row['log_id']}:time-interpolated"] = (
+                    "日志缺少提交时间，按邻近记录时间归入处理，请核对原表")
+            result: list[WorkLog] = []
+            for row, submitted_at in zip(rows, resolved):
+                if not start <= submitted_at < end:
+                    continue
                 person_id = _resolve_reference(
-                    values.get(f["submitter_ref"]), person_aliases
-                )
+                    row["values"].get(f["submitter_ref"]), person_aliases)
                 if not person_id:
-                    raise ValueError(
-                        f"日志 {log_id} 的提交人无法匹配到人员表中的人员编号"
-                    )
+                    name = _display_name(row["values"].get(f["submitter_ref"]))
+                    issues[f"log:{row['log_id']}:unknown-submitter"] = (
+                        f"日志 {row['log_id']} 的提交人「{name or '未知'}」"
+                        "不在人员表，本条已跳过；请补录人员或改派")
+                    continue
                 result.append(
                     WorkLog(
-                        log_id=log_id,
-                        source_record_id=str(item.get("record_id", "")) or None,
+                        log_id=row["log_id"],
+                        source_record_id=str(row["item"].get("record_id", "")) or None,
                         submitted_at=submitted_at,
                         person_id=person_id,
-                        progress=_scalar(values.get(f["progress"])),
-                        difficulties=_scalar(values.get(f["difficulties"])),
-                        reflection=_scalar(values.get(f["reflection"])),
-                        other=_scalar(values.get(f["other"])),
-                        full_log=_scalar(values.get(f["full_log"])),
+                        progress=_scalar(row["values"].get(f["progress"])),
+                        difficulties=_scalar(row["values"].get(f["difficulties"])),
+                        reflection=_scalar(row["values"].get(f["reflection"])),
+                        other=_scalar(row["values"].get(f["other"])),
+                        full_log=_scalar(row["values"].get(f["full_log"])),
                     )
                 )
-            return result
+            # One log per person per day: the latest submission wins outright.
+            latest: dict[str, tuple[int, WorkLog]] = {}
+            for order, log in enumerate(result):
+                current = latest.get(log.person_id)
+                if current is None or (log.submitted_at, order) >= (
+                        current[1].submitted_at, current[0]):
+                    if current is not None:
+                        issues[f"log:{current[1].log_id}:superseded"] = (
+                            f"同一人同日多条日志，{current[1].log_id} 已被 "
+                            f"{log.log_id}（最后一条）取代")
+                    latest[log.person_id] = (order, log)
+                else:
+                    issues[f"log:{log.log_id}:superseded"] = (
+                        f"同一人同日多条日志，{log.log_id} 已被 "
+                        f"{current[1].log_id}（最后一条）取代")
+            kept = [log for _, log in sorted(latest.values(), key=lambda pair: pair[0])]
+            return kept, issues
+        except FeishuReadError:
+            raise
         except Exception as exc:
             raise FeishuReadError(f"Unable to load logs for {target_date}") from exc
 

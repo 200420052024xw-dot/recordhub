@@ -18,9 +18,11 @@ class WorkflowReportRepository:
         self.store = store
 
     def publish(self, snapshot: DailySnapshot,
-                objects: dict[str, CloudObject]) -> None:
+                objects: dict[str, CloudObject]) -> dict[str, str]:
+        """Index documents in the report table; returns issue entries to log."""
+        issues: dict[str, str] = {}
         if not objects:
-            return
+            return issues
         f = self.table.fields
         url_type = None
         if "document_url" in f:
@@ -63,12 +65,18 @@ class WorkflowReportRepository:
             elif scope == "DEPARTMENT":
                 department = departments[scope_id]
                 person_id = department.minister_id
-                title = f"{department.name}部门日志"
+                title = f"{snapshot.target_date:%m-%d} {department.name}日志"
             else:
                 person_id = scope_id
-                title = f"{people[scope_id].name}的成员日志表"
-            if not person_id or not people[person_id].open_id:
-                raise ValueError(f"报告 {key} 缺少报告人 OpenID")
+                title = (f"{snapshot.target_date:%m-%d} "
+                         f"{people[scope_id].name}同学小组日志")
+            if not person_id:
+                raise ValueError(f"报告 {key} 缺少报告人")
+            if not people[person_id].open_id:
+                issues[f"report:{key}:missing-open-id"] = (
+                    f"报告「{key}」的报告人「{people[person_id].name}」缺少 OpenID，"
+                    "索引行未写入，请补录 OpenID 后重跑")
+                continue
             fields = {
                 f["title"]: title if url_type else f"{title}\n{item.url}",
                 f["reporter_ref"]: [{"id": people[person_id].open_id}],
@@ -93,3 +101,4 @@ class WorkflowReportRepository:
                     raise ValueError(f"报告 {key} 创建后没有记录 ID")
                 self.store.map_external_record(
                     snapshot.target_date, key, "reports", record_id)
+        return issues

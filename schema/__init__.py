@@ -148,8 +148,10 @@ class LogEvaluationState(StrictModel):
     positive_final: str | None = None
     improvement_final: str | None = None
     source: Literal["AI", "HUMAN"] = "AI"
+    manual_skipped: bool = False
     record_id: str | None = None
     evaluation_id: str | None = None
+    evaluated_at: datetime | None = None
     error: str | None = None
 
 
@@ -179,6 +181,7 @@ class DailySnapshot(StrictModel):
     evaluators: dict[str, EvaluatorProgress] = Field(default_factory=dict)
     cloud_objects: dict[str, CloudObject] = Field(default_factory=dict)
     evaluations_published: bool = False
+    issues: dict[str, str] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
 
@@ -202,6 +205,55 @@ class ConfirmationRequest(StrictModel):
     record_id: str
     business_key: str
     modified_at: datetime | None = None
+
+
+class PersonCreateRequest(StrictModel):
+    person_id: str
+    name: str
+    role: str
+    department_id: str | None = None
+    leader_id: str | None = None
+    open_id: str | None = None
+    active: bool = True
+
+    @model_validator(mode="after")
+    def required_nonempty(self) -> "PersonCreateRequest":
+        for field in ("person_id", "name", "role"):
+            if not getattr(self, field).strip():
+                raise ValueError(f"{field} 不能为空")
+        return self
+
+    def to_person(self) -> Person:
+        return Person(
+            person_id=self.person_id.strip(),
+            name=self.name.strip(),
+            role=self.role.strip(),
+            department_id=(self.department_id or "").strip() or None,
+            leader_id=(self.leader_id or "").strip() or None,
+            open_id=(self.open_id or "").strip() or None,
+            active=self.active,
+        )
+
+
+class PersonUpdateRequest(StrictModel):
+    name: str | None = None
+    role: str | None = None
+    department_id: str | None = None
+    leader_id: str | None = None
+    open_id: str | None = None
+    active: bool | None = None
+
+    @model_validator(mode="after")
+    def normalize(self) -> "PersonUpdateRequest":
+        if not self.model_fields_set:
+            raise ValueError("至少需要提供一个要修改的字段")
+        for field in ("name", "role"):
+            if field in self.model_fields_set and not (getattr(self, field) or "").strip():
+                raise ValueError(f"{field} 不能为空")
+        for field in ("department_id", "leader_id", "open_id"):
+            if field in self.model_fields_set and not (getattr(self, field) or "").strip():
+                setattr(self, field, None)
+        return self
 
 
 class TableDefinition(StrictModel):

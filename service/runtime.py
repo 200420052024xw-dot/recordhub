@@ -60,6 +60,7 @@ def build_runtime(settings: AppSettings) -> Runtime:
         reports=WorkflowReportRepository(infrastructure.bitable, tables, store),
         llm_concurrency=settings.llm_concurrency,
         auto_advance_at=settings.auto_advance_at,
+        admin_open_id=settings.admin_open_id,
     )
     return Runtime(
         settings=settings,

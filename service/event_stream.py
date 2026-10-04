@@ -11,7 +11,6 @@ from typing import Any
 import lark_oapi as lark
 
 from config.settings import AppSettings
-from data.repositories import OrganizationCache
 from tool.feishu import BitableService
 from data.workflow1_evaluations import HumanEvaluationRepository
 from workflow1.workflow import Workflow1
@@ -26,19 +25,21 @@ class _Job:
 
 
 class ConfirmationEventStream:
+    """Routes questionnaire record changes only.
+
+    Organization tables are never re-read on events; the cached copy is the
+    runtime master data (see OrganizationCache) and refreshes happen only on
+    startup or via the admin API.
+    """
+
     def __init__(self, *, workflow: Workflow1, bitable: BitableService,
                  human_evaluations: HumanEvaluationRepository,
-                 organization_cache: OrganizationCache,
                  settings: AppSettings) -> None:
         self.workflow = workflow
         self.bitable = bitable
         self.human = human_evaluations
-        self.organization = organization_cache
         self.settings = settings
-        tables = organization_cache.repository.config.tables
         self.table_ids = {
-            tables["persons"].table_id: "organization",
-            tables["departments"].table_id: "organization",
             human_evaluations.table.table_id: "human_evaluations",
         }
         self.queue: queue.Queue[_Job | None] = queue.Queue()
@@ -104,10 +105,7 @@ class ConfirmationEventStream:
             if job is None:
                 return
             try:
-                if job.table_name == "organization":
-                    self.organization.refresh()
-                else:
-                    self.workflow.handle_human_record(job.record_id)
+                self.workflow.handle_human_record(job.record_id)
             except Exception:
                 logger.exception("feishu_event_worker_failed")
             finally:

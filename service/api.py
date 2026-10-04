@@ -10,7 +10,12 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import Depends, FastAPI, Header, HTTPException
 
-from schema import ConfirmationRequest
+from schema import (
+    ConfirmationRequest,
+    Organization,
+    PersonCreateRequest,
+    PersonUpdateRequest,
+)
 from service.event_stream import ConfirmationEventStream
 from service.runtime import Runtime, build_runtime
 from config import AppSettings, load_env_file, load_schedule_config
@@ -73,14 +78,22 @@ def _make_lifespan(runtime, settings, schedules):
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         nonlocal scheduler, stream
-        runtime.organization_cache.refresh()
+        try:
+            runtime.organization_cache.refresh()
+        except Exception:
+            # Restart reads the Feishu tables once; if that fails, keep the
+            # persisted cache as the runtime master data instead of dying.
+            if runtime.store.load_cache("organization") is None:
+                raise
+            logger.exception(
+                "organization_refresh_failed_using_persisted_cache"
+            )
         runtime.workflow.recover_incomplete()
         if settings.event_stream_enabled:
             stream = ConfirmationEventStream(
                 workflow=runtime.workflow,
                 bitable=runtime.infrastructure.bitable,
                 human_evaluations=runtime.human_evaluations,
-                organization_cache=runtime.organization_cache,
                 settings=settings,
             )
             stream.start()
@@ -177,7 +190,17 @@ def _register_admin_routes(app, runtime, settings):
         "/admin/workflows/{target_date}/resume", dependencies=[Depends(require_admin)]
     )
     def resume_workflow(target_date: date) -> dict:
+        """重评接口：只重跑标记为失败或尚未处理的日志，已有结果的不动。"""
         return runtime.workflow.resume(target_date).model_dump(mode="json")
+
+    @app.get(
+        "/admin/workflows/{target_date}/issues", dependencies=[Depends(require_admin)]
+    )
+    def workflow_issues(target_date: date) -> dict:
+        snapshot = runtime.store.load_snapshot(target_date)
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail=f"{target_date} 没有当日快照")
+        return {"target_date": target_date.isoformat(), "issues": snapshot.issues}
 
     @app.post(
         "/admin/cache/organization/refresh", dependencies=[Depends(require_admin)]
@@ -189,6 +212,65 @@ def _register_admin_routes(app, runtime, settings):
             "departments": len(organization.departments),
             "anomalies": organization.anomalies,
         }
+
+    @app.get("/admin/organization/persons", dependencies=[Depends(require_admin)])
+    def list_persons() -> dict:
+        return _organization_payload(runtime.organization_cache.get())
+
+    @app.post(
+        "/admin/organization/persons", status_code=201,
+        dependencies=[Depends(require_admin)],
+    )
+    def add_person(request: PersonCreateRequest) -> dict:
+        try:
+            organization = runtime.organization_cache.add_person(request.to_person())
+        except ValueError as exc:
+            _raise_organization_error(exc)
+        return _organization_payload(organization)
+
+    @app.put(
+        "/admin/organization/persons/{person_id}",
+        dependencies=[Depends(require_admin)],
+    )
+    def update_person(person_id: str, request: PersonUpdateRequest) -> dict:
+        try:
+            organization = runtime.organization_cache.update_person(
+                person_id, request.model_dump(exclude_unset=True)
+            )
+        except (ValueError, LookupError) as exc:
+            _raise_organization_error(exc)
+        return _organization_payload(organization)
+
+    @app.delete(
+        "/admin/organization/persons/{person_id}",
+        dependencies=[Depends(require_admin)],
+    )
+    def delete_person(person_id: str) -> dict:
+        try:
+            organization = runtime.organization_cache.delete_person(person_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return _organization_payload(organization)
+
+
+def _organization_payload(organization: Organization) -> dict:
+    return {
+        "team_leader_id": organization.team_leader_id,
+        "anomalies": organization.anomalies,
+        "persons": [person.model_dump(mode="json") for person in organization.persons],
+        "departments": [
+            department.model_dump(mode="json")
+            for department in organization.departments
+        ],
+    }
+
+
+def _raise_organization_error(exc: Exception) -> None:
+    if isinstance(exc, LookupError):
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if "已存在" in str(exc):
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 

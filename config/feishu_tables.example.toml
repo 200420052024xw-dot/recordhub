@@ -62,6 +62,7 @@ table_id = ""                    # 填写人工评价表的 tbl... ID
 evaluation_id = "评价编号"
 person_ref = "被评价日志提交人"
 evaluator_ref = "评价人"
+evaluated_at = "评价时间"
 positive_final = "肯定之处_人工"
 improvement_final = "改进之处_人工"
 submitted_by = "填写人"
@@ -84,7 +85,7 @@ title = "文本"
 reporter_ref = "报告人"
 role = "角色"
 reported_at = "报告时间"
-document_url = "飞书文档链接"
+# document_url = "飞书文档链接"  # 若报告表有独立链接列，可取消注释
 
 
 # ---------- Skill configuration ----------
