@@ -6,6 +6,7 @@ __pycache__/
 dist/
 build/
 data/state/
+config/feishu_tables.toml
 .tmp-wheel/
 .tmp-workbook-analysis/
 *.sqlite

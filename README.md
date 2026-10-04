@@ -1,6 +1,6 @@
 # RecordHub
 
-RecordHub 的 Workflow1 每天读取前一自然日的飞书工作日志，逐条调用一次 DeepSeek Prompt，收集人工评价后生成三级飞书云文档。目标行为见 [Workflow1 改造目标文档](docs/Workflow1_改造目标文档.md)。
+RecordHub 的 Workflow1 每天读取前一自然日的飞书工作日志，逐条调用一次 DeepSeek Prompt，收集人工评价后生成三级飞书云文档。异常处理与重评方法见 [异常流程与重评接口](docs/异常流程与重评接口.md)。
 
 ## 代码位置
 
@@ -34,3 +34,17 @@ Copy-Item .env.example .env
 每日运行状态在 `data/state/workflow1/YYYY-MM-DD.json`。只运行一个服务进程。**已完成的状态保留 2 天**（任意时刻本地都有"昨天评价的＋今天评价的"两天数据，供后续 workbuddy 等流程读取；未完成的状态不清理），由 `RECORDHUB_SNAPSHOT_RETENTION_DAYS` 控制，每天 3:30 执行清理。服务重启时从已保存快照继续，并重读一次人员表/部门表（启动重读失败时使用持久化的组织缓存）；未完成的人工评价在配置的截止时间采用现有 AI 结果并在文档标注"人工未评价"，已填写的人工意见保留。飞书长连接用于及时核对问卷结果（人员/部门表变更不再触发组织缓存重读）。飞书消息采用稳定 UUID 去重；发送结果不明且超过飞书去重窗口时会停下并要求人工核对。
 
 当前版本的云文档接口和真实飞书表字段仍需在目标租户中联调。配置检查只验证本地映射，无法替代飞书 API 权限与字段类型检查。
+
+
+## Skill 与周期分析
+
+- `src/skills/`：S01—S09 Python Skill，返回经过 Schema 与来源校验的 JSON。
+- `src/analysis/`：周期任务、模型、材料准备、版本配置、飞书结果写回、确认与状态恢复。
+- `data/state/checked/workflow1/`：已完成的每日原始检查材料，独立于短期状态清理，供周度和月度分析使用。
+
+新服务默认读取 `config/tables.toml`；可复制 `config/tables.example.toml` 后填写实际表 ID，也可继续通过 `RECORDHUB_TABLE_CONFIG` 指向原配置。仓库自带映射中的表 ID 仅适用于原租户。
+
+周期分析默认关闭自动执行，显式设置 `RECORDHUB_ANALYSIS_ENABLED=true` 后启用。
+详见 [Skill 接口说明](docs/Skill接口与调用说明.md) 和 [周期分析说明](docs/周期分析接入与验收说明.md)。
+程序处理日期、权限、统计及飞书 IO；AI 只处理输入文字并形成待确认建议。
+每日流程采用仓库的同一人同日最后一条日志规则；周期分析读取当日冻结并已确认的有效日志，旧快照中已有多条日志时仍全部保留。

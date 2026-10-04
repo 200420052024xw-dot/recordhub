@@ -25,8 +25,10 @@ packages = [
     "service",
     "tool",
     "llm",
+    "skills",
+    "analysis",
 ]
-package-dir = {workflow1 = "src/workflow1", service = "service", tool = "tool", llm = "llm"}
+package-dir = {skills = "src/skills", analysis = "src/analysis", workflow1 = "src/workflow1", service = "service", tool = "tool", llm = "llm"}
 py-modules = ["main"]
 
 [project.scripts]
