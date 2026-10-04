@@ -49,6 +49,7 @@ class FileStateStore:
         self.root = Path(root)
         self.workflow_type = workflow_type
         self.runs_dir = self.root / workflow_type
+        self.checked_dir = self.root / "checked" / workflow_type
         self._snapshot_model = snapshot_model
         self._lock = threading.RLock()
         self._migrate_legacy_layout()
@@ -68,6 +69,13 @@ class FileStateStore:
                 if not target.exists():
                     os.replace(path, target)
             _rmdir_if_empty(legacy_runs)
+        legacy_checked = self.root / "checked"
+        if legacy_checked.is_dir() and self.workflow_type == "workflow1":
+            for path in legacy_checked.glob("*.json"):
+                self.checked_dir.mkdir(parents=True, exist_ok=True)
+                target = self.checked_dir / path.name
+                if not target.exists():
+                    os.replace(path, target)
         legacy_cache = self.root / "cache"
         if legacy_cache.is_dir():
             for path in legacy_cache.glob("*.json"):
@@ -86,6 +94,13 @@ class FileStateStore:
     def get_or_create_workflow(self, target_date: date) -> WorkflowRun:
         with self._lock:
             document = self._load_document(target_date, missing_ok=True)
+            if document is None:
+                archived = self.checked_dir / f"{target_date.isoformat()}.json"
+                if archived.exists():
+                    document = self._read_json(archived)
+                    if document.get("schema_version") != self.schema_version:
+                        raise WorkflowStateError(f"Unsupported archived state schema in {archived}")
+                    self._write_document(target_date, document)
             if document is not None:
                 return WorkflowRun.model_validate(document["run"])
             now = utc_now()
@@ -163,6 +178,19 @@ class FileStateStore:
     def load_snapshot(self, target_date: date) -> Any:
         with self._lock:
             document = self._load_document(target_date)
+            raw = document.get("snapshot")
+            return self._snapshot_class().model_validate(raw) if raw else None
+
+    def load_check_snapshot(self, target_date: date) -> Any:
+        with self._lock:
+            path = self._workflow_path(target_date)
+            if not path.exists():
+                path = self.checked_dir / f"{target_date.isoformat()}.json"
+            if not path.exists():
+                return None
+            document = self._read_json(path)
+            if document.get("schema_version") != self.schema_version:
+                raise WorkflowStateError(f"Unsupported checked state schema in {path}")
             raw = document.get("snapshot")
             return self._snapshot_class().model_validate(raw) if raw else None
 
@@ -284,6 +312,8 @@ class FileStateStore:
                 document = self._read_json(path)
                 run = WorkflowRun.model_validate(document["run"])
                 if run.status == "COMPLETED" and run.target_date < cutoff:
+                    if document.get("snapshot"):
+                        self._atomic_write(self.checked_dir / path.name, document)
                     path.unlink()
                     removed += 1
         return removed
@@ -313,6 +343,8 @@ class FileStateStore:
 
     def _write_document(self, target_date: date, document: dict[str, Any]) -> None:
         self._atomic_write(self._workflow_path(target_date), document)
+        if document["run"]["status"] == "COMPLETED" and document.get("snapshot"):
+            self._atomic_write(self.checked_dir / f"{target_date.isoformat()}.json", document)
 
     def _workflow_path(self, target_date: date) -> Path:
         return self.runs_dir / f"{target_date.isoformat()}.json"
