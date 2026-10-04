@@ -136,6 +136,7 @@ class Workflow1:
 
     def resume(self, target_date: date) -> WorkflowRun:
         with self._lock:
+            self.store.get_or_create_workflow(target_date)
             if self.store.load_snapshot(target_date):
                 self.store.update_snapshot(target_date, self._reset_failed)
             return self.start(target_date)
@@ -191,6 +192,9 @@ class Workflow1:
                         state.status = (UnitStatus.WAITING_CONFIRMATION
                             if state.evaluator_id else UnitStatus.CONFIRMED)
                         state.evaluated_at = utc_now()
+                        state.ai_evaluated_at = state.evaluated_at
+                        if state.status == UnitStatus.CONFIRMED:
+                            state.confirmed_at = state.evaluated_at
                         state.error = None
                     self.store.update_snapshot(target_date, save)
                 except Exception as exc:
@@ -280,6 +284,7 @@ class Workflow1:
                 state.source = "HUMAN"
                 state.status = UnitStatus.CONFIRMED
                 state.evaluated_at = utc_now()
+                state.confirmed_at = state.evaluated_at
             self.store.update_snapshot(target_date, save)
             snapshot.log_evaluations[log_id].source = "HUMAN"
             accepted += 1
@@ -316,6 +321,7 @@ class Workflow1:
                         raise ValueError(f"日志 {log_id} 尚无有效 AI 评价")
                     if state.status != UnitStatus.CONFIRMED:
                         state.status = UnitStatus.CONFIRMED
+                        state.confirmed_at = utc_now()
                         if state.source != "HUMAN":
                             state.manual_skipped = True
                         count += 1

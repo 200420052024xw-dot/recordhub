@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Callable, Mapping
 from datetime import date, datetime, time, timedelta
@@ -12,6 +13,7 @@ from schema import (
     Person,
     TableConfig,
     WorkLog,
+    LogResource,
 )
 from data import FileStateStore
 from tool.bitable_fields import (
@@ -416,6 +418,11 @@ class LogRepository:
                         reflection=scalar(row["values"].get(f["reflection"])),
                         other=scalar(row["values"].get(f["other"])),
                         full_log=scalar(row["values"].get(f["full_log"])),
+                        achievement_refs=(json.loads(scalar(row["values"].get(f["achievement_refs"])) or "[]")
+                            if f.get("achievement_refs") else []),
+                        resources=([LogResource.model_validate(item) for item in
+                            json.loads(scalar(row["values"].get(f["resources"])) or "[]")]
+                            if f.get("resources") else []),
                     )
                 )
             # One log per person per day: the latest submission wins outright.

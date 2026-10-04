@@ -37,6 +37,7 @@ def check_config(settings: AppSettings) -> int:
         "state_dir": settings.state_dir,
         "table_config": settings.table_config_path,
         "scheduler_enabled": settings.scheduler_enabled,
+        "analysis_enabled": settings.analysis_enabled,
         "enabled_schedules": [
             name for name, item in schedules.workflows.items() if item.enabled
         ],
@@ -71,6 +72,19 @@ def main() -> int:
     refresh_parser.add_argument(
         "cache", choices=["organization", "all"]
     )
+    analysis_parser = subparsers.add_parser("run-analysis")
+    analysis_parser.add_argument("--skill", required=True, choices=["S04", "S05", "S06", "S07", "S08", "S09"])
+    analysis_parser.add_argument("--start", required=True, type=date.fromisoformat)
+    analysis_parser.add_argument("--end", required=True, type=date.fromisoformat)
+    analysis_parser.add_argument("--user-id", required=True)
+    analysis_parser.add_argument("--department-id", action="append")
+    analysis_parser.add_argument("--revision", default="1")
+    analysis_resume = subparsers.add_parser("resume-analysis")
+    analysis_resume.add_argument("--run-id", required=True)
+    analysis_confirm = subparsers.add_parser("confirm-analysis")
+    analysis_confirm.add_argument("--run-id", required=True)
+    analysis_confirm.add_argument("--user-id", required=True)
+    analysis_confirm.add_argument("--content-file", type=Path)
     args = parser.parse_args()
     command = args.command or "check-config"
     if command == "check-config":
@@ -90,7 +104,18 @@ def main() -> int:
 
     runtime = build_runtime(settings)
     workflow1 = runtime.workflows["workflow1_daily"]
-    if command == "run-workflow":
+    if command == "run-analysis":
+        from analysis.models import AnalysisRequest
+        result = runtime.analysis.run(AnalysisRequest(skill_code=args.skill,
+            start_date=args.start, end_date=args.end, user_id=args.user_id,
+            department_ids=args.department_id, revision=args.revision))
+    elif command == "resume-analysis":
+        result = runtime.analysis.resume(args.run_id)
+    elif command == "confirm-analysis":
+        content = (json.loads(args.content_file.read_text(encoding="utf-8-sig"))
+                   if args.content_file else None)
+        result = runtime.analysis.confirm(args.run_id, user_id=args.user_id, content=content)
+    elif command == "run-workflow":
         result = workflow1.workflow.start(args.date)
     elif command == "resume-workflow":
         result = workflow1.workflow.resume(args.date)

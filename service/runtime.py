@@ -5,6 +5,10 @@ from collections.abc import Callable
 from typing import Any
 
 from config import AppSettings, load_table_config
+from analysis.materials import MaterialPreparer
+from analysis.repositories import AnalysisRepository, SkillConfigRepository
+from analysis.store import AnalysisStore
+from analysis.workflow import AnalysisWorkflow
 from data import FileStateStore
 from data.repositories import LogRepository, OrganizationCache, OrganizationRepository
 from llm import PromptService
@@ -52,6 +56,7 @@ class Runtime:
     infrastructure: Infrastructure
     organization_cache: OrganizationCache
     workflows: dict[str, WorkflowBinding]
+    analysis: AnalysisWorkflow | None = None
 
 
 @dataclass(slots=True)
@@ -113,9 +118,20 @@ def build_runtime(settings: AppSettings) -> Runtime:
             human_evaluations.table.table_id: workflow.handle_human_record,
         },
     )
+    analysis = AnalysisWorkflow(
+        store=AnalysisStore(settings.state_dir), preparer=MaterialPreparer(store),
+        organization=organization_cache,
+        configs=SkillConfigRepository(infrastructure.bitable, tables,
+            settings.skill_config_path, settings.team_skill_department_id),
+        repository=AnalysisRepository(infrastructure.bitable, tables),
+        prompt_service=PromptService(infrastructure.llm, max_attempts=settings.llm_max_attempts),
+        messages=infrastructure.messages,
+        team_department_id=settings.team_skill_department_id,
+    )
     return Runtime(
         settings=settings,
         infrastructure=infrastructure,
         organization_cache=organization_cache,
         workflows={binding.name: binding},
+        analysis=analysis,
     )

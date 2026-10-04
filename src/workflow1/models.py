@@ -62,6 +62,8 @@ class LogEvaluationState(StrictModel):
     record_id: str | None = None
     evaluation_id: str | None = None
     evaluated_at: datetime | None = None
+    ai_evaluated_at: datetime | None = None
+    confirmed_at: datetime | None = None
     error: str | None = None
 
 
