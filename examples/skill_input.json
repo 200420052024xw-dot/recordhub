@@ -1,0 +1,28 @@
+{
+  "run_id": "example-only",
+  "scope": {
+    "start_date": "2026-10-03",
+    "end_date": "2026-10-03",
+    "department_ids": ["d1"],
+    "complete": true
+  },
+  "records": [
+    {
+      "record_id": "example-record-1",
+      "person_id": "example-student-1",
+      "name": "示例学生",
+      "department_id": "d1",
+      "department_name": "示例部门",
+      "role": "基层学生",
+      "work_start": "2026-10-03",
+      "work_end": "2026-10-03",
+      "submitted": true,
+      "confirmed": true,
+      "progress": "完成示例数据核对",
+      "difficulties": "两条示例记录缺少编号",
+      "reflection": "归档前应先核对编号",
+      "other": "下一步补齐编号"
+    }
+  ],
+  "resources": []
+}
