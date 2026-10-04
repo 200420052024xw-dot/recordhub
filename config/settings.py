@@ -53,6 +53,9 @@ class AppSettings:
     llm_max_attempts: int = 3
     snapshot_retention_days: int = 2
     scheduler_enabled: bool = True
+    analysis_enabled: bool = False
+    skill_config_path: str = "config/skill_versions.json"
+    team_skill_department_id: str = "TEAM_MANAGEMENT"
     event_stream_enabled: bool = True
     archive_parent_folder_token: str = ""
 
@@ -93,6 +96,9 @@ class AppSettings:
                 "RECORDHUB_SNAPSHOT_RETENTION_DAYS", 2
             ),
             scheduler_enabled=_boolean("RECORDHUB_SCHEDULER_ENABLED", True),
+            analysis_enabled=_boolean("RECORDHUB_ANALYSIS_ENABLED", False),
+            skill_config_path=os.getenv("RECORDHUB_SKILL_CONFIG", "config/skill_versions.json"),
+            team_skill_department_id=os.getenv("RECORDHUB_TEAM_SKILL_DEPARTMENT_ID", "TEAM_MANAGEMENT").strip(),
             event_stream_enabled=_boolean("RECORDHUB_EVENT_STREAM_ENABLED", True),
             archive_parent_folder_token=os.getenv(
                 "RECORDHUB_ARCHIVE_PARENT_FOLDER_TOKEN", "").strip(),
@@ -110,6 +116,8 @@ class AppSettings:
         return [name for name, value in required.items() if not value]
 
     def validate(self) -> None:
+        if not self.team_skill_department_id.strip():
+            raise ValueError("团队 Skill 配置归属编号不能为空")
         missing = self.missing_variables()
         if missing:
             raise ValueError(f"Missing environment variables: {', '.join(missing)}")

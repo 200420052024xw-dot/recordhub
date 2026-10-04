@@ -1,0 +1,12 @@
+[
+  {
+    "config_id": "example-department-s04-v1",
+    "skill_code": "S04",
+    "department_id": "replace-with-department-id",
+    "user_id": null,
+    "version": "department-1",
+    "based_on_version": "1.0",
+    "instructions": "按实际工作事项整理进展，突出明确写出的困难。",
+    "enabled": false
+  }
+]
