@@ -5,11 +5,6 @@ from datetime import date, timedelta
 from config.schedules import WorkflowSchedule
 
 
-PERIODIC_CODES = {"s04_progress": "S04", "s05_people_suggestions": "S05",
-                  "s06_ideas": "S06", "s07_meeting_focus": "S07",
-                  "s08_public_technology": "S08", "s09_public_training": "S09"}
-
-
 def due(schedule: WorkflowSchedule, today: date) -> bool:
     if not schedule.enabled:
         return False

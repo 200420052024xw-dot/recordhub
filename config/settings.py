@@ -49,11 +49,12 @@ class AppSettings:
     admin_token: str = ""
     admin_open_id: str = ""
     message_override_open_id: str = ""
+    simulation_mode: bool = False
     llm_concurrency: int = 3
     llm_max_attempts: int = 3
-    snapshot_retention_days: int = 2
+    snapshot_retention_days: int = 3
     scheduler_enabled: bool = True
-    analysis_enabled: bool = False
+    workflow2_enabled: bool = False
     skill_config_path: str = "config/skill_versions.json"
     team_skill_department_id: str = "TEAM_MANAGEMENT"
     event_stream_enabled: bool = True
@@ -90,13 +91,14 @@ class AppSettings:
             admin_token=os.getenv("RECORDHUB_ADMIN_TOKEN", ""),
             admin_open_id=os.getenv("RECORDHUB_ADMIN_OPEN_ID", ""),
             message_override_open_id=os.getenv("RECORDHUB_MESSAGE_OVERRIDE_OPEN_ID", ""),
+            simulation_mode=_boolean("RECORDHUB_SIMULATION_MODE", False),
             llm_concurrency=_positive_int("RECORDHUB_LLM_CONCURRENCY", 3),
             llm_max_attempts=_positive_int("RECORDHUB_LLM_MAX_ATTEMPTS", 3),
             snapshot_retention_days=_positive_int(
-                "RECORDHUB_SNAPSHOT_RETENTION_DAYS", 2
+                "RECORDHUB_SNAPSHOT_RETENTION_DAYS", 3
             ),
             scheduler_enabled=_boolean("RECORDHUB_SCHEDULER_ENABLED", True),
-            analysis_enabled=_boolean("RECORDHUB_ANALYSIS_ENABLED", False),
+            workflow2_enabled=_boolean("RECORDHUB_WORKFLOW2_ENABLED", False),
             skill_config_path=os.getenv("RECORDHUB_SKILL_CONFIG", "config/skill_versions.json"),
             team_skill_department_id=os.getenv("RECORDHUB_TEAM_SKILL_DEPARTMENT_ID", "TEAM_MANAGEMENT").strip(),
             event_stream_enabled=_boolean("RECORDHUB_EVENT_STREAM_ENABLED", True),
@@ -116,6 +118,8 @@ class AppSettings:
         return [name for name, value in required.items() if not value]
 
     def validate(self) -> None:
+        if self.simulation_mode and not self.message_override_open_id.strip():
+            raise ValueError("RECORDHUB_SIMULATION_MODE requires RECORDHUB_MESSAGE_OVERRIDE_OPEN_ID")
         if not self.team_skill_department_id.strip():
             raise ValueError("团队 Skill 配置归属编号不能为空")
         missing = self.missing_variables()

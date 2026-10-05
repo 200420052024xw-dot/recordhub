@@ -22,14 +22,24 @@ def check_config(settings: AppSettings) -> int:
     w1 = W1Settings.from_env()
     missing = settings.missing_variables()
     table_config_error = ""
+    workflow2_missing: list[str] = []
     try:
-        load_table_config(settings.table_config_path)
+        tables = load_table_config(settings.table_config_path)
+        required = ("stage_analysis", "stage_confirmation", "stage_report",
+                    "monthly_department_analysis", "monthly_department_confirmation",
+                    "monthly_department_report", "team_analysis")
+        workflow2_missing = [name for name in required
+                             if name not in tables.tables or not tables.tables[name].table_id]
+        if not schedules.workflows["s05_people_suggestions"].options.get("form_url"):
+            workflow2_missing.append("monthly_form_url")
     except ValueError as exc:
         table_config_error = str(exc)
     result = {
-        "status": "ready" if not missing and not table_config_error else "incomplete",
+        "status": "ready" if not missing and not table_config_error and
+        (not settings.workflow2_enabled or not workflow2_missing) else "incomplete",
         "missing_variables": missing,
         "table_config_error": table_config_error or None,
+        "workflow2_missing": workflow2_missing,
         "feishu_base_url": settings.feishu.base_url,
         "deepseek_base_url": settings.deepseek.base_url,
         "deepseek_model": settings.deepseek.model,
@@ -37,7 +47,7 @@ def check_config(settings: AppSettings) -> int:
         "state_dir": settings.state_dir,
         "table_config": settings.table_config_path,
         "scheduler_enabled": settings.scheduler_enabled,
-        "analysis_enabled": settings.analysis_enabled,
+        "workflow2_enabled": settings.workflow2_enabled,
         "enabled_schedules": [
             name for name, item in schedules.workflows.items() if item.enabled
         ],
@@ -47,13 +57,14 @@ def check_config(settings: AppSettings) -> int:
         },
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if not missing and not table_config_error else 1
+    return 0 if not missing and not table_config_error and (
+        not settings.workflow2_enabled or not workflow2_missing) else 1
 
 
 def main() -> int:
     load_env_file()
     settings = AppSettings.from_env()
-    parser = argparse.ArgumentParser(description="RecordHub Workflow1 service")
+    parser = argparse.ArgumentParser(description="RecordHub Workflow1 and Workflow2 service")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("check-config")
 
@@ -72,19 +83,11 @@ def main() -> int:
     refresh_parser.add_argument(
         "cache", choices=["organization", "all"]
     )
-    analysis_parser = subparsers.add_parser("run-analysis")
-    analysis_parser.add_argument("--skill", required=True, choices=["S04", "S05", "S06", "S07", "S08", "S09"])
-    analysis_parser.add_argument("--start", required=True, type=date.fromisoformat)
-    analysis_parser.add_argument("--end", required=True, type=date.fromisoformat)
-    analysis_parser.add_argument("--user-id", required=True)
-    analysis_parser.add_argument("--department-id", action="append")
-    analysis_parser.add_argument("--revision", default="1")
-    analysis_resume = subparsers.add_parser("resume-analysis")
-    analysis_resume.add_argument("--run-id", required=True)
-    analysis_confirm = subparsers.add_parser("confirm-analysis")
-    analysis_confirm.add_argument("--run-id", required=True)
-    analysis_confirm.add_argument("--user-id", required=True)
-    analysis_confirm.add_argument("--content-file", type=Path)
+    workflow2_parser = subparsers.add_parser("run-workflow2")
+    workflow2_parser.add_argument("--kind", required=True, choices=["stage", "monthly", "weekly"])
+    workflow2_parser.add_argument("--date", required=True, type=date.fromisoformat)
+    workflow2_resume = subparsers.add_parser("resume-workflow2")
+    workflow2_resume.add_argument("--run-id", required=True)
     args = parser.parse_args()
     command = args.command or "check-config"
     if command == "check-config":
@@ -104,17 +107,10 @@ def main() -> int:
 
     runtime = build_runtime(settings)
     workflow1 = runtime.workflows["workflow1_daily"]
-    if command == "run-analysis":
-        from analysis.models import AnalysisRequest
-        result = runtime.analysis.run(AnalysisRequest(skill_code=args.skill,
-            start_date=args.start, end_date=args.end, user_id=args.user_id,
-            department_ids=args.department_id, revision=args.revision))
-    elif command == "resume-analysis":
-        result = runtime.analysis.resume(args.run_id)
-    elif command == "confirm-analysis":
-        content = (json.loads(args.content_file.read_text(encoding="utf-8-sig"))
-                   if args.content_file else None)
-        result = runtime.analysis.confirm(args.run_id, user_id=args.user_id, content=content)
+    if command == "run-workflow2":
+        result = runtime.workflow2.start(args.kind, args.date)
+    elif command == "resume-workflow2":
+        result = runtime.workflow2.resume(args.run_id)
     elif command == "run-workflow":
         result = workflow1.workflow.start(args.date)
     elif command == "resume-workflow":

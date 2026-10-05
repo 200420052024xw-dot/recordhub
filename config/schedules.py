@@ -93,6 +93,12 @@ def load_schedule_config(
 
 
 def _validate_type_options(name: str, schedule_type: str, values: dict[str, Any]) -> None:
+    if "confirmation_days" in values:
+        days = values["confirmation_days"]
+        if not isinstance(days, int) or days < 0:
+            raise ValueError(f"Workflow schedule {name} needs nonnegative confirmation_days")
+    if "confirmation_time" in values and not _TIME_PATTERN.fullmatch(str(values["confirmation_time"])):
+        raise ValueError(f"Workflow schedule {name} has invalid confirmation_time")
     if schedule_type == "weekly" and values.get("weekday") not in _WEEKDAYS:
         raise ValueError(f"Weekly task {name} needs weekday mon..sun")
     if schedule_type == "monthly":
@@ -103,6 +109,12 @@ def _validate_type_options(name: str, schedule_type: str, values: dict[str, Any]
         every_days = values.get("every_days")
         if not isinstance(every_days, int) or every_days < 1:
             raise ValueError(f"Interval task {name} needs positive every_days")
+        if "startup_wait_complete_days" in values:
+            wait_days = values["startup_wait_complete_days"]
+            material_days = values.get("material_days", 3)
+            if (not isinstance(wait_days, int) or not isinstance(material_days, int)
+                    or wait_days < material_days or material_days < 1):
+                raise ValueError(f"Interval task {name} must wait for its complete material days")
         try:
             date.fromisoformat(str(values.get("anchor_date", "")))
         except ValueError as exc:
@@ -126,5 +138,3 @@ def _check_dependency_cycles(workflows: dict[str, WorkflowSchedule]) -> None:
 
     for workflow_name in workflows:
         visit(workflow_name)
-
-

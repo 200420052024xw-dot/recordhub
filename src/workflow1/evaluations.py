@@ -62,6 +62,7 @@ class AiEvaluationRepository:
         through the returned issues instead of failing the whole day.
         """
         f = self.table.fields
+        business_field = f.get("business_key")
         logs = {log.log_id: log for log in snapshot.logs}
         people = snapshot.organization.person_map()
         issues: dict[str, str] = {}
@@ -73,8 +74,11 @@ class AiEvaluationRepository:
             fields = record_fields(record)
             record_id = str(record.get("record_id", ""))
             evaluation_id = scalar(fields.get(f["evaluation_id"]))
-            if record_id and evaluation_id:
-                by_evaluation[evaluation_id] = (record_id, evaluation_id)
+            business_id = scalar(fields.get(business_field)) if business_field else evaluation_id
+            if record_id and business_id:
+                if business_field and not evaluation_id:
+                    raise ValueError(f"AI 评价记录 {record_id} 缺少自动评价编号")
+                by_evaluation[business_id] = (record_id, evaluation_id)
             source = scalar(fields.get(f["source_log"]))
             if source:
                 source_rows[source].append(record)
@@ -132,7 +136,7 @@ class AiEvaluationRepository:
                 mapped[state.log_id] = (record_id, evaluation_id)
                 continue
             creates.append((state.log_id, {
-                f["evaluation_id"]: key,
+                business_field or f["evaluation_id"]: key,
                 f["person_ref"]: [{"id": person.open_id}],
                 f["source_log"]: log.content(),
                 f["evaluated_at"]: int(datetime.now().timestamp() * 1000),
@@ -152,7 +156,7 @@ class AiEvaluationRepository:
                     f"未交人员「{person.name}」缺少 OpenID，未填写日志标注行未写回")
                 continue
             creates.append((None, {
-                f["evaluation_id"]: key,
+                business_field or f["evaluation_id"]: key,
                 f["person_ref"]: [{"id": person.open_id}],
                 f["evaluated_at"]: int(datetime.now().timestamp() * 1000),
                 f["positive_ai"]: "未填写日志",
@@ -168,8 +172,14 @@ class AiEvaluationRepository:
                 record_id = str(record.get("record_id", ""))
                 if not record_id:
                     raise ValueError(f"日志 {log_id} 创建后没有记录 ID")
-                evaluation_id = scalar(record_fields(record).get(f["evaluation_id"])) \
-                    or fields_sent[f["evaluation_id"]]
+                evaluation_id = scalar(record_fields(record).get(f["evaluation_id"]))
+                if business_field and not evaluation_id:
+                    evaluation_id = scalar(record_fields(self.bitable.get_record(
+                        self.table.table_id, record_id)).get(f["evaluation_id"]))
+                if not evaluation_id:
+                    if business_field:
+                        raise ValueError(f"AI 评价记录 {record_id} 缺少自动评价编号")
+                    evaluation_id = scalar(fields_sent.get(f["evaluation_id"]))
                 if log_id is not None:
                     mapped[log_id] = (record_id, evaluation_id)
         return mapped, issues
@@ -233,8 +243,19 @@ class HumanEvaluationRepository:
                    evaluator.open_id, evaluator.source_record_id}
         if not authors.intersection(allowed):
             raise ValueError(f"人工评价 {evaluation_id} 的填写人不是直属评价人")
-        positive = scalar(values.get(f["positive_final"])).strip()
-        improvement = scalar(values.get(f["improvement_final"])).strip()
+        positive_flag = scalar(values.get(f["positive_confirmed"])).strip() if f.get("positive_confirmed") else ""
+        improvement_flag = scalar(values.get(f["improvement_confirmed"])).strip() if f.get("improvement_confirmed") else ""
+        if f.get("positive_confirmed") and f.get("improvement_confirmed"):
+            if not positive_flag or not improvement_flag:
+                return None
+            allowed = {"确认无误", "需修改"}
+            if positive_flag not in allowed or improvement_flag not in allowed:
+                raise ValueError(f"人工评价 {evaluation_id} 的确认选项无效")
+            positive = (state.positive_ai or "") if positive_flag == "确认无误" else scalar(values.get(f["positive_final"])).strip()
+            improvement = (state.improvement_ai or "") if improvement_flag == "确认无误" else scalar(values.get(f["improvement_final"])).strip()
+        else:
+            positive = scalar(values.get(f["positive_final"])).strip()
+            improvement = scalar(values.get(f["improvement_final"])).strip()
         if not positive or not improvement:
             return None
         key = evaluation_key(snapshot.target_date, state.evaluator_id, state.log_id)

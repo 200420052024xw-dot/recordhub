@@ -11,6 +11,7 @@ import argparse
 import json
 import sys
 import tempfile
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -98,7 +99,8 @@ def main() -> int:
     target_date = args.date or datetime.now(ZoneInfo("Asia/Shanghai")).date()
 
     load_env_file(ROOT / ".env")
-    settings = AppSettings.from_env()
+    settings = replace(AppSettings.from_env(),
+                       simulation_mode=args.send_confirmations)
     runtime = build_runtime(settings)
     binding = runtime.workflows["workflow1_daily"]
     live = binding.workflow
@@ -119,15 +121,15 @@ def main() -> int:
             store=store,
             organization_cache=runtime.organization_cache,
             log_repository=PreviewLogs(live.log_repository),
-                ai_evaluations=live.ai_evaluations,
-                human_evaluations=live.human_evaluations,
-                prompt_service=live.prompt_service,
-                messages=sender,
-                documents=live.documents,
-                reports=live.reports,
-                auto_advance_at="",
-            )
-            workflow._notify_evaluators(target_date)
+            ai_evaluations=live.ai_evaluations,
+            human_evaluations=live.human_evaluations,
+            prompt_service=live.prompt_service,
+            messages=sender,
+            documents=live.documents,
+            reports=live.reports,
+            auto_advance_at="",
+        )
+        workflow._notify_evaluators(target_date)
         print(json.dumps({"date": str(target_date),
                           "sent_to_test_account": len(sender.message_ids),
                           "message_ids": sender.message_ids}, indent=2))
@@ -182,7 +184,7 @@ def main() -> int:
             "notifications_suppressed": len(messages.sent),
             "logs": logs,
         }
-        report_path = ROOT / "data" / "state" / "previews" / f"workflow1-{target_date}.json"
+        report_path = ROOT / "data" / "state" / "workflow1" / "previews" / f"{target_date}.json"
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps({

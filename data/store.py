@@ -303,19 +303,33 @@ class FileStateStore:
             return self._read_json(path).get("payload")
 
     def cleanup_completed(self, retention_days: int, *, today: date | None = None) -> int:
+        """Really delete completed daily states once past retention.
+
+        Snapshots are processing caches; the Feishu tables are the source of
+        truth, so no checked copy is kept. Incomplete days are never touched.
+        """
         cutoff = (today or date.today()) - timedelta(days=retention_days)
         removed = 0
         with self._lock:
-            if not self.runs_dir.exists():
-                return 0
-            for path in self.runs_dir.glob("*.json"):
-                document = self._read_json(path)
-                run = WorkflowRun.model_validate(document["run"])
-                if run.status == "COMPLETED" and run.target_date < cutoff:
-                    if document.get("snapshot"):
-                        self._atomic_write(self.checked_dir / path.name, document)
-                    path.unlink()
-                    removed += 1
+            if self.runs_dir.exists():
+                for path in self.runs_dir.glob("*.json"):
+                    document = self._read_json(path)
+                    run = WorkflowRun.model_validate(document["run"])
+                    if run.status == "COMPLETED" and run.target_date < cutoff:
+                        path.unlink()
+                        archived = self.checked_dir / path.name
+                        if archived.exists():
+                            archived.unlink()
+                        removed += 1
+            if self.checked_dir.exists():
+                for path in self.checked_dir.glob("*.json"):
+                    try:
+                        day = date.fromisoformat(path.stem)
+                    except ValueError:
+                        continue
+                    if day < cutoff:
+                        path.unlink()
+                        removed += 1
         return removed
 
     def _mutate_document(
@@ -343,8 +357,6 @@ class FileStateStore:
 
     def _write_document(self, target_date: date, document: dict[str, Any]) -> None:
         self._atomic_write(self._workflow_path(target_date), document)
-        if document["run"]["status"] == "COMPLETED" and document.get("snapshot"):
-            self._atomic_write(self.checked_dir / f"{target_date.isoformat()}.json", document)
 
     def _workflow_path(self, target_date: date) -> Path:
         return self.runs_dir / f"{target_date.isoformat()}.json"

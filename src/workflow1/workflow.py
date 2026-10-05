@@ -22,7 +22,7 @@ from workflow1.evaluations import AiEvaluationRepository, HumanEvaluationReposit
 from workflow1.reports import WorkflowReportRepository
 
 logger = logging.getLogger(__name__)
-FORM_URL = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcn4Atuvh0rgPngi5TMQCoxmg"
+FORM_URL = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcnzhv8IqgIeWXqltJQkWo7ag"
 
 # 通知称呼：部长/团队负责人称「老师」，骨干称「同学」；其余角色不加后缀。
 ROLE_TITLES = {"部长": "老师", "团队负责人": "老师", "骨干学生": "同学"}
@@ -384,6 +384,9 @@ class Workflow1:
             target_date,
             on_issue=lambda key, reason: self._record_issue(target_date, key, reason))
         report_issues = self.reports.publish(snapshot, objects)
+        detail_issues = self.reports.publish_details(snapshot, objects)
+        if isinstance(detail_issues, dict):
+            report_issues.update(detail_issues)
         for key, reason in report_issues.items():
             self._record_issue(target_date, key, reason)
         people = snapshot.organization.person_map()

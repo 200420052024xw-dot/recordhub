@@ -344,8 +344,26 @@ class LogRepository:
         neighbouring record (tables are created in submission order), and
         submitters absent from the persons table are recorded and skipped.
         """
-        start = datetime.combine(target_date, time.min, SHANGHAI)
-        end = start + timedelta(days=1)
+        bucket = self._logs_in_window(target_date, target_date, organization)
+        return bucket.get(target_date, ([], {}))
+
+    def logs_in_window(
+        self, start: date, end: date,
+        organization: Organization | None = None,
+    ) -> dict[date, tuple[list[WorkLog], dict[str, str]]]:
+        """Read the log table once and return (logs, issues) per day in range.
+
+        Identical parsing semantics as ``get_logs_by_date``; used by Workflow2
+        when the local snapshot cache no longer covers the analysis window.
+        """
+        return self._logs_in_window(start, end, organization)
+
+    def _logs_in_window(
+        self, start_day: date, end_day: date,
+        organization: Organization | None = None,
+    ) -> dict[date, tuple[list[WorkLog], dict[str, str]]]:
+        start = datetime.combine(start_day, time.min, SHANGHAI)
+        end = datetime.combine(end_day + timedelta(days=1), time.min, SHANGHAI)
         issues: dict[str, str] = {}
         try:
             organization = organization or self.organization_cache.get()
@@ -395,6 +413,11 @@ class LogRepository:
                 resolved[index] = timestamp
                 issues[f"log:{row['log_id']}:time-interpolated"] = (
                     "日志缺少提交时间，按邻近记录时间归入处理，请核对原表")
+            per_day: dict[date, tuple[list[WorkLog], dict[str, str]]] = {}
+            day = start_day
+            while day <= end_day:
+                per_day[day] = ([], dict(issues))
+                day += timedelta(days=1)
             result: list[WorkLog] = []
             for row, submitted_at in zip(rows, resolved):
                 if not start <= submitted_at < end:
@@ -406,6 +429,10 @@ class LogRepository:
                     issues[f"log:{row['log_id']}:unknown-submitter"] = (
                         f"日志 {row['log_id']} 的提交人「{name or '未知'}」"
                         "不在人员表，本条已跳过；请补录人员或改派")
+                    row_day = submitted_at.astimezone(SHANGHAI).date()
+                    if row_day in per_day:
+                        per_day[row_day][1][f"log:{row['log_id']}:unknown-submitter"] = (
+                            issues[f"log:{row['log_id']}:unknown-submitter"])
                     continue
                 result.append(
                     WorkLog(
@@ -426,23 +453,31 @@ class LogRepository:
                     )
                 )
             # One log per person per day: the latest submission wins outright.
-            latest: dict[str, tuple[int, WorkLog]] = {}
-            for order, log in enumerate(result):
-                current = latest.get(log.person_id)
-                if current is None or (log.submitted_at, order) >= (
-                        current[1].submitted_at, current[0]):
-                    if current is not None:
-                        issues[f"log:{current[1].log_id}:superseded"] = (
-                            f"同一人同日多条日志，{current[1].log_id} 已被 "
-                            f"{log.log_id}（最后一条）取代")
-                    latest[log.person_id] = (order, log)
-                else:
-                    issues[f"log:{log.log_id}:superseded"] = (
-                        f"同一人同日多条日志，{log.log_id} 已被 "
-                        f"{current[1].log_id}（最后一条）取代")
-            kept = [log for _, log in sorted(latest.values(), key=lambda pair: pair[0])]
-            return kept, issues
+            by_day: dict[date, list[WorkLog]] = {}
+            for log in result:
+                by_day.setdefault(
+                    log.submitted_at.astimezone(SHANGHAI).date(), []).append(log)
+            for day, day_logs in by_day.items():
+                day_issues = per_day[day][1]
+                latest: dict[str, tuple[int, WorkLog]] = {}
+                for order, log in enumerate(day_logs):
+                    current = latest.get(log.person_id)
+                    if current is None or (log.submitted_at, order) >= (
+                            current[1].submitted_at, current[0]):
+                        if current is not None:
+                            day_issues[f"log:{current[1].log_id}:superseded"] = (
+                                f"同一人同日多条日志，{current[1].log_id} 已被 "
+                                f"{log.log_id}（最后一条）取代")
+                        latest[log.person_id] = (order, log)
+                    else:
+                        day_issues[f"log:{log.log_id}:superseded"] = (
+                            f"同一人同日多条日志，{log.log_id} 已被 "
+                            f"{current[1].log_id}（最后一条）取代")
+                per_day[day] = ([log for _, log in sorted(
+                    latest.values(), key=lambda pair: pair[0])], day_issues)
+            return per_day
         except FeishuReadError:
             raise
         except Exception as exc:
-            raise FeishuReadError(f"Unable to load logs for {target_date}") from exc
+            raise FeishuReadError(
+                f"Unable to load logs for {start_day}~{end_day}") from exc

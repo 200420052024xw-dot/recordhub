@@ -88,7 +88,8 @@ class Workflow1PipelineTests(unittest.TestCase):
             state.positive_ai = "肯定"
             state.improvement_ai = "改进"
         fields = {
-            "evaluation_id": "评价编号", "person_ref": "被评价日志提交人",
+            "evaluation_id": "业务编号", "business_key": "业务编号",
+            "person_ref": "被评价日志提交人",
             "evaluator_ref": "评价人", "source_log": "工作日志",
             "evaluated_at": "评价时间", "positive_ai": "肯定之处_AI",
             "improvement_ai": "改进之处_AI",
@@ -106,7 +107,7 @@ class Workflow1PipelineTests(unittest.TestCase):
                 result = []
                 for row in rows:
                     record = {"record_id": f"rec{len(self.records) + 1}",
-                        "fields": {**row, "评价编号": f"PJ-{len(self.records) + 1}"}}
+                        "fields": dict(row)}
                     self.records.append(record)
                     result.append(record)
                 return result
@@ -119,6 +120,7 @@ class Workflow1PipelineTests(unittest.TestCase):
         self.assertEqual(first[1], {})
         self.assertEqual(len(bitable.created), 3)
         self.assertEqual(set(bitable.created[0]), set(fields.values()) - {"评价人"})
+        self.assertTrue(bitable.created[0]["业务编号"].startswith("2026-10-03:EVAL:"))
         self.assertEqual(bitable.created[0]["工作日志"], "第一条")
 
     def test_log_content_uses_four_sections_without_blank_lines(self):
@@ -165,7 +167,7 @@ class Workflow1PipelineTests(unittest.TestCase):
             repo.publish(snapshot, {item.business_key: item})
         self.assertEqual(bitable.calls, 1)
         self.assertEqual(set(bitable.records[0]["fields"]),
-            {"文本", "报告人", "角色", "报告时间", "飞书文档链接"})
+            {"报告人", "角色", "报告时间", "飞书文档链接"})
         self.assertEqual(bitable.records[0]["fields"]["飞书文档链接"],
                          {"text": "10-03 团队日志", "link": item.url})
 

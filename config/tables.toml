@@ -37,7 +37,8 @@ full_log = "完整日志"
 [tables.evaluations]
 table_id = "tbl4B9ZzGLgXvqXO"
 [tables.evaluations.fields]
-evaluation_id = "评价编号"
+evaluation_id = "业务编号"
+business_key = "业务编号"
 person_ref = "被评价日志提交人"
 evaluator_ref = "评价人"
 source_log = "工作日志"
@@ -55,9 +56,11 @@ evaluated_at = "评价时间"
 positive_final = "肯定之处_人工"
 improvement_final = "改进之处_人工"
 submitted_by = "填写人"
+positive_confirmed = "肯定之处_AI是否确认"
+improvement_confirmed = "需改进之处_AI是否确认："
 
 [tables.check_details]
-table_id = "tblyjKkCAraVJqPR"
+table_id = "tblHG8enRcoNwdqv"
 [tables.check_details.fields]
 title = "文本"
 reporter_ref = "报告人"
@@ -67,12 +70,13 @@ submitted = "已交人数"
 missing = "未交认数"
 
 [tables.reports]
-table_id = "tblHG8enRcoNwdqv"
+table_id = "tblyjKkCAraVJqPR"
 [tables.reports.fields]
 title = "文本"
 reporter_ref = "报告人"
 role = "角色"
 reported_at = "报告时间"
+document_url = "飞书文档链接"
 
 # ---------- Skill configuration ----------
 
@@ -85,23 +89,75 @@ role = "角色"
 template = "分析skill"
 modified_at = "修改日期"
 
-# ---------- Existing S04-S09 analysis tables ----------
-# Workflow1 loads these mappings for schema validation but does not write them.
-
-[tables.department_analysis]
-table_id = "tblwD6ULDfqRvL97"
-[tables.department_analysis.fields]
-title = "文本"
-minister_ref = "部长"
-analysis_date = "日期"
-progress_s04 = "阶段工作进展汇总"
-personnel_s05 = "降级—奖励—退出—提拔名单"
-ideas_s06 = "idea 清单"
-meeting_focus_s07 = "学生例会重点人员"
+# ---------- Workflow2 output tables ----------
 
 [tables.team_analysis]
 table_id = "tblGyxHawUnOOZeO"
 [tables.team_analysis.fields]
-title = "文本"
+task_id = "任务编号"
+analysis_date = "日期"
 technology_s08 = "公共技术"
 training_s09 = "公共培训建议"
+
+# Workflow2 的新表 ID 请从飞书多维表链接中填入 tbl...，不是表单 shrcn... ID。
+[tables.stage_analysis]
+table_id = "tblinnLHK1d3wYXF"
+[tables.stage_analysis.fields]
+task_id = "任务编号"
+minister_ref = "部长"
+progress = "阶段工作进展"
+analysis_date = "日期"
+
+[tables.stage_confirmation]
+table_id = "tblyWCq4i788xvoF"
+[tables.stage_confirmation.fields]
+task_id = "任务编号"
+analysis_date = "日期"
+submitted_by = "填写人："
+edited = "阶段工作修改"
+draft = "阶段工作总结"
+decision = "阶段工作总结是否确认"
+
+[tables.stage_report]
+table_id = "tblc2JmQluPkoF5u"
+[tables.stage_report.fields]
+task_id = "任务编号"
+analysis_date = "日期"
+minister_ref = "部长"
+progress = "阶段工作总结"
+
+[tables.monthly_department_analysis]
+table_id = "tblwD6ULDfqRvL97"
+[tables.monthly_department_analysis.fields]
+task_id = "任务编号"
+minister_ref = "部长名称："
+analysis_date = "日期"
+personnel_s05 = "降级—奖励—退出—提拔名单"
+ideas_s06 = "idea 清单"
+meeting_s07 = "学生例会重点人员"
+
+[tables.monthly_department_confirmation]
+table_id = "tblPeiBPgGL1Q9YV"
+[tables.monthly_department_confirmation.fields]
+task_id = "任务编号"
+minister_ref = "部长名称："
+analysis_date = "日期"
+personnel_draft = "降级—奖励—退出—提拔名单"
+personnel_decision = "降级—奖励—退出—提拔名单是否确认"
+personnel_edited = "降级—奖励—退出—提拔名单修改"
+ideas_draft = "idea清单"
+ideas_decision = "idea清单是否确认"
+ideas_edited = "idea清单修改："
+meeting_draft = "学生例会重点人员"
+meeting_decision = "学生例会重点人员是否确认"
+meeting_edited = "学生例会重点人员修改："
+
+[tables.monthly_department_report]
+table_id = "tbltEY3rXnTTCPXC"
+[tables.monthly_department_report.fields]
+task_id = "任务编号"
+analysis_date = "日期"
+minister_ref = "部长"
+personnel_s05 = "降级—奖励—退出—提拔名单"
+ideas_s06 = "idea 清单"
+meeting_s07 = "学生例会重点人员"

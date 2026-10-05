@@ -1,23 +1,28 @@
-"""Prepare complete, authorized date ranges from original daily check snapshots."""
+"""Prepare authorized date ranges from original daily check snapshots."""
 
 from datetime import date, timedelta
 
 from data.store import FileStateStore
 from workflow1.models import UnitStatus
-from analysis.models import MaterialStatistics, PreparedMaterial
-from skills import AvailableResource, EvaluationText, MaterialScope, SkillInput, TextRecord
+from workflow2.models import MaterialStatistics, PreparedMaterial
+from workflow2.skills import AvailableResource, EvaluationText, MaterialScope, SkillInput, TextRecord
 
 
 class MaterialPreparer:
-    def __init__(self, store: FileStateStore):
+    def __init__(self, store: FileStateStore, rebuilder=None):
         self.store = store
+        self.rebuilder = rebuilder
         self.cache: dict[tuple, PreparedMaterial] = {}
+        self._rebuild_cache: dict[tuple, dict] = {}
 
     def prepare(self, *, run_id: str, start: date, end: date,
-                department_ids: list[str]) -> PreparedMaterial:
+                department_ids: list[str], person_ids: list[str] | None = None,
+                allow_rebuild: bool = False,
+                allow_partial: bool = False) -> PreparedMaterial:
         if end < start:
             raise ValueError("分析起止日期倒置")
         department_ids = sorted(set(department_ids))
+        member_filter = sorted(set(person_ids)) if person_ids is not None else None
         dates = [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
         signatures = []
         for day in dates:
@@ -26,8 +31,10 @@ class MaterialPreparer:
                 path = self.store.checked_dir / f"{day}.json"
             stat = path.stat() if path.exists() else None
             signatures.append((day, stat.st_mtime_ns if stat else None, stat.st_size if stat else None))
-        cache_key = (start, end, tuple(department_ids), tuple(signatures))
-        if cache_key in self.cache:
+        cache_key = (start, end, allow_partial, tuple(department_ids),
+                     tuple(member_filter or ()), tuple(signatures))
+        # Rebuilt material has no file signature; skip the prepared cache for it.
+        if cache_key in self.cache and not allow_rebuild:
             cached = self.cache[cache_key].model_copy(deep=True)
             cached.input.run_id = run_id
             return cached
@@ -35,8 +42,16 @@ class MaterialPreparer:
         resources: dict[str, AvailableResource] = {}
         missing = []
         expected, submitted = set(), set()
+        rebuilt: dict | None = None
         for day in dates:
             snapshot = self.store.load_check_snapshot(day)
+            if snapshot is None and allow_rebuild and self.rebuilder is not None:
+                if rebuilt is None:
+                    window = (start, end)
+                    if window not in self._rebuild_cache:
+                        self._rebuild_cache[window] = self.rebuilder.rebuild(start, end)
+                    rebuilt = self._rebuild_cache[window]
+                snapshot = rebuilt.get(day)
             if snapshot is None:
                 missing.append(f"{day} 每日检查快照缺失")
                 continue
@@ -45,9 +60,12 @@ class MaterialPreparer:
                 continue
             people = snapshot.organization.person_map()
             departments = snapshot.organization.department_map()
+            member_set = set(member_filter) if member_filter else None
             eligible = sorted((person for person in people.values()
                 if person.active and person.department_id in department_ids
-                and person.role in {"基层学生", "骨干学生"}), key=lambda person: person.person_id)
+                and person.role in {"基层学生", "骨干学生"}
+                and (member_set is None or person.person_id in member_set)),
+                key=lambda person: person.person_id)
             for person in eligible:
                 expected.add((day, person.person_id))
                 status = snapshot.submission_status.get(person.person_id)
@@ -85,17 +103,21 @@ class MaterialPreparer:
                     if evaluator is None:
                         missing.append(f"{day} 日志 {log.log_id} 评价人缺失")
                         continue
-                    reviews = []
-                    positive_ai = state.positive_ai or (state.positive_final if state.source == "AI" else "")
-                    improvement_ai = state.improvement_ai or (state.improvement_final if state.source == "AI" else "")
-                    if positive_ai or improvement_ai:
-                        reviews.append(EvaluationText(evaluator_id=evaluator.person_id,
-                            evaluator_role=evaluator.role, evaluated_at=state.ai_evaluated_at or (state.evaluated_at if state.source == "AI" else None),
-                            positive=positive_ai, improvement=improvement_ai, source="AI"))
+                    # Only the effective (finalized) evaluation reaches the Skills:
+                    # the human text when the evaluator edited it, otherwise the AI text.
                     if state.source == "HUMAN":
-                        reviews.append(EvaluationText(evaluator_id=evaluator.person_id,
-                            evaluator_role=evaluator.role, evaluated_at=state.confirmed_at or state.evaluated_at,
-                            positive=state.positive_final, improvement=state.improvement_final, source="HUMAN"))
+                        reviews = [EvaluationText(evaluator_id=evaluator.person_id,
+                            evaluator_role=evaluator.role,
+                            evaluated_at=state.confirmed_at or state.evaluated_at,
+                            positive=state.positive_final or "", improvement=state.improvement_final or "",
+                            source="HUMAN")]
+                    else:
+                        reviews = [EvaluationText(evaluator_id=evaluator.person_id,
+                            evaluator_role=evaluator.role,
+                            evaluated_at=state.ai_evaluated_at or state.evaluated_at,
+                            positive=state.positive_ai or state.positive_final or "",
+                            improvement=state.improvement_ai or state.improvement_final or "",
+                            source="AI")]
                     record = TextRecord(record_id=log.source_record_id or log.log_id,
                         confirmed=True, progress=log.progress, difficulties=log.difficulties,
                         reflection=log.reflection, other=log.other, full_log=log.full_log,
@@ -126,11 +148,13 @@ class MaterialPreparer:
             missing_person_days=len(expected - submitted))
         prepared = PreparedMaterial(input=SkillInput(run_id=run_id,
             scope=MaterialScope(start_date=start, end_date=end, department_ids=department_ids,
-                complete=not missing, missing_sources=missing),
+                complete=allow_partial or not missing,
+                missing_sources=[] if allow_partial else missing,
+                omitted_sources=missing if allow_partial else []),
             records=sorted(records.values(), key=lambda record: (record.work_start, record.person_id, record.record_id)),
             resources=sorted(resources.values(), key=lambda resource: resource.resource_id)),
-            statistics=stats if not missing else None)
-        if not missing:
+            statistics=stats if allow_partial or not missing else None)
+        if not missing and not allow_rebuild:
             # Bounded cache: multiple Skills share a prepared range, not the whole history.
             if len(self.cache) >= 32:
                 self.cache.pop(next(iter(self.cache)))

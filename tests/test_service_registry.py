@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -10,8 +12,8 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from config import AppSettings, DeepSeekSettings, FeishuSettings
-from config.schedules import ScheduleConfig, WorkflowSchedule
-from service.api import _build_scheduler, _event_handlers, create_app
+from config.schedules import ScheduleConfig, WorkflowSchedule, load_schedule_config
+from service.api import _build_scheduler, _event_handlers, _make_lifespan, create_app
 from service.runtime import Runtime, WorkflowBinding
 
 
@@ -79,6 +81,27 @@ class ServiceRegistryTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "Duplicate event handler"):
             _event_handlers(runtime)
+
+    def test_startup_records_activation_without_running_workflows(self) -> None:
+        settings = replace(self.settings, workflow2_enabled=True,
+                           scheduler_enabled=False, event_stream_enabled=False)
+        daily = binding("workflow1_daily", "human")
+        periodic = Mock()
+        runtime = Runtime(settings=settings, infrastructure=Mock(),
+                          organization_cache=Mock(), workflows={daily.name: daily},
+                          workflow2=periodic)
+        schedules = load_schedule_config(
+            Path(__file__).resolve().parents[1] / "config" / "schedules.toml")
+
+        async def open_and_close() -> None:
+            async with _make_lifespan(runtime, settings, schedules)(None):
+                pass
+
+        asyncio.run(open_and_close())
+        daily.workflow.recover_incomplete.assert_not_called()
+        periodic.recover.assert_not_called()
+        periodic.catch_up.assert_not_called()
+        periodic.store.activate.assert_called_once()
 
 
 if __name__ == "__main__":

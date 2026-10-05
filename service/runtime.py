@@ -4,11 +4,7 @@ from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any
 
-from config import AppSettings, load_table_config
-from analysis.materials import MaterialPreparer
-from analysis.repositories import AnalysisRepository, SkillConfigRepository
-from analysis.store import AnalysisStore
-from analysis.workflow import AnalysisWorkflow
+from config import AppSettings, load_table_config, load_schedule_config
 from data import FileStateStore
 from data.repositories import LogRepository, OrganizationCache, OrganizationRepository
 from llm import PromptService
@@ -39,7 +35,8 @@ def _build_infrastructure(
     http = transport or UrllibTransport(settings.http_timeout_seconds)
     feishu = FeishuClient(settings.feishu, http)
     messages = MessageService(
-        feishu, recipient_override=settings.message_override_open_id
+        feishu, recipient_override=(settings.message_override_open_id
+                                    if settings.simulation_mode else "")
     )
     return Infrastructure(
         bitable=BitableService(feishu, settings.feishu.bitable_app_token),
@@ -56,7 +53,7 @@ class Runtime:
     infrastructure: Infrastructure
     organization_cache: OrganizationCache
     workflows: dict[str, WorkflowBinding]
-    analysis: AnalysisWorkflow | None = None
+    workflow2: Workflow2 | None = None
 
 
 @dataclass(slots=True)
@@ -82,19 +79,19 @@ def build_runtime(settings: AppSettings) -> Runtime:
     organization_cache = OrganizationCache(
         store, OrganizationRepository(
             infrastructure.bitable, infrastructure.contacts, tables,
-            use_person_field_ids=bool(settings.message_override_open_id),
+            use_person_field_ids=(settings.simulation_mode and
+                                  bool(settings.message_override_open_id)),
         )
     )
     ai_evaluations = AiEvaluationRepository(
         infrastructure.bitable, tables, store
     )
     human_evaluations = HumanEvaluationRepository(infrastructure.bitable, tables)
+    log_repository = LogRepository(infrastructure.bitable, tables, organization_cache)
     workflow = Workflow1(
         store=store,
         organization_cache=organization_cache,
-        log_repository=LogRepository(
-            infrastructure.bitable, tables, organization_cache
-        ),
+        log_repository=log_repository,
         ai_evaluations=ai_evaluations,
         human_evaluations=human_evaluations,
         prompt_service=PromptService(
@@ -118,20 +115,35 @@ def build_runtime(settings: AppSettings) -> Runtime:
             human_evaluations.table.table_id: workflow.handle_human_record,
         },
     )
-    analysis = AnalysisWorkflow(
-        store=AnalysisStore(settings.state_dir), preparer=MaterialPreparer(store),
-        organization=organization_cache,
-        configs=SkillConfigRepository(infrastructure.bitable, tables,
-            settings.skill_config_path, settings.team_skill_department_id),
-        repository=AnalysisRepository(infrastructure.bitable, tables),
-        prompt_service=PromptService(infrastructure.llm, max_attempts=settings.llm_max_attempts),
-        messages=infrastructure.messages,
-        team_department_id=settings.team_skill_department_id,
-    )
+    workflow2 = None
+    if settings.workflow2_enabled:
+        from workflow2.workflow import Workflow2
+        from workflow2.feishu_material import SnapshotRebuilder
+        from workflow2.materials import MaterialPreparer
+        from workflow2.configs import SkillConfigRepository
+        from workflow2.store import Workflow2Store
+        from workflow2.tables import Workflow2Tables
+
+        preparer = MaterialPreparer(store, rebuilder=SnapshotRebuilder(
+            infrastructure.bitable, tables, organization_cache, log_repository,
+            auto_advance_at=w1.auto_advance_at,
+        ))
+        skill_configs = SkillConfigRepository(infrastructure.bitable, tables,
+            settings.skill_config_path, settings.team_skill_department_id)
+        prompt_service = PromptService(infrastructure.llm, max_attempts=settings.llm_max_attempts)
+        workflow2 = Workflow2(
+            store=Workflow2Store(settings.state_dir), preparer=preparer,
+            organization=organization_cache, configs=skill_configs,
+            tables=Workflow2Tables(infrastructure.bitable, tables),
+            prompt_service=prompt_service, messages=infrastructure.messages,
+            documents=infrastructure.cloud_docs,
+            schedules=load_schedule_config(settings.schedule_config_path),
+            archive_parent=settings.archive_parent_folder_token,
+        )
     return Runtime(
         settings=settings,
         infrastructure=infrastructure,
         organization_cache=organization_cache,
         workflows={binding.name: binding},
-        analysis=analysis,
+        workflow2=workflow2,
     )

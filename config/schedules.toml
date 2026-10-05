@@ -8,22 +8,33 @@ schedule_type = "daily"
 time = "08:10"
 material_days_ago = 1
 
-# 从 anchor_date 起每三天执行一次，分析最近三个完整自然日。
+# S04 首次自动运行以服务器上 Workflow2 的首次启用日为基准；
+# 启用后的第一个完整自然日起累计 3 天，此后每 3 天执行一次。
+# anchor_date 仅保留为 interval_days 配置格式的兼容字段。
+# 周期任务安排在 Workflow1 次日 12:00 自动确认截止之后。
 [workflows.s04_progress]
 enabled = true
 schedule_type = "interval_days"
-time = "09:00"
+time = "13:00"
 every_days = 3
 anchor_date = "2026-01-01"
 material_days = 3
+startup_wait_complete_days = 3
+form_url = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcnmKu2UfHH9G0BUKM9DYPdQg"
+confirmation_days = 1
+confirmation_time = "12:00"
 
 # 月度流程默认每月 1 日运行，材料范围为上一自然月。
 [workflows.s05_people_suggestions]
 enabled = true
 schedule_type = "monthly"
-time = "09:30"
+time = "13:30"
 day = 1
 material_period = "previous_month"
+# Workflow2 runs S05-S07 as one monthly cycle using this trigger and cutoff.
+form_url = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcnBhfAz6TvklRpeoEN1skclh"
+confirmation_days = 1
+confirmation_time = "12:00"
 
 [workflows.s06_ideas]
 enabled = true
@@ -43,7 +54,7 @@ material_period = "previous_month"
 [workflows.s08_public_technology]
 enabled = true
 schedule_type = "weekly"
-time = "09:00"
+time = "14:00"
 weekday = "mon"
 material_period = "previous_week"
 
