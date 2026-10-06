@@ -36,6 +36,7 @@ REQUIRED_FIELDS = {
         "log_id",
         "submitted_at",
         "submitter_ref",
+        "submitter_name",
         "progress",
         "difficulties",
         "reflection",
@@ -45,14 +46,14 @@ REQUIRED_FIELDS = {
     "evaluations": {
         "evaluation_id",
         "person_ref",
-        "evaluator_ref",
+        "person_name",
         "source_log",
         "evaluated_at",
         "positive_ai",
         "improvement_ai",
     },
     "human_evaluations": {
-        "evaluation_id", "person_ref", "evaluator_ref",
+        "evaluation_id", "basic_name", "backbone_ref", "source_log",
         "positive_final", "improvement_final", "submitted_by",
     },
     "reports": {

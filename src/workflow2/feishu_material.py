@@ -19,7 +19,8 @@ from data.repositories import LogRepository, OrganizationCache
 from data.store import utc_now
 from schema import (Organization, SubmissionStatus, TableConfig, WorkLog)
 from tool.bitable_fields import (SHANGHAI, alias_index, field_datetime,
-                                 record_fields, resolve_reference, scalar)
+                                  record_fields, record_submission_time,
+                                  resolve_reference, scalar)
 from tool.feishu import BitableService
 from workflow1.models import (DailySnapshot, EvaluatorProgress,
                               LogEvaluationState, UnitStatus)
@@ -42,7 +43,7 @@ class SnapshotRebuilder:
         organization = self.organization_cache.get()
         logs_by_day = self.log_repository.logs_in_window(start, end, organization)
         ai_rows = self._read_ai_rows(organization)
-        human_rows = self._read_human_rows(organization)
+        human_rows = self._read_human_rows(organization, ai_rows)
         people = organization.person_map()
         now = utc_now()
         rebuilt: dict[date, DailySnapshot] = {}
@@ -150,13 +151,21 @@ class SnapshotRebuilder:
         f = table.fields
         key_field = f.get("business_key") or f["evaluation_id"]
         people = self._person_index(organization)
+        basic_names = alias_index(
+            (person.person_id, (person.name,)) for person in organization.persons
+            if person.role == "基层学生" and person.active)
         for record in self.bitable.list_records(table.table_id):
             values = record_fields(record)
             parts = self._eval_key(scalar(values.get(key_field)))
             if parts is None:
                 continue  # 未填写 marker rows and malformed keys are never material
             day, evaluator_id, log_id = parts
-            person_id = resolve_reference(values.get(f["person_ref"]), people)
+            name = scalar(values.get(f.get("person_name", ""))).strip()
+            legacy_ref = resolve_reference(values.get(f["person_ref"]), people)
+            if name and legacy_ref and legacy_ref != basic_names.get(name):
+                continue
+            person_id = (basic_names.get(name, "") if name else
+                         legacy_ref)
             if not person_id:
                 continue
             rows.setdefault((day, log_id), {
@@ -164,23 +173,50 @@ class SnapshotRebuilder:
                 "evaluator_id": evaluator_id, "person_id": person_id,
                 "positive": scalar(values.get(f["positive_ai"])),
                 "improvement": scalar(values.get(f["improvement_ai"])),
+                "source_log": scalar(values.get(f["source_log"])),
                 "evaluated_at": self._timestamp(values.get(f.get("evaluated_at"))),
                 "record_id": str(record.get("record_id", "")) or None,
             })
         return rows
 
-    def _read_human_rows(self, organization: Organization) -> dict[tuple[date, str], dict]:
+    def _read_human_rows(self, organization: Organization,
+                         ai_rows: dict[tuple[date, str], dict]) -> dict[tuple[date, str], dict]:
         table = self.tables.tables.get("human_evaluations")
         rows: dict[tuple[date, str], dict] = {}
         if table is None or not table.table_id.strip():
             return rows
         f = table.fields
+        people = self._person_index(organization)
+        basic_names = alias_index(
+            (person.person_id, (person.name,)) for person in organization.persons
+            if person.role == "基层学生" and person.active)
         for record in self.bitable.list_records(table.table_id):
             values = record_fields(record)
+            submitted_at = record_submission_time(record, f.get("evaluated_at", ""))
+            if submitted_at is None:
+                continue
             parts = self._eval_key(scalar(values.get(f["evaluation_id"])))
             if parts is None:
+                name = scalar(values.get(f.get("basic_name", ""))).strip()
+                if name and resolve_reference(values.get(f.get("backbone_ref", "")), people):
+                    continue
+                person_id = (basic_names.get(name, "") if name else
+                             resolve_reference(values.get(
+                                 f.get("backbone_ref") or f.get("person_ref", "")), people))
+                evaluator_id = resolve_reference(values.get(f["submitted_by"]), people)
+                original = scalar(values.get(f.get("source_log", ""))).strip()
+                candidates = [(day, log_id) for (day, log_id), ai in ai_rows.items()
+                              if ai["person_id"] == person_id
+                              and ai["evaluator_id"] == evaluator_id
+                              and (not original or ai["source_log"] == original)
+                               and self._human_within_window(day, submitted_at)]
+                if len(candidates) != 1:
+                    continue
+                day, log_id = candidates[0]
+            else:
+                day, evaluator_id, log_id = parts
+            if not self._human_within_window(day, submitted_at):
                 continue
-            day, evaluator_id, log_id = parts
             positive = self._final_text(values, f, "positive_confirmed", "positive_final")
             improvement = self._final_text(values, f, "improvement_confirmed", "improvement_final")
             if positive is None or improvement is None:
@@ -191,6 +227,15 @@ class SnapshotRebuilder:
                 "evaluated_at": self._timestamp(values.get(f.get("evaluated_at"))),
             })
         return rows
+
+    def _human_within_window(self, day: date, submitted_at: datetime) -> bool:
+        start = datetime.combine(day + timedelta(days=1), time.min, SHANGHAI)
+        if self.auto_advance_at:
+            hour, minute = map(int, self.auto_advance_at.split(":"))
+            end = datetime.combine(day + timedelta(days=1), time(hour, minute), SHANGHAI)
+        else:
+            end = datetime.combine(day + timedelta(days=2), time.min, SHANGHAI)
+        return start <= submitted_at < end
 
     @staticmethod
     def _final_text(values: dict, f: dict, flag_field: str, text_field: str) -> str | None:

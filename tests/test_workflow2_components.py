@@ -197,14 +197,14 @@ class SnapshotRebuilderTests(unittest.TestCase):
             list_records=lambda table_id, field_names=None: self.rows.get(table_id, []))
         log_repository = LogRepository(bitable, self.tables, self.cache)
         self.rebuilder = SnapshotRebuilder(bitable, self.tables, self.cache,
-                                           log_repository, auto_advance_at="12:00")
+                                           log_repository, auto_advance_at="19:00")
 
     @property
     def key(self):
         return f"{DAY.isoformat()}:EVAL:K:L1"
 
-    def _millis(self, hour):
-        moment = self.datetime(DAY.year, DAY.month, DAY.day, hour,
+    def _millis(self, hour, day=DAY):
+        moment = self.datetime(day.year, day.month, day.day, hour,
                                 tzinfo=self.ZoneInfo("Asia/Shanghai"))
         return int(moment.timestamp() * 1000)
 
@@ -222,7 +222,7 @@ class SnapshotRebuilderTests(unittest.TestCase):
         self.rows["tblHuman"].append({"record_id": "recH1", "fields": {
             "评价编号": self.key, "被评价人": [{"id": "ou_m"}],
             "评价人": [{"id": "ou_k"}], "填写人": [{"id": "ou_k"}],
-            "评价时间": self._millis(12),
+            "评价时间": self._millis(12, DAY + timedelta(days=1)),
             "肯定之处_AI是否确认": "确认无误", "需改进之处_AI是否确认：": "需修改",
             "肯定之处_人工": "", "需改进之处_人工": "老师改进"}})
         state = self.rebuilder.rebuild(DAY, DAY)[DAY].log_evaluations["L1"]
@@ -230,6 +230,16 @@ class SnapshotRebuilderTests(unittest.TestCase):
         self.assertEqual(state.source, "HUMAN")
         self.assertEqual(state.positive_final, "AI肯定")
         self.assertEqual(state.improvement_final, "老师改进")
+
+    def test_rebuild_rejects_human_form_at_or_after_deadline(self):
+        self.rows["tblHuman"].append({"record_id": "recH1", "fields": {
+            "评价编号": self.key, "被评价人": [{"id": "ou_m"}],
+            "评价人": [{"id": "ou_k"}], "填写人": [{"id": "ou_k"}],
+            "评价时间": self._millis(19, DAY + timedelta(days=1)),
+            "肯定之处_AI是否确认": "确认无误",
+            "需改进之处_AI是否确认：": "确认无误"}})
+        state = self.rebuilder.rebuild(DAY, DAY)[DAY].log_evaluations["L1"]
+        self.assertEqual(state.source, "AI")
 
     def test_rebuilt_snapshot_passes_material_preparer(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,77 +1,143 @@
 # 所有时间都按这里的时区解释。修改后重启服务生效。
+# 所有定时任务使用的时区。
 timezone = "Asia/Shanghai"
 
 # Workflow1 只在次日启动一次；后续阶段由确认事件推进。
 [workflows.workflow1_daily]
+# 是否启用此任务。
 enabled = true
+# 执行周期：daily、weekly、monthly 或 interval_days。
 schedule_type = "daily"
-time = "08:10"
+# 计划运行的本地时间，格式为 HH:MM。
+time = "01:00"
+# 日报读取距运行日多少天前的工作日志。
 material_days_ago = 1
+# 次日向老师发送人工评价通知的本地时间，格式为 HH:MM；任务晚完成则完成后补发。
+notify_at = "08:00"
+# 部长审核骨干日志时填写的表单。
+minister_review_form_url = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcnaBl2hPcNAs4nNBYI2STpGh"
+# 骨干审核基层日志时填写的表单。
+backbone_review_form_url = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcngOWTo1tmzxm4V9blwKA1Dd"
+# 次日人工评价截止时间；到点后使用现有 AI 结果放行，留空则不自动放行。
+auto_advance_at = "19:00"
 
 # S04 首次自动运行以服务器上 Workflow2 的首次启用日为基准；
 # 启用后的第一个完整自然日起累计 3 天，此后每 3 天执行一次。
 # anchor_date 仅保留为 interval_days 配置格式的兼容字段。
-# 周期任务安排在 Workflow1 次日 12:00 自动确认截止之后。
+# 每次在计划日中午启动，分析完成后立即发送确认通知。
+# 最近一天的人工评价若尚未完成，19:00 截止后会由恢复任务继续处理。
 [workflows.s04_progress]
+# 是否启用此任务。
 enabled = true
+# 执行周期：daily、weekly、monthly 或 interval_days。
 schedule_type = "interval_days"
-time = "13:00"
+# 计划运行的本地时间，格式为 HH:MM。
+time = "12:00"
+# S04 AI 阶段分析表的「日期」写为计划运行日的次日，供次日确认表的“晚于昨天”查找引用筛选使用。
+analysis_date_offset_days = 1
+# 阶段分析每隔多少个完整自然日运行。
 every_days = 3
+# 间隔日程格式保留的锚定日期；S04 首次执行仍由启用日计算。
 anchor_date = "2026-01-01"
+# 阶段分析每次覆盖的完整自然日数量。
 material_days = 3
+# 首次运行前等待的完整自然日数量。
 startup_wait_complete_days = 3
+# 对应确认表单的访问链接。
 form_url = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcnmKu2UfHH9G0BUKM9DYPdQg"
+# 确认截止距计划运行日的天数。
 confirmation_days = 1
+# 确认截止当天的本地时间，格式为 HH:MM。
 confirmation_time = "12:00"
 
 # 月度流程默认每月 1 日运行，材料范围为上一自然月。
 [workflows.s05_people_suggestions]
+# 是否启用此任务。
 enabled = true
+# 执行周期：daily、weekly、monthly 或 interval_days。
 schedule_type = "monthly"
-time = "13:30"
+# 计划运行的本地时间，格式为 HH:MM。
+time = "04:00"
+# 当日向各部长发送确认通知的本地时间；任务晚完成则完成后补发。
+notify_at = "12:00"
+# 月度任务在每月几日触发。
 day = 1
+# 分析材料所覆盖的周期。
 material_period = "previous_month"
-# Workflow2 runs S05-S07 as one monthly cycle using this trigger and cutoff.
+# S05-S07 共用这一月度触发时间和确认截止时间。
+# 对应确认表单的访问链接。
 form_url = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcnBhfAz6TvklRpeoEN1skclh"
+# 确认截止距计划运行日的天数。
 confirmation_days = 1
+# 确认截止当天的本地时间，格式为 HH:MM。
 confirmation_time = "12:00"
 
 [workflows.s06_ideas]
+# 是否启用此任务。
 enabled = true
+# 执行周期：daily、weekly、monthly 或 interval_days。
 schedule_type = "monthly"
-time = "10:00"
+# 计划运行的本地时间，格式为 HH:MM。
+time = "04:00"
+# 月度任务在每月几日触发。
 day = 1
+# 分析材料所覆盖的周期。
 material_period = "previous_month"
 
 [workflows.s07_meeting_focus]
+# 是否启用此任务。
 enabled = true
+# 执行周期：daily、weekly、monthly 或 interval_days。
 schedule_type = "monthly"
-time = "10:30"
+# 计划运行的本地时间，格式为 HH:MM。
+time = "04:00"
+# 月度任务在每月几日触发。
 day = 1
+# 分析材料所覆盖的周期。
 material_period = "previous_month"
 
 # weekly 的 weekday 使用 mon/tue/wed/thu/fri/sat/sun。
 [workflows.s08_public_technology]
+# 是否启用此任务。
 enabled = true
+# 执行周期：daily、weekly、monthly 或 interval_days。
 schedule_type = "weekly"
-time = "14:00"
+# 计划运行的本地时间，格式为 HH:MM。
+time = "06:00"
+# 当日向负责人发送报告通知的本地时间；任务晚完成则完成后补发。
+notify_at = "09:00"
+# 周度任务触发的星期，使用 mon 到 sun。
 weekday = "mon"
+# 分析材料所覆盖的周期。
 material_period = "previous_week"
 
 [workflows.s09_public_training]
+# 是否启用此任务。
 enabled = true
+# 执行周期：daily、weekly、monthly 或 interval_days。
 schedule_type = "weekly"
-time = "09:30"
+# 计划运行的本地时间，格式为 HH:MM。
+time = "06:00"
+# 周度任务触发的星期，使用 mon 到 sun。
 weekday = "mon"
+# 分析材料所覆盖的周期。
 material_period = "previous_week"
 
 # 提醒流程和业务流程分开配置，方便只调整提醒时刻。
 [workflows.daily_log_reminder]
+# 是否启用此任务。
 enabled = true
+# 执行周期：daily、weekly、monthly 或 interval_days。
 schedule_type = "daily"
+# 计划运行的本地时间，格式为 HH:MM。
 time = "20:00"
+# 工作日志填写表单。
+form_url = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcnomQ0yUYQGvAODCOC3bZ5sf"
 
 [workflows.pending_confirmation_reminder]
+# 是否启用此任务。
 enabled = true
+# 执行周期：daily、weekly、monthly 或 interval_days。
 schedule_type = "daily"
+# 计划运行的本地时间，格式为 HH:MM。
 time = "16:00"

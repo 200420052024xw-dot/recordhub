@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
 from data.store import FileStateStore
 from tool.bitable_fields import (
     SHANGHAI,
-    field_datetime,
     record_fields,
+    record_submission_time,
     references,
     scalar,
 )
@@ -87,6 +87,13 @@ class AiEvaluationRepository:
         creates: list[tuple[str | None, dict]] = []
         for state in snapshot.log_evaluations.values():
             if state.record_id:
+                person = people[state.person_id]
+                record = existing_by_id.get(state.record_id)
+                if (record and person.role == "基层学生" and f.get("person_name")
+                        and scalar(record_fields(record).get(f["person_name"])).strip()
+                        != person.name):
+                    self.bitable.update_record(self.table.table_id, state.record_id,
+                                               {f["person_name"]: person.name})
                 continue
             if not state.evaluator_id or state.status == UnitStatus.FAILED:
                 continue
@@ -98,8 +105,8 @@ class AiEvaluationRepository:
             evaluator = people[state.evaluator_id]
             if not log.source_record_id:
                 raise ValueError(f"日志 {log.log_id} 缺少原始飞书记录 ID")
-            if not person.open_id or not evaluator.open_id:
-                missing_id = state.person_id if not person.open_id else state.evaluator_id
+            if (person.role != "基层学生" and not person.open_id) or not evaluator.open_id:
+                missing_id = state.person_id if not person.open_id and person.role != "基层学生" else state.evaluator_id
                 role = "提交人" if missing_id == state.person_id else "评价人"
                 who = people[missing_id]
                 issues[f"person:{missing_id}:missing-open-id"] = (
@@ -110,16 +117,26 @@ class AiEvaluationRepository:
                 snapshot.target_date, state.evaluator_id, state.log_id)
             hit = by_evaluation.get(key)
             if hit is not None:
-                if scalar(record_fields(existing_by_id[hit[0]]).get(f["source_log"])) != log.content():
-                    self.bitable.update_record(self.table.table_id, hit[0],
-                        {f["source_log"]: log.content()})
+                current = record_fields(existing_by_id[hit[0]])
+                updates = {}
+                if scalar(current.get(f["source_log"])) != log.content():
+                    updates[f["source_log"]] = log.content()
+                if person.role == "基层学生" and f.get("person_name") and (
+                        scalar(current.get(f["person_name"])).strip() != person.name):
+                    updates[f["person_name"]] = person.name
+                if updates:
+                    self.bitable.update_record(self.table.table_id, hit[0], updates)
                 mapped[state.log_id] = hit
                 continue
             matches = []
             candidates = source_rows.get(log.source_record_id, []) + source_rows.get(log.content(), [])
             for record in candidates:
-                if person.open_id not in references(
-                        record_fields(record).get(f["person_ref"])):
+                prior = record_fields(record)
+                same_person = (scalar(prior.get(f["person_name"])).strip() == person.name
+                               or person.open_id in references(prior.get(f["person_ref"]))
+                               if person.role == "基层学生" and f.get("person_name")
+                               else person.open_id in references(prior.get(f["person_ref"])))
+                if not same_person:
                     raise ValueError(f"AI 评价表中日志 {log.log_id} 已有关联但人员不匹配")
                 matches.append(record)
             if len(matches) > 1:
@@ -130,14 +147,23 @@ class AiEvaluationRepository:
                 evaluation_id = scalar(record_fields(record).get(f["evaluation_id"]))
                 if not record_id or not evaluation_id:
                     raise ValueError(f"AI 评价表中日志 {log.log_id} 缺少评价编号")
-                if scalar(record_fields(record).get(f["source_log"])) != log.content():
-                    self.bitable.update_record(self.table.table_id, record_id,
-                        {f["source_log"]: log.content()})
+                current = record_fields(record)
+                updates = {}
+                if scalar(current.get(f["source_log"])) != log.content():
+                    updates[f["source_log"]] = log.content()
+                if person.role == "基层学生" and f.get("person_name") and (
+                        scalar(current.get(f["person_name"])).strip() != person.name):
+                    updates[f["person_name"]] = person.name
+                if updates:
+                    self.bitable.update_record(self.table.table_id, record_id, updates)
                 mapped[state.log_id] = (record_id, evaluation_id)
                 continue
+            identity = ({f["person_name"]: person.name}
+                        if person.role == "基层学生" and f.get("person_name")
+                        else {f["person_ref"]: [{"id": person.open_id}]})
             creates.append((state.log_id, {
                 business_field or f["evaluation_id"]: key,
-                f["person_ref"]: [{"id": person.open_id}],
+                **identity,
                 f["source_log"]: log.content(),
                 f["evaluated_at"]: int(datetime.now().timestamp() * 1000),
                 f["positive_ai"]: state.positive_ai,
@@ -150,14 +176,23 @@ class AiEvaluationRepository:
             person = people[person_id]
             key = f"{target}:MISSING:{person_id}"
             if key in by_evaluation:
+                hit = by_evaluation[key]
+                if person.role == "基层学生" and f.get("person_name") and (
+                        scalar(record_fields(existing_by_id[hit[0]]).get(f["person_name"])).strip()
+                        != person.name):
+                    self.bitable.update_record(self.table.table_id, hit[0],
+                                               {f["person_name"]: person.name})
                 continue
-            if not person.open_id:
+            if person.role != "基层学生" and not person.open_id:
                 issues[f"person:{person_id}:missing-open-id"] = (
                     f"未交人员「{person.name}」缺少 OpenID，未填写日志标注行未写回")
                 continue
+            identity = ({f["person_name"]: person.name}
+                        if person.role == "基层学生" and f.get("person_name")
+                        else {f["person_ref"]: [{"id": person.open_id}]})
             creates.append((None, {
                 business_field or f["evaluation_id"]: key,
-                f["person_ref"]: [{"id": person.open_id}],
+                **identity,
                 f["evaluated_at"]: int(datetime.now().timestamp() * 1000),
                 f["positive_ai"]: "未填写日志",
                 f["improvement_ai"]: "未填写日志",
@@ -186,27 +221,42 @@ class AiEvaluationRepository:
 
 
 class HumanEvaluationRepository:
-    def __init__(self, bitable: BitableService, config: TableConfig) -> None:
+    def __init__(self, bitable: BitableService, config: TableConfig,
+                 cutoff_at: str = "19:00") -> None:
         self.bitable = bitable
         self.table = config.tables["human_evaluations"]
+        self.cutoff_at = cutoff_at
 
-    def load_record_fields(self, record_id: str) -> dict:
-        return record_fields(self.bitable.get_record(self.table.table_id, record_id))
+    def load_record(self, record_id: str) -> dict:
+        return self.bitable.get_record(self.table.table_id, record_id)
+
+    def _within_window(self, snapshot: DailySnapshot, record: dict) -> bool:
+        field = self.table.fields.get("evaluated_at")
+        if not field:
+            return True
+        submitted = record_submission_time(record, field)
+        if submitted is None:
+            return False
+        start = datetime.combine(snapshot.target_date + timedelta(days=1),
+                                 time.min, SHANGHAI)
+        if self.cutoff_at:
+            hour, minute = map(int, self.cutoff_at.split(":"))
+            end = datetime.combine(snapshot.target_date + timedelta(days=1),
+                                   time(hour, minute), SHANGHAI)
+        else:
+            end = datetime.combine(snapshot.target_date + timedelta(days=2),
+                                   time.min, SHANGHAI)
+        return start <= submitted < end
 
     def for_date(self, snapshot: DailySnapshot) -> list[dict]:
         records = self.bitable.list_records(self.table.table_id)
-        field = self.table.fields.get("evaluated_at")
-        if not field:
-            return records
-        end = datetime.combine(snapshot.target_date + timedelta(days=2),
-                               datetime.min.time(), SHANGHAI)
-        return [record for record in records
-                if record_fields(record).get(field)
-                and snapshot.created_at <= field_datetime(record_fields(record)[field]) < end]
+        return [record for record in records if self._within_window(snapshot, record)]
 
     def parse(self, snapshot: DailySnapshot,
               record: dict) -> tuple[str, FinalEvaluation] | None:
         f = self.table.fields
+        if not self._within_window(snapshot, record):
+            return None
         values = record_fields(record)
         evaluation_id = scalar(values.get(f["evaluation_id"]))
         if not evaluation_id:
@@ -215,11 +265,10 @@ class HumanEvaluationRepository:
                    if state.evaluation_id == evaluation_id]
         if not matches:
             people = snapshot.organization.person_map()
-            person_refs = set(references(values.get(f["person_ref"])))
             authors = set(references(values.get(f["submitted_by"])))
             matches = [state for state in snapshot.log_evaluations.values()
                        if state.evaluator_id
-                       and people[state.person_id].open_id in person_refs
+                       and self._matches_person(values, f, people[state.person_id])
                        and people[state.evaluator_id].open_id in authors]
             if not matches:
                 return None
@@ -229,11 +278,9 @@ class HumanEvaluationRepository:
         people = snapshot.organization.person_map()
         person = people[state.person_id]
         evaluator = people[state.evaluator_id]
-        supplied = set(references(values.get(f["person_ref"])))
-        if not supplied.intersection({person.person_id, person.name,
-                                      person.open_id, person.source_record_id}):
-            raise ValueError(f"人工评价 {evaluation_id} 的 person_ref 与快照不符")
-        evaluator_refs = set(references(values.get(f["evaluator_ref"])))
+        if not self._matches_person(values, f, person):
+            raise ValueError(f"人工评价 {evaluation_id} 的被审核人与快照不符")
+        evaluator_refs = set(references(values.get(f.get("evaluator_ref", ""))))
         if evaluator_refs and not evaluator_refs.intersection(
                 {evaluator.person_id, evaluator.name, evaluator.open_id,
                  evaluator.source_record_id}):
@@ -263,3 +310,16 @@ class HumanEvaluationRepository:
             person_id=state.person_id, log_id=state.log_id,
             evaluator_id=state.evaluator_id, positive=positive,
             improvement=improvement, source="HUMAN")
+
+    @staticmethod
+    def _matches_person(values: dict, fields: dict, person) -> bool:
+        if person.role == "基层学生" and fields.get("basic_name"):
+            name = scalar(values.get(fields["basic_name"])).strip()
+            return bool(name and name == person.name
+                        and not references(values.get(fields.get("backbone_ref", ""))))
+        ref_field = fields.get("backbone_ref") or fields.get("person_ref")
+        supplied = set(references(values.get(ref_field)))
+        if fields.get("basic_name") and scalar(values.get(fields["basic_name"])).strip():
+            return False
+        return bool(supplied.intersection({person.person_id, person.name,
+                                           person.open_id, person.source_record_id}))

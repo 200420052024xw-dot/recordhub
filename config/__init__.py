@@ -1,5 +1,6 @@
 """Application configuration public API."""
 
+from config.logs import setup_logging
 from config.schedules import ScheduleConfig, WorkflowSchedule, load_schedule_config
 from config.settings import (
     AppSettings,
@@ -18,4 +19,5 @@ __all__ = [
     "load_env_file",
     "load_schedule_config",
     "load_table_config",
+    "setup_logging",
 ]

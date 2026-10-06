@@ -31,6 +31,7 @@ class DepartmentResult(StrictModel):
     final_text: dict[str, str] = Field(default_factory=dict)
     unconfirmed: list[str] = Field(default_factory=list)
     confirmation_record_id: str | None = None
+    analysis_published: bool = False
 
 
 class CycleRun(StrictModel):

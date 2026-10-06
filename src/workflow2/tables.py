@@ -35,6 +35,15 @@ class Workflow2Tables:
                 if column not in actual:
                     raise ValueError(f"{name} 缺少字段：{column}")
 
+    def url_value(self, name: str, field: str, url: str, title: str):
+        table = self.table(name)
+        column = table.fields[field]
+        matches = [item for item in self.bitable.list_fields(table.table_id)
+                   if item.get("field_name") == column]
+        if len(matches) != 1 or matches[0].get("type") not in (1, 15):
+            raise ValueError(f"{name} 的 {column} 必须是文本或超链接字段")
+        return {"text": title, "link": url} if matches[0]["type"] == 15 else url
+
     def upsert(self, name: str, task_id: str, values: dict[str, object]) -> str:
         table = self.table(name)
         f = table.fields

@@ -11,6 +11,7 @@ from typing import Any
 
 import lark_oapi as lark
 
+from config.logs import silence_third_party_console_handlers
 from config.settings import AppSettings
 from tool.feishu import BitableService
 
@@ -44,6 +45,9 @@ class BitableEventStream:
         self.worker: threading.Thread | None = None
 
     def start(self) -> None:
+        # lark_oapi attaches its own stdout handler at import time; when this
+        # module is imported after setup_logging we must strip it again.
+        silence_third_party_console_handlers()
         self.bitable.subscribe_document_events()
         handler = (lark.EventDispatcherHandler.builder("", "")
             .register_p2_drive_file_bitable_record_changed_v1(self._on_record_changed)
@@ -56,6 +60,8 @@ class BitableEventStream:
         self.worker.start()
         threading.Thread(target=self._run_ws, args=(client,),
             name="feishu-event-stream", daemon=True).start()
+        logger.info("feishu_event_stream_started app_token=%s tables=%d",
+                    self.bitable.app_token, len(self.handlers))
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -81,15 +87,22 @@ class BitableEventStream:
                         continue
                     self.pending.add(key)
                 self.queue.put(_Job(table_id, record_id))
+                logger.info("feishu_event_enqueued table_id=%s record_id=%s action=%s",
+                            table_id, record_id, action.action)
         except Exception:
             logger.exception("feishu_event_callback_failed")
 
     @staticmethod
     def _run_ws(client: Any) -> None:
+        logger.info("feishu_event_stream_connecting")
         try:
             client.start()
         except Exception:
             logger.exception("feishu_event_stream_failed")
+        # client.start() is meant to block for the process lifetime; a return
+        # means the long connection dropped and confirmation now relies on the
+        # daily auto-advance until the service restarts.
+        logger.warning("feishu_event_stream_loop_exited")
 
     def _run_worker(self) -> None:
         while not self.stop_event.is_set():

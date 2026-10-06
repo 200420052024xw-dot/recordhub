@@ -125,3 +125,20 @@ def field_datetime(value: Any) -> datetime:
         raise ValueError("datetime field is empty")
     parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=SHANGHAI)
+
+
+def record_submission_time(record: Mapping[str, Any], time_field: str = "") -> datetime | None:
+    """Use the latest available form/record timestamp when checking a deadline."""
+    fields = record_fields(record)
+    values = [record.get("created_time"), record.get("last_modified_time")]
+    if time_field:
+        values.append(fields.get(time_field))
+    timestamps = []
+    for value in values:
+        if value in (None, ""):
+            continue
+        try:
+            timestamps.append(field_datetime(value))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return max(timestamps) if timestamps else None

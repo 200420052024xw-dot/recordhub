@@ -16,3 +16,4 @@ config/feishu_tables.toml
 .venv/
 .idea/
 *.log
+logs/

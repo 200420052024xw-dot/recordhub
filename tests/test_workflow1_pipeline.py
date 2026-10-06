@@ -7,6 +7,7 @@ import unittest
 from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import Mock
+from zoneinfo import ZoneInfo
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
@@ -227,6 +228,33 @@ class Workflow1PipelineTests(unittest.TestCase):
         self.assertEqual(evaluation.source, "HUMAN")
         with self.assertRaisesRegex(ValueError, "evaluator_ref"):
             repo.parse(snapshot, {"fields": {**fields, "evaluator": "部长"}})
+
+    def test_form_matching_accepts_next_day_before_nineteen_only(self):
+        snapshot = sample_snapshot()
+        snapshot.log_evaluations["L1"].evaluation_id = "PJ-1"
+        config = TableConfig.model_validate({"tables": {
+            "human_evaluations": {"table_id": "human", "fields": {
+                "evaluation_id": "number", "person_ref": "person",
+                "evaluator_ref": "evaluator", "positive_final": "positive",
+                "improvement_final": "improvement", "submitted_by": "author",
+                "evaluated_at": "filled_at"}}}})
+        fields = {"number": "PJ-1", "person": "成员", "evaluator": "骨干",
+                  "positive": "具体肯定", "improvement": "具体建议",
+                  "author": [{"id": "ou_b"}]}
+        def row(hour, minute=0, **metadata):
+            submitted = datetime(2026, 10, 4, hour, minute,
+                                 tzinfo=ZoneInfo("Asia/Shanghai"))
+            return {"fields": {**fields, "filled_at": int(submitted.timestamp() * 1000)},
+                    **metadata}
+        on_time = row(18, 59)
+        at_cutoff = row(19)
+        edited_late = row(18, 0, last_modified_time=row(19)["fields"]["filled_at"])
+        repo = HumanEvaluationRepository(Mock(), config, cutoff_at="19:00")
+        repo.bitable.list_records.return_value = [on_time, at_cutoff, edited_late]
+        self.assertEqual(repo.for_date(snapshot), [on_time])
+        self.assertIsNotNone(repo.parse(snapshot, on_time))
+        self.assertIsNone(repo.parse(snapshot, at_cutoff))
+        self.assertIsNone(repo.parse(snapshot, edited_late))
 
     def test_document_links_are_hierarchical_and_reused(self):
         snapshot = sample_snapshot()

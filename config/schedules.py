@@ -93,6 +93,16 @@ def load_schedule_config(
 
 
 def _validate_type_options(name: str, schedule_type: str, values: dict[str, Any]) -> None:
+    if "analysis_date_offset_days" in values:
+        offset = values["analysis_date_offset_days"]
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise ValueError(f"Workflow schedule {name} needs nonnegative analysis_date_offset_days")
+    if "notify_at" in values and not _TIME_PATTERN.fullmatch(str(values["notify_at"])):
+        raise ValueError(f"Workflow schedule {name} has invalid notify_at")
+    if "auto_advance_at" in values:
+        deadline = str(values["auto_advance_at"])
+        if deadline and not _TIME_PATTERN.fullmatch(deadline):
+            raise ValueError(f"Workflow schedule {name} has invalid auto_advance_at")
     if "confirmation_days" in values:
         days = values["confirmation_days"]
         if not isinstance(days, int) or days < 0:

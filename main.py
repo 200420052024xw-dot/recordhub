@@ -12,14 +12,22 @@ _SRC_DIR = Path(__file__).resolve().parent / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from config import AppSettings, load_env_file, load_schedule_config, load_table_config
+from config import (
+    AppSettings,
+    load_env_file,
+    load_schedule_config,
+    load_table_config,
+    setup_logging,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def check_config(settings: AppSettings) -> int:
     schedules = load_schedule_config(settings.schedule_config_path)
     from workflow1.settings import W1Settings
 
-    w1 = W1Settings.from_env()
+    w1 = W1Settings.from_schedule(schedules)
     missing = settings.missing_variables()
     table_config_error = ""
     workflow2_missing: list[str] = []
@@ -64,6 +72,9 @@ def check_config(settings: AppSettings) -> int:
 def main() -> int:
     load_env_file()
     settings = AppSettings.from_env()
+    # Covers serve and every CLI branch; console goes to stderr so the JSON
+    # printed by check-config and friends stays pipeable.
+    setup_logging(settings)
     parser = argparse.ArgumentParser(description="RecordHub Workflow1 and Workflow2 service")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("check-config")
@@ -93,14 +104,19 @@ def main() -> int:
     if command == "check-config":
         return check_config(settings)
     if command == "serve":
-        # Module loggers otherwise fall through to the WARNING lastResort
-        # handler, hiding confirmation/event-stream observability.
-        logging.basicConfig(level=logging.INFO)
         import uvicorn
 
         from service.api import create_app
 
-        uvicorn.run(create_app(settings), host=args.host, port=args.port)
+        logger.info(
+            "serving host=%s port=%s log_dir=%s retention_days=%d level=%s",
+            args.host, args.port, settings.log_dir,
+            settings.log_retention_days, settings.log_level,
+        )
+        # log_config=None skips uvicorn's own dictConfig so uvicorn.* loggers
+        # propagate to the root handlers (terminal + rotating file).
+        uvicorn.run(create_app(settings), host=args.host, port=args.port,
+                    log_config=None)
         return 0
 
     from service.runtime import build_runtime

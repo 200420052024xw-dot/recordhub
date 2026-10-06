@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -39,6 +40,8 @@ CONFIRM_COLUMNS = {"S05": ("personnel_decision", "personnel_edited"),
                    "S06": ("ideas_decision", "ideas_edited"),
                    "S07": ("meeting_decision", "meeting_edited")}
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+logger = logging.getLogger(__name__)
 
 
 def _write_date_millis() -> int:
@@ -89,18 +92,22 @@ class Workflow2:
             raise ValueError("未知的 Workflow2 周期")
         return self.schedules.workflows[SCHEDULES[kind]]
 
+    def _analysis_date_millis(self, run: CycleRun) -> int:
+        if run.kind != "stage":
+            return _write_date_millis()
+        offset = int(self._schedule(run.kind).options.get("analysis_date_offset_days", 0))
+        return date_millis(run.scheduled_date + timedelta(days=offset))
+
     def _required_tables(self, kind: str) -> list[str]:
-        common = ["reports"]
         if kind == "stage":
-            return common + ["stage_analysis", "stage_confirmation", "stage_report"]
+            return ["stage_analysis", "stage_confirmation", "stage_report"]
         if kind == "monthly":
-            return common + ["monthly_department_analysis",
+            return ["monthly_department_analysis",
                              "monthly_department_confirmation", "monthly_department_report"]
-        return common + ["team_analysis"]
+        return ["team_analysis"]
 
     def _check_ready(self, kind: str) -> None:
-        self.tables.require([name for name in self._required_tables(kind) if name != "reports"])
-        self.tables.table("reports")
+        self.tables.require(self._required_tables(kind))
         if kind != "weekly" and not str(self._schedule(kind).options.get("form_url", "")).strip():
             raise ValueError(f"{kind} 确认表单链接尚未配置")
         if not self.archive_parent:
@@ -119,6 +126,8 @@ class Workflow2:
                 run = CycleRun(run_id=run_id, kind=kind, scheduled_date=scheduled_date,
                                start_date=start, end_date=end, created_at=now, updated_at=now)
                 self.store.save(run)
+            logger.info("workflow2_start kind=%s date=%s run_id=%s",
+                        kind, scheduled_date, run_id)
             return self._advance(run)
 
     def resume(self, run_id: str) -> CycleRun:
@@ -126,12 +135,18 @@ class Workflow2:
             run = self.store.load(run_id)
             if run is None:
                 raise ValueError("Workflow2 任务不存在")
+            logger.info("workflow2_resume run_id=%s", run_id)
             return self._advance(run)
 
     def recover(self) -> list[CycleRun]:
         activation = self.store.activate(utc_now().astimezone(SHANGHAI).date())
-        return [self.resume(run.run_id) for run in self.store.pending()
-                if run.kind != "stage" or run.start_date > activation]
+        results = [self.resume(run.run_id) for run in self.store.pending()
+                   if run.kind != "stage" or run.start_date > activation]
+        for run in self.store.all_runs():
+            if run.kind in {"monthly", "weekly"}:
+                self.notify_due(run.kind, run.scheduled_date)
+        logger.debug("workflow2_recover resumed=%d", len(results))
+        return results
 
     def scheduled(self, kind: str, today: date) -> CycleRun | None:
         schedule = self._schedule(kind)
@@ -155,8 +170,48 @@ class Workflow2:
         return datetime.combine(run.scheduled_date + timedelta(days=days),
                                 time(hour, minute), SHANGHAI)
 
+    def _notification_due(self, run: CycleRun) -> bool:
+        value = self._schedule(run.kind).options.get("notify_at")
+        if not value:
+            return True
+        hour, minute = map(int, str(value).split(":"))
+        scheduled = datetime.combine(run.scheduled_date, time(hour, minute), SHANGHAI)
+        return utc_now().astimezone(SHANGHAI) >= scheduled
+
+    def notify_due(self, kind: str, scheduled_date: date) -> None:
+        with self.lock:
+            run_id = str(uuid5(NAMESPACE_URL,
+                               f"recordhub-workflow2:{kind}:{scheduled_date}"))
+            run = self.store.load(run_id)
+            if run is None or not self._notification_due(run):
+                return
+            organization = self.organization.get()
+            people = organization.person_map()
+            if kind == "monthly" and utc_now().astimezone(SHANGHAI) < self._cutoff(run):
+                for draft in run.departments.values():
+                    minister = people.get(draft.minister_id)
+                    if (draft.analysis_published and minister and minister.open_id and
+                            not set(CODES[kind]) <= set(draft.final_text)):
+                        self._notify_minister(run, draft.department_id, minister.open_id)
+            if (kind in {"monthly", "weekly"} and run.status == "COMPLETED" and
+                    set(CODES[kind]) <= set(run.document_urls)):
+                leader = people.get(organization.team_leader_id or "")
+                if leader and leader.open_id:
+                    self._notify_leader(run, leader.open_id)
+
+    def _notify_minister(self, run: CycleRun, department_id: str, open_id: str) -> None:
+        self._notify(run, f"minister:{department_id}", open_id,
+            f"【{run.start_date} 至 {run.end_date} 周期分析待确认】\n"
+            f"请核对本部门分析并填写确认表：{self._schedule(run.kind).options['form_url']}")
+
+    def _notify_leader(self, run: CycleRun, open_id: str) -> None:
+        self._notify(run, "leader", open_id,
+            "【周期分析报告已生成】\n" + "\n".join(
+                f"{NAMES[code]}：{run.document_urls[code]}" for code in CODES[run.kind]))
+
     def _advance(self, run: CycleRun) -> CycleRun:
         if run.status == "COMPLETED":
+            logger.debug("workflow2_already_completed run_id=%s", run.run_id)
             return run
         try:
             self._check_ready(run.kind)
@@ -171,16 +226,22 @@ class Workflow2:
                            for item in run.departments.values()):
                     run.status = "WAITING_CONFIRMATION"
                     self.store.save(run)
+                    logger.info("workflow2_waiting_confirmation run_id=%s kind=%s",
+                                run.run_id, run.kind)
                     return run
             self._documents(run, organization)
             run.status, run.last_error = "COMPLETED", None
             self.store.save(run)
+            logger.info("workflow2_completed run_id=%s kind=%s", run.run_id, run.kind)
         except ValueError as exc:
             run.status, run.last_error = "BLOCKED", str(exc)
             self.store.save(run)
+            logger.warning("workflow2_blocked run_id=%s kind=%s error=%s",
+                           run.run_id, run.kind, exc)
         except Exception as exc:
             run.status, run.last_error = "FAILED", str(exc)
             self.store.save(run)
+            logger.exception("workflow2_failed run_id=%s kind=%s", run.run_id, run.kind)
         return run
 
     def _departments(self, run: CycleRun, organization: Organization) -> None:
@@ -201,7 +262,6 @@ class Workflow2:
                 run.departments[department.department_id] = draft
                 self.store.save(run)
             if set(CODES[run.kind]) <= set(draft.final_text):
-                self._publish_department_report(run, draft, minister)
                 continue
             allow_rebuild = run.kind != "stage"
             group_materials = [self.preparer.prepare(
@@ -238,7 +298,7 @@ class Workflow2:
                     self.store.save(run)
             task_id = f"{run.run_id}:{department.department_id}"
             common = {"minister_ref": [{"id": minister.open_id}],
-                      "analysis_date": _write_date_millis()}
+                      "analysis_date": self._analysis_date_millis(run)}
             if run.kind == "stage":
                 self.tables.upsert("stage_analysis", task_id,
                     {**common, "progress": draft.draft_text["S04"]})
@@ -246,10 +306,11 @@ class Workflow2:
                 self.tables.upsert("monthly_department_analysis", task_id,
                     {**common, **{RESULT_COLUMNS[code]: draft.draft_text[code]
                                   for code in CODES[run.kind]}})
-            if utc_now().astimezone(SHANGHAI) < self._cutoff(run):
-                self._notify(run, f"minister:{department.department_id}", minister.open_id,
-                    f"【{run.start_date} 至 {run.end_date} 周期分析待确认】\n"
-                    f"请核对本部门分析并填写确认表：{self._schedule(run.kind).options['form_url']}")
+            draft.analysis_published = True
+            self.store.save(run)
+            if (utc_now().astimezone(SHANGHAI) < self._cutoff(run) and
+                    self._notification_due(run)):
+                self._notify_minister(run, department.department_id, minister.open_id)
             self._confirmation(run, draft, organization)
 
     @staticmethod
@@ -348,29 +409,6 @@ class Workflow2:
                     if code not in draft.unconfirmed:
                         draft.unconfirmed.append(code)
         self.store.save(run)
-        if set(codes) <= set(draft.final_text):
-            self._publish_department_report(run, draft, person)
-
-    def _publish_department_report(self, run: CycleRun, draft: DepartmentResult,
-                                   minister) -> None:
-        def report_text(code: str) -> str:
-            prefix = "【人工未确认，采用 AI 草稿】\n" if code in draft.unconfirmed else ""
-            text = draft.final_text[code]
-            notice = run.issues.get(f"materials:{draft.department_id}", "")
-            if notice and notice not in text:
-                text = notice + "\n" + text
-            return prefix + text
-        common = {"minister_ref": [{"id": minister.open_id}],
-                  "analysis_date": _write_date_millis()}
-        task_id = f"{run.run_id}:{draft.department_id}"
-        if run.kind == "stage":
-            self.tables.upsert("stage_report", task_id,
-                {**common, "progress": report_text("S04")})
-        else:
-            self.tables.upsert("monthly_department_report", task_id,
-                {**common, **{RESULT_COLUMNS[code]: report_text(code)
-                              for code in CODES[run.kind]}})
-
     def _weekly(self, run: CycleRun, organization: Organization) -> None:
         leader_id = organization.team_leader_id
         if not leader_id:
@@ -460,11 +498,6 @@ class Workflow2:
                 input_data=data, output_model=SUMMARY_MODELS[code], semantic_validator=validate)
             run.team_results[code] = {"content": output.model_dump(mode="json")}
             self.store.save(run)
-        self.tables.upsert("team_analysis", run.run_id,
-            {"analysis_date": _write_date_millis(),
-             "technology_s08": weekly_notice + _result_text(run.team_results["S08"], "S08"),
-             "training_s09": weekly_notice + _result_text(run.team_results["S09"], "S09")})
-
     def _documents(self, run: CycleRun, organization: Organization) -> None:
         leader = organization.person_map().get(organization.team_leader_id or "")
         if leader is None or not leader.open_id:
@@ -476,12 +509,6 @@ class Workflow2:
         folder = folder or self.documents.create_folder(parent, folder_name)
         for code in CODES[run.kind]:
             title = f"{run.scheduled_date:%m-%d} 团队{NAMES[code]}"
-            token = run.document_tokens.get(code)
-            if not token:
-                token = self.documents.find_child(folder, title, "docx")
-                token = token or self.documents.create_document(folder, title)
-                run.document_tokens[code] = token
-                self.store.save(run)
             blocks = [text_block(title, heading=1),
                       text_block(f"-分析范围：{run.start_date} 至 {run.end_date}")]
             if run.kind == "weekly" and run.issues.get("materials:weekly"):
@@ -511,63 +538,86 @@ class Workflow2:
                 if code in draft.unconfirmed:
                     blocks.append(text_block("-确认状态：人工未确认，采用 AI 草稿"))
                 blocks.extend(text_block(line) for line in draft.final_text[code].split("\n") if line)
-            existing = [block for block in self.documents.list_blocks(token)
-                        if DailyDocuments._block_content(block).strip()]
-            expected = [block for block in blocks if block.get("block_type") != 22]
-            if len(existing) > len(expected) or any(
-                DailyDocuments._block_signature(actual) != DailyDocuments._block_signature(wanted)
-                for actual, wanted in zip(existing, expected)):
-                raise ValueError(f"云文档 {title} 已被修改，停止自动覆盖")
-            tail = []
-            seen = 0
-            for block in blocks:
-                if block.get("block_type") == 22:
-                    if seen >= len(existing):
-                        tail.append(block)
-                else:
-                    if seen >= len(existing):
-                        tail.append(block)
-                    seen += 1
-            if tail:
-                self.documents.append_blocks(token, tail)
-            url = f"https://feishu.cn/docx/{token}"
-            run.document_urls[code] = url
-            self.store.save(run)
-            self._index_document(run, code, url, leader)
-        if run.kind == "stage":
+            self._ensure_document(run, folder, code, title, blocks)
+        for department_id, draft in sorted(run.departments.items()):
+            department = organization.department_map()[department_id]
+            minister = organization.person_map()[draft.minister_id]
+            links = {}
+            for code in CODES[run.kind]:
+                title = f"{run.scheduled_date:%m-%d} {department.name}{NAMES[code]}"
+                blocks = [text_block(title, heading=1),
+                          text_block(f"-分析范围：{run.start_date} 至 {run.end_date}")]
+                if code in draft.unconfirmed:
+                    blocks.append(text_block("-确认状态：人工未确认，采用 AI 草稿"))
+                notice = run.issues.get(f"materials:{department_id}", "")
+                if notice:
+                    blocks.append(text_block(notice))
+                blocks.extend(text_block(line) for line in draft.final_text[code].split("\n") if line)
+                links[code] = self._ensure_document(
+                    run, folder, f"{code}:{department_id}", title, blocks)
+            common = {"minister_ref": [{"id": minister.open_id}],
+                      "analysis_date": _write_date_millis()}
+            task_id = f"{run.run_id}:{department_id}"
+            if run.kind == "stage":
+                self.tables.upsert("stage_report", task_id,
+                    {**common, "progress": self.tables.url_value("stage_report", "progress", links["S04"], NAMES["S04"])})
+            else:
+                self.tables.upsert("monthly_department_report", task_id,
+                    {**common, **{RESULT_COLUMNS[code]: self.tables.url_value(
+                        "monthly_department_report", RESULT_COLUMNS[code], links[code], NAMES[code])
+                        for code in CODES["monthly"]}})
+        if run.kind == "weekly":
+            self.tables.upsert("team_analysis", run.run_id,
+                {"analysis_date": _write_date_millis(),
+                 "technology_s08": self.tables.url_value(
+                     "team_analysis", "technology_s08", run.document_urls["S08"], NAMES["S08"]),
+                 "training_s09": self.tables.url_value(
+                     "team_analysis", "training_s09", run.document_urls["S09"], NAMES["S09"])})
+        elif run.kind == "stage":
             self.tables.upsert("stage_report", run.run_id + ":TEAM",
                 {"minister_ref": [{"id": leader.open_id}],
                  "analysis_date": _write_date_millis(),
-                 "progress": run.document_urls["S04"]})
+                 "progress": self.tables.url_value("stage_report", "progress", run.document_urls["S04"], NAMES["S04"])})
         elif run.kind == "monthly":
             self.tables.upsert("monthly_department_report", run.run_id + ":TEAM",
                 {"minister_ref": [{"id": leader.open_id}],
                  "analysis_date": _write_date_millis(),
-                 **{RESULT_COLUMNS[code]: run.document_urls[code]
+                 **{RESULT_COLUMNS[code]: self.tables.url_value(
+                     "monthly_department_report", RESULT_COLUMNS[code], run.document_urls[code], NAMES[code])
                     for code in CODES["monthly"]}})
-        self._notify(run, "leader", leader.open_id,
-            "【周期分析报告已生成】\n" + "\n".join(
-                f"{NAMES[code]}：{run.document_urls[code]}" for code in CODES[run.kind]))
+        if self._notification_due(run):
+            self._notify_leader(run, leader.open_id)
 
-    def _index_document(self, run: CycleRun, code: str, url: str, leader) -> None:
-        table = self.tables.table("reports")
-        f = table.fields
-        if not f.get("document_url"):
-            raise ValueError("报告日志表缺少飞书文档链接映射")
-        fields = [item for item in self.tables.bitable.list_fields(table.table_id)
-                  if item.get("field_name") == f["document_url"]]
-        if len(fields) != 1 or fields[0].get("type") not in (1, 15):
-            raise ValueError("报告日志表的文档链接字段必须是文本或超链接")
-        rows = [row for row in self.tables.bitable.list_records(table.table_id)
-                if scalar(record_fields(row).get(f["document_url"])) == url]
-        if len(rows) > 1:
-            raise ValueError(f"报告日志表中文档 {url} 重复")
-        if not rows:
-            self.tables.bitable.create_record(table.table_id, {
-                f["reporter_ref"]: [{"id": leader.open_id}], f["role"]: leader.role,
-                f["reported_at"]: int(utc_now().timestamp() * 1000),
-                f["document_url"]: ({"text": NAMES[code], "link": url}
-                                    if fields[0]["type"] == 15 else url)})
+    def _ensure_document(self, run: CycleRun, folder: str, key: str,
+                         title: str, blocks: list[dict]) -> str:
+        token = run.document_tokens.get(key)
+        if not token:
+            token = self.documents.find_child(folder, title, "docx")
+            token = token or self.documents.create_document(folder, title)
+            run.document_tokens[key] = token
+            self.store.save(run)
+        existing = [block for block in self.documents.list_blocks(token)
+                    if DailyDocuments._block_content(block).strip()]
+        expected = [block for block in blocks if block.get("block_type") != 22]
+        if len(existing) > len(expected) or any(
+            DailyDocuments._block_signature(actual) != DailyDocuments._block_signature(wanted)
+            for actual, wanted in zip(existing, expected)):
+            raise ValueError(f"云文档 {title} 已被修改，停止自动覆盖")
+        tail = []
+        seen = 0
+        for block in blocks:
+            if block.get("block_type") != 22:
+                if seen >= len(existing):
+                    tail.append(block)
+                seen += 1
+            elif seen >= len(existing):
+                tail.append(block)
+        if tail:
+            self.documents.append_blocks(token, tail)
+        url = f"https://feishu.cn/docx/{token}"
+        run.document_urls[key] = url
+        self.store.save(run)
+        return url
 
     def _notify(self, run: CycleRun, key: str, open_id: str, message: str) -> None:
         if key in run.notification_ids:
@@ -579,9 +629,12 @@ class Workflow2:
             raise ValueError("周期通知没有返回 message_id")
         run.notification_ids[key] = message_id
         self.store.save(run)
+        logger.info("workflow2_notification_sent run_id=%s key=%s", run.run_id, key)
 
     def handle_confirmation(self, record_id: str) -> dict:
         # The event merely wakes recovery. Reconciliation checks row identity and cutoff.
         updated = [self.resume(run.run_id).run_id for run in self.store.pending()
                    if run.kind in {"stage", "monthly"}]
+        logger.info("workflow2_confirmation_event record_id=%s checked=%d",
+                    record_id, len(updated))
         return {"record_id": record_id, "checked_runs": updated}

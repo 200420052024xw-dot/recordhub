@@ -68,7 +68,8 @@ class WorkflowBinding:
 
 def build_runtime(settings: AppSettings) -> Runtime:
     settings.validate()
-    w1 = W1Settings.from_env()
+    schedules = load_schedule_config(settings.schedule_config_path)
+    w1 = W1Settings.from_schedule(schedules)
     tables = load_table_config(settings.table_config_path)
     infrastructure = _build_infrastructure(settings)
     store = FileStateStore(
@@ -86,7 +87,8 @@ def build_runtime(settings: AppSettings) -> Runtime:
     ai_evaluations = AiEvaluationRepository(
         infrastructure.bitable, tables, store
     )
-    human_evaluations = HumanEvaluationRepository(infrastructure.bitable, tables)
+    human_evaluations = HumanEvaluationRepository(
+        infrastructure.bitable, tables, cutoff_at=w1.auto_advance_at)
     log_repository = LogRepository(infrastructure.bitable, tables, organization_cache)
     workflow = Workflow1(
         store=store,
@@ -103,6 +105,9 @@ def build_runtime(settings: AppSettings) -> Runtime:
         reports=WorkflowReportRepository(infrastructure.bitable, tables, store),
         llm_concurrency=settings.llm_concurrency,
         auto_advance_at=w1.auto_advance_at,
+        notify_at=w1.notify_at,
+        minister_review_form_url=w1.minister_review_form_url,
+        backbone_review_form_url=w1.backbone_review_form_url,
         admin_open_id=settings.admin_open_id,
     )
     binding = WorkflowBinding(
@@ -137,7 +142,7 @@ def build_runtime(settings: AppSettings) -> Runtime:
             tables=Workflow2Tables(infrastructure.bitable, tables),
             prompt_service=prompt_service, messages=infrastructure.messages,
             documents=infrastructure.cloud_docs,
-            schedules=load_schedule_config(settings.schedule_config_path),
+            schedules=schedules,
             archive_parent=settings.archive_parent_folder_token,
         )
     return Runtime(

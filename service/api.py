@@ -73,10 +73,14 @@ def _register_routes(app: FastAPI, runtime: Runtime, settings: AppSettings) -> N
     ) -> dict:
         _require_token(workflow1.confirmation_webhook_token, authorization)
         try:
-            return workflow1.workflow.handle_confirmation(request)
+            result = workflow1.workflow.handle_confirmation(request)
         except Exception as exc:
-            logger.warning("confirmation_rejected", extra={"error": str(exc)})
+            logger.warning("confirmation_rejected record_id=%s error=%s",
+                           request.record_id, exc)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.info("confirmation_received record_id=%s status=%s",
+                    request.record_id, result.get("status"))
+        return result
 
     @app.post("/admin/workflows/daily/{target_date}", dependencies=[Depends(require_admin)])
     def run_workflow(target_date: date) -> dict:
@@ -211,17 +215,21 @@ def _make_lifespan(runtime: Runtime, settings: AppSettings, schedules: ScheduleC
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         nonlocal scheduler, stream
         try:
-            runtime.organization_cache.refresh()
+            organization = runtime.organization_cache.refresh()
         except Exception:
             # Use the persisted organization cache if startup refresh fails.
             if runtime.organization_cache.store.load_cache("organization") is None:
                 raise
             logger.exception("organization_refresh_failed_using_persisted_cache")
+            organization = runtime.organization_cache.get()
+        logger.info("organization_cache_loaded persons=%d departments=%d",
+                    len(organization.persons), len(organization.departments))
         if settings.workflow2_enabled and runtime.workflow2 is not None:
             for kind in ("stage", "monthly", "weekly"):
                 runtime.workflow2._check_ready(kind)
-            runtime.workflow2.store.activate(
+            activation = runtime.workflow2.store.activate(
                 datetime.now(ZoneInfo(schedules.timezone)).date())
+            logger.info("workflow2_activated activation=%s", activation)
         if settings.event_stream_enabled:
             stream = BitableEventStream(
                 handlers=_event_handlers(runtime),
@@ -232,13 +240,22 @@ def _make_lifespan(runtime: Runtime, settings: AppSettings, schedules: ScheduleC
         if settings.scheduler_enabled:
             scheduler = _build_scheduler(schedules, runtime, settings)
             scheduler.start()
+        logger.info(
+            "service_started scheduler_enabled=%s event_stream_enabled=%s "
+            "workflow2_enabled=%s jobs=%d timezone=%s",
+            settings.scheduler_enabled, settings.event_stream_enabled,
+            settings.workflow2_enabled,
+            len(scheduler.get_jobs()) if scheduler else 0, schedules.timezone,
+        )
         try:
             yield
         finally:
+            logger.info("service_stopping")
             if stream:
                 stream.stop()
             if scheduler:
                 scheduler.shutdown(wait=False)
+            logger.info("service_stopped")
 
     return lifespan
 
@@ -256,7 +273,9 @@ def _schedule_daily(
     def run_daily() -> None:
         days_ago = int(schedule.options.get("material_days_ago", 1))
         today = datetime.now(ZoneInfo(schedules.timezone)).date()
-        binding.workflow.start(today - timedelta(days=days_ago))
+        target = today - timedelta(days=days_ago)
+        logger.info("scheduled_workflow1_run date=%s", target)
+        binding.workflow.start(target)
 
     scheduler.add_job(
         run_daily, "cron", hour=hour, minute=minute, id=binding.name,
@@ -274,13 +293,38 @@ def _build_scheduler(
             raise ValueError(f"Missing schedule for registered workflow {name}")
         if schedule.enabled:
             _schedule_daily(scheduler, schedules, schedule, binding)
+            if notify_at := schedule.options.get("notify_at"):
+                hour, minute = map(int, str(notify_at).split(":"))
+
+                def notify_evaluators(one: WorkflowBinding = binding,
+                                      daily: WorkflowSchedule = schedule) -> None:
+                    today = datetime.now(ZoneInfo(schedules.timezone)).date()
+                    days_ago = int(daily.options.get("material_days_ago", 1))
+                    one.workflow.notify_evaluators_if_due(today - timedelta(days=days_ago))
+
+                scheduler.add_job(
+                    notify_evaluators, "cron", hour=hour, minute=minute,
+                    id=f"{name}_evaluator_notification", replace_existing=True,
+                    max_instances=1, coalesce=True,
+                )
+
+                def recover_notifications(one: WorkflowBinding = binding) -> None:
+                    for run in one.store.list_incomplete_workflows():
+                        one.workflow.notify_evaluators_if_due(run.target_date)
+
+                scheduler.add_job(
+                    recover_notifications, "interval", minutes=15,
+                    id=f"{name}_evaluator_notification_recovery",
+                    replace_existing=True, max_instances=1, coalesce=True,
+                )
         if binding.auto_advance_at:
             hour, minute = (int(value) for value in binding.auto_advance_at.split(":", 1))
 
             def auto_advance(one: WorkflowBinding = binding) -> None:
                 for run in one.store.list_incomplete_workflows():
                     result = one.workflow.finalize_pending_confirmations(run.target_date)
-                    logger.info("auto_advance_result", extra={"result": result})
+                    logger.info("auto_advance_result date=%s result=%s",
+                                run.target_date, result)
 
             scheduler.add_job(
                 auto_advance, "cron", hour=hour, minute=minute,
@@ -290,8 +334,12 @@ def _build_scheduler(
 
     def cleanup() -> None:
         today = datetime.now(ZoneInfo(schedules.timezone)).date()
-        for binding in runtime.workflows.values():
+        removed = sum(
             binding.store.cleanup_completed(settings.snapshot_retention_days, today=today)
+            for binding in runtime.workflows.values()
+        )
+        logger.info("snapshot_cleanup_removed removed=%d retention_days=%d",
+                    removed, settings.snapshot_retention_days)
 
     scheduler.add_job(
         cleanup, "cron", hour=3, minute=30, id="snapshot_cleanup",
@@ -300,7 +348,9 @@ def _build_scheduler(
     if settings.workflow2_enabled and runtime.workflow2 is not None:
         def run_workflow2(kind: str) -> None:
             today = datetime.now(ZoneInfo(schedules.timezone)).date()
-            runtime.workflow2.scheduled(kind, today)
+            run = runtime.workflow2.scheduled(kind, today)
+            if run is None:
+                logger.info("workflow2_not_due kind=%s date=%s", kind, today)
 
         for kind, schedule_name in (("stage", "s04_progress"),
                                     ("monthly", "s05_people_suggestions"),
@@ -317,6 +367,17 @@ def _build_scheduler(
             scheduler.add_job(run_workflow2, "cron", args=[kind], hour=hour,
                 minute=minute, **options, id=f"workflow2_{kind}",
                 replace_existing=True, max_instances=1, coalesce=True)
+            if notify_at := item.options.get("notify_at"):
+                notify_hour, notify_minute = map(int, str(notify_at).split(":"))
+
+                def notify_workflow2(cycle_kind: str) -> None:
+                    today = datetime.now(ZoneInfo(schedules.timezone)).date()
+                    runtime.workflow2.notify_due(cycle_kind, today)
+
+                scheduler.add_job(notify_workflow2, "cron", args=[kind],
+                    hour=notify_hour, minute=notify_minute, **options,
+                    id=f"workflow2_{kind}_notification", replace_existing=True,
+                    max_instances=1, coalesce=True)
         scheduler.add_job(runtime.workflow2.recover, "interval", minutes=15,
             id="workflow2_recovery", replace_existing=True, max_instances=1,
             coalesce=True)

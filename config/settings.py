@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +60,9 @@ class AppSettings:
     team_skill_department_id: str = "TEAM_MANAGEMENT"
     event_stream_enabled: bool = True
     archive_parent_folder_token: str = ""
+    log_dir: str = "logs"
+    log_retention_days: int = 3
+    log_level: str = "INFO"
 
     @classmethod
     def from_env(cls) -> "AppSettings":
@@ -104,6 +108,11 @@ class AppSettings:
             event_stream_enabled=_boolean("RECORDHUB_EVENT_STREAM_ENABLED", True),
             archive_parent_folder_token=os.getenv(
                 "RECORDHUB_ARCHIVE_PARENT_FOLDER_TOKEN", "").strip(),
+            log_dir=os.getenv("RECORDHUB_LOG_DIR", "logs").strip() or "logs",
+            log_retention_days=_positive_int(
+                "RECORDHUB_LOG_RETENTION_DAYS", 3
+            ),
+            log_level=_log_level("RECORDHUB_LOG_LEVEL", "INFO"),
         )
 
     def missing_variables(self) -> list[str]:
@@ -131,6 +140,13 @@ def _positive_int(name: str, default: int) -> int:
     value = int(os.getenv(name, str(default)))
     if value < 1:
         raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _log_level(name: str, default: str) -> str:
+    value = os.getenv(name, default).strip().upper()
+    if not isinstance(logging.getLevelName(value), int):
+        raise ValueError(f"{name} must be one of DEBUG/INFO/WARNING/ERROR/CRITICAL")
     return value
 
 

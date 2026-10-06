@@ -84,7 +84,8 @@ class OrganizationCacheTests(unittest.TestCase):
     def test_delete_removes_person_and_flags_dangling_references(self):
         organization = self.fresh().delete_person("B1")
         self.assertNotIn("B1", [p.person_id for p in organization.persons])
-        self.assertTrue(any("S1" in item for item in organization.anomalies))
+        self.assertTrue(any("成员甲" in item and "S1" in item
+                            for item in organization.anomalies))
         self.assertNotIn("B1",
                          [p.person_id for p in self.fresh().get().persons])
 

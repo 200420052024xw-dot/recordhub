@@ -22,7 +22,6 @@ from workflow1.evaluations import AiEvaluationRepository, HumanEvaluationReposit
 from workflow1.reports import WorkflowReportRepository
 
 logger = logging.getLogger(__name__)
-FORM_URL = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcnzhv8IqgIeWXqltJQkWo7ag"
 
 # 通知称呼：部长/团队负责人称「老师」，骨干称「同学」；其余角色不加后缀。
 ROLE_TITLES = {"部长": "老师", "团队负责人": "老师", "骨干学生": "同学"}
@@ -48,6 +47,9 @@ class Workflow1:
                  reports: WorkflowReportRepository,
                  llm_concurrency: int = 3,
                  auto_advance_at: str = "12:00",
+                 notify_at: str = "08:00",
+                 minister_review_form_url: str = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcnaBl2hPcNAs4nNBYI2STpGh",
+                 backbone_review_form_url: str = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcngOWTo1tmzxm4V9blwKA1Dd",
                  prompt_path: str = "prompts/S01.txt",
                  admin_open_id: str = "") -> None:
         self.store = store
@@ -61,6 +63,11 @@ class Workflow1:
         self.reports = reports
         self.llm_concurrency = llm_concurrency
         self.auto_advance_at = auto_advance_at
+        self.notify_at = notify_at
+        self.review_form_urls = {
+            "部长": minister_review_form_url,
+            "骨干学生": backbone_review_form_url,
+        }
         self.prompt_path = Path(prompt_path)
         self.admin_open_id = admin_open_id
         self._lock = threading.RLock()
@@ -74,6 +81,9 @@ class Workflow1:
             return True
 
         added = self.store.update_snapshot(target_date, mutate)
+        if added:
+            logger.warning("workflow1_issue_recorded date=%s key=%s reason=%s",
+                           target_date, key, reason)
         if not added or not self.admin_open_id:
             return
         try:
@@ -89,7 +99,9 @@ class Workflow1:
         with self._lock:
             run = self.store.get_or_create_workflow(target_date)
             if run.status == WorkflowStatus.COMPLETED:
+                logger.debug("workflow1_already_completed date=%s", target_date)
                 return run
+            logger.info("workflow1_start date=%s", target_date)
             try:
                 snapshot = self.store.load_snapshot(target_date)
                 if snapshot is not None and snapshot.schema_version != 2:
@@ -124,7 +136,7 @@ class Workflow1:
                         for state in item.log_evaluations.values())
                 if mapped or not snapshot.evaluations_published:
                     self.store.update_snapshot(target_date, save_published)
-                self._notify_evaluators(target_date)
+                self.notify_evaluators_if_due(target_date)
                 self._reconcile_human(target_date)
                 if self._deadline_passed(target_date):
                     self._close_remaining(target_date)
@@ -132,10 +144,13 @@ class Workflow1:
             except Exception as exc:
                 logger.exception("workflow1_failed date=%s", target_date)
                 self.store.set_status(target_date, WorkflowStatus.FAILED, error=str(exc))
-            return self.store.load_workflow(target_date) or run
+            result = self.store.load_workflow(target_date) or run
+            logger.info("workflow1_finished date=%s status=%s", target_date, result.status)
+            return result
 
     def resume(self, target_date: date) -> WorkflowRun:
         with self._lock:
+            logger.info("workflow1_resume date=%s", target_date)
             self.store.get_or_create_workflow(target_date)
             if self.store.load_snapshot(target_date):
                 self.store.update_snapshot(target_date, self._reset_failed)
@@ -208,6 +223,8 @@ class Workflow1:
                         target_date, f"log:{log_id}:ai-failed",
                         f"日志 {log_id} AI 评价生成失败（重试已耗尽）：{exc}；"
                         "已跳过，可调用重评接口补评")
+        logger.info("workflow1_logs_evaluated date=%s pending=%d failed=%d",
+                    target_date, len(pending), len(failures))
 
     def _notify_once(self, target_date: date, key: str,
                      open_id: str, message: str) -> None:
@@ -238,14 +255,18 @@ class Workflow1:
             names = sorted({people[snapshot.log_evaluations[log_id].person_id].name
                             for log_id in progress.log_ids})
             key = f"{target_date}:FORM:{evaluator_id}"
-            open_id = people[evaluator_id].open_id or ""
+            evaluator = people[evaluator_id]
+            form_url = self.review_form_urls.get(evaluator.role)
+            if not form_url:
+                raise ValueError(f"评价人「{evaluator.name}」的角色 {evaluator.role} 未配置审核表单")
+            open_id = evaluator.open_id or ""
             if open_id:
-                scope = "骨干" if people[evaluator_id].role == "部长" else "成员"
+                scope = "骨干" if evaluator.role == "部长" else "成员"
                 self._notify_once(target_date, key, open_id,
-                    f"{greeting(people[evaluator_id])}"
+                    f"{greeting(evaluator)}"
                     f"请评价以下{scope} {date_cn(target_date)} 的工作日志"
                     f"（共 {len(progress.log_ids)} 条）：\n{'、'.join(names)}"
-                    f"\n问卷：{FORM_URL}")
+                    f"\n问卷：{form_url}")
             else:
                 self._record_issue(
                     target_date, f"person:{evaluator_id}:missing-open-id",
@@ -253,6 +274,18 @@ class Workflow1:
                     "问卷通知未发送，请补录")
             self.store.update_snapshot(target_date,
                 lambda item: setattr(item.evaluators[evaluator_id], "notified", True))
+
+    def notify_evaluators_if_due(self, target_date: date) -> None:
+        with self._lock:
+            hour, minute = map(int, self.notify_at.split(":"))
+            notify_time = datetime.combine(target_date + timedelta(days=1),
+                                           time(hour, minute), ZoneInfo("Asia/Shanghai"))
+            if (datetime.now(ZoneInfo("Asia/Shanghai")) < notify_time or
+                    self._deadline_passed(target_date)):
+                return
+            snapshot = self.store.load_snapshot(target_date)
+            if snapshot is not None:
+                self._notify_evaluators(target_date)
 
     def _reconcile_human(self, target_date: date) -> int:
         snapshot = self.store.load_snapshot(target_date)
@@ -335,10 +368,14 @@ class Workflow1:
                 human = self._reconcile_human(target_date)
                 auto = self._close_remaining(target_date)
                 self.advance(target_date)
+                logger.info("workflow1_finalized date=%s human_confirmed=%d auto_confirmed=%d",
+                            target_date, human, auto)
                 return {"target_date": target_date.isoformat(),
                         "human_confirmed": human, "auto_confirmed": auto,
                         "errors": []}
             except Exception as exc:
+                logger.warning("workflow1_finalize_failed date=%s error=%s",
+                               target_date, exc)
                 self.store.set_status(target_date, WorkflowStatus.FAILED,
                                       error=str(exc))
                 return {"target_date": target_date.isoformat(),
@@ -357,8 +394,7 @@ class Workflow1:
     def handle_human_record(self, record_id: str, *, target_date: date | None = None,
                             expected_key: str | None = None) -> dict:
         with self._lock:
-            record = {"record_id": record_id,
-                      "fields": self.human_evaluations.load_record_fields(record_id)}
+            record = self.human_evaluations.load_record(record_id)
             dates = ([target_date] if target_date else
                 [run.target_date for run in self.store.list_incomplete_workflows()])
             for one_date in dates:

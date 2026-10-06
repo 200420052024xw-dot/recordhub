@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest.mock import patch
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -170,13 +171,32 @@ class FoundationTests(unittest.TestCase):
         )
 
     def test_default_schedule_file_is_valid(self) -> None:
+        from workflow1.settings import W1Settings
+
         schedules = load_schedule_config("config/schedules.toml")
         self.assertEqual(schedules.timezone, "Asia/Shanghai")
-        self.assertEqual(schedules.workflows["workflow1_daily"].time, "08:10")
+        self.assertEqual(schedules.workflows["workflow1_daily"].time, "01:00")
         self.assertEqual(
             schedules.workflows["workflow1_daily"].options["material_days_ago"],
             1,
         )
+        with patch.dict("os.environ", {"RECORDHUB_AUTO_ADVANCE_AT": "23:59"}):
+            self.assertEqual(W1Settings.from_schedule(schedules).auto_advance_at,
+                              "19:00")
+        self.assertEqual(W1Settings.from_schedule(schedules).notify_at, "08:00")
+
+    def test_invalid_confirmation_deadline_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bad.toml"
+            path.write_text(
+                'timezone = "Asia/Shanghai"\n'
+                '[workflows.workflow1_daily]\n'
+                'enabled = true\n'
+                'schedule_type = "daily"\n'
+                'time = "08:10"\n'
+                'auto_advance_at = "25:00"\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "invalid auto_advance_at"):
+                load_schedule_config(path)
 
     def test_invalid_schedule_time_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

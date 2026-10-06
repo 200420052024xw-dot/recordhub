@@ -1,6 +1,6 @@
 import tempfile
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -56,6 +56,14 @@ class Workflow2TableTests(unittest.TestCase):
                    return_value=datetime(2026, 10, 4, 17, tzinfo=timezone.utc)):
             self.assertEqual(_write_date_millis(), date_millis(date(2026, 10, 5)))
 
+    def test_report_link_uses_actual_field_type(self):
+        self.tables.config.tables["stage_report"].fields["progress"] = "阶段工作总结"
+        self.bitable.list_fields = lambda table_id: [
+            {"field_name": "阶段工作总结", "type": 15}]
+        self.assertEqual(self.tables.url_value(
+            "stage_report", "progress", "https://feishu.cn/docx/x", "阶段汇报"),
+            {"text": "阶段汇报", "link": "https://feishu.cn/docx/x"})
+
     def test_missing_text_task_id_blocks_startup(self):
         self.bitable.list_fields = lambda table_id: [
             {"field_name": "任务编号", "type": 20},
@@ -98,6 +106,40 @@ class Workflow2TableTests(unittest.TestCase):
             self.assertEqual(workflow.scheduled("weekly", date(2026, 10, 19)), "started")
             self.assertEqual(workflow.scheduled("monthly", date(2026, 11, 1)), "started")
             self.assertEqual(workflow.scheduled("monthly", date(2026, 12, 1)), "started")
+
+    def test_stage_ai_date_is_next_day_for_confirmation_lookup(self):
+        from schema import Department, Organization, Person
+
+        day = date(2026, 10, 5)
+        run = CycleRun(run_id="927065ce-76e3-4837-9a1c-dff6ce6604cb",
+                       kind="stage", scheduled_date=day,
+                       start_date=date(2026, 10, 2), end_date=date(2026, 10, 4),
+                       created_at=datetime.now(timezone.utc),
+                       updated_at=datetime.now(timezone.utc))
+        run.departments["D"] = DepartmentResult(
+            department_id="D", minister_id="M",
+            drafts={"S04": {"content": {"items": []}}},
+            draft_text={"S04": "AI 阶段分析"})
+        organization = Organization(
+            persons=[Person(person_id="M", name="部长", role="部长",
+                            department_id="D", open_id="ou_m")],
+            departments=[Department(department_id="D", name="一部",
+                                    minister_id="M")])
+        workflow = Workflow2.__new__(Workflow2)
+        workflow.schedules = load_schedule_config("config/schedules.toml")
+        workflow.store = SimpleNamespace(save=lambda state: None)
+        workflow.configs = SimpleNamespace(load=lambda org: [])
+        workflow.prompt_service = Mock()
+        workflow.preparer = SimpleNamespace(prepare=lambda **kwargs: SimpleNamespace(
+            input=SimpleNamespace(scope=SimpleNamespace(
+                complete=True, omitted_sources=[]))))
+        workflow.tables = SimpleNamespace(upsert=Mock())
+        workflow._confirmation = Mock()
+        workflow._notify_minister = Mock()
+        workflow._departments(run, organization)
+        table, _, fields = workflow.tables.upsert.call_args.args
+        self.assertEqual(table, "stage_analysis")
+        self.assertEqual(fields["analysis_date"], date_millis(day + timedelta(days=1)))
 
     def test_weekly_and_monthly_do_not_depend_on_activation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -142,7 +184,7 @@ class Workflow2TableTests(unittest.TestCase):
         workflow._confirmation(run, draft, organization)
         self.assertEqual(draft.final_text["S04"], "AI draft")
         self.assertEqual(draft.unconfirmed, ["S04"])
-        self.assertEqual(len(writes), 1)
+        self.assertEqual(len(writes), 0)
 
     def test_confirmation_matches_scheduled_day(self):
         run = CycleRun(run_id="927065ce-76e3-4837-9a1c-dff6ce6604cb",
@@ -181,7 +223,7 @@ class Workflow2TableTests(unittest.TestCase):
         self.assertEqual(draft.final_text["S04"], "AI draft")
         self.assertEqual(draft.confirmation_record_id, "rec1")
         self.assertEqual(draft.unconfirmed, [])
-        self.assertEqual(len(writes), 1)
+        self.assertEqual(len(writes), 0)
 
     def test_confirmation_matches_next_day_before_cutoff(self):
         run = CycleRun(run_id="927065ce-76e3-4837-9a1c-dff6ce6604cb",
@@ -218,7 +260,92 @@ class Workflow2TableTests(unittest.TestCase):
         self.assertEqual(draft.final_text["S04"], "AI draft")
         self.assertEqual(draft.confirmation_record_id, "rec1")
         self.assertEqual(draft.unconfirmed, [])
-        self.assertEqual(len(writes), 1)
+        self.assertEqual(len(writes), 0)
+
+    def test_periodic_links_go_to_their_report_tables(self):
+        from schema import Department, Organization, Person
+
+        class FakeDocs:
+            def __init__(self):
+                self.created = {}
+
+            def find_child(self, parent, title, kind):
+                return self.created.get((parent, title, kind))
+
+            def create_folder(self, parent, title):
+                token = f"folder{len(self.created)}"
+                self.created[(parent, title, "folder")] = token
+                return token
+
+            def create_document(self, parent, title):
+                token = f"doc{len(self.created)}"
+                self.created[(parent, title, "docx")] = token
+                return token
+
+            def list_blocks(self, token):
+                return []
+
+            def append_blocks(self, token, blocks):
+                pass
+
+        organization = Organization(
+            persons=[Person(person_id="T", name="负责人", role="团队负责人",
+                            open_id="ou_t"),
+                     Person(person_id="M", name="部长", role="部长",
+                            open_id="ou_m", department_id="D")],
+            departments=[Department(department_id="D", name="一部", minister_id="M")],
+            team_leader_id="T")
+        for kind, codes, table_name in (
+            ("stage", ("S04",), "stage_report"),
+            ("monthly", ("S05", "S06", "S07"), "monthly_department_report"),
+            ("weekly", ("S08", "S09"), "team_analysis"),
+        ):
+            with self.subTest(kind=kind):
+                run = CycleRun(run_id="927065ce-76e3-4837-9a1c-dff6ce6604cb",
+                               kind=kind, scheduled_date=date(2026, 10, 5),
+                               start_date=date(2026, 10, 2), end_date=date(2026, 10, 4),
+                               created_at=datetime.now(timezone.utc),
+                               updated_at=datetime.now(timezone.utc))
+                if kind == "weekly":
+                    run.team_results = {code: {"content": {"items": []}}
+                                        for code in codes}
+                    run.weekly_reference = {code: {"content": {"items": []}}
+                                            for code in codes}
+                else:
+                    run.departments["D"] = DepartmentResult(
+                        department_id="D", minister_id="M",
+                        final_text={code: f"{code} 正文" for code in codes})
+                writes = []
+                workflow = Workflow2.__new__(Workflow2)
+                workflow.documents = FakeDocs()
+                workflow.archive_parent = "root"
+                workflow.store = SimpleNamespace(save=lambda state: None)
+                workflow.schedules = load_schedule_config("config/schedules.toml")
+                workflow.tables = SimpleNamespace(
+                    upsert=lambda *args: writes.append(args),
+                    url_value=lambda table, field, url, title: url)
+                workflow._notify = Mock()
+                workflow._documents(run, organization)
+                self.assertEqual({entry[0] for entry in writes}, {table_name})
+                if kind == "weekly":
+                    self.assertEqual(len(writes), 1)
+                    self.assertEqual(writes[0][1], run.run_id)
+                    self.assertEqual(set(writes[0][2]),
+                                     {"analysis_date", "technology_s08", "training_s09"})
+                    for column in ("technology_s08", "training_s09"):
+                        self.assertTrue(writes[0][2][column].startswith("https://feishu.cn/docx/"))
+                    continue
+                self.assertEqual(len(writes), 2)
+                department_fields = next(entry[2] for entry in writes
+                                         if entry[1].endswith(":D"))
+                team_fields = next(entry[2] for entry in writes
+                                   if entry[1].endswith(":TEAM"))
+                columns = (["progress"] if kind == "stage" else
+                           ["personnel_s05", "ideas_s06", "meeting_s07"])
+                for column in columns:
+                    self.assertTrue(department_fields[column].startswith("https://feishu.cn/docx/"))
+                    self.assertTrue(team_fields[column].startswith("https://feishu.cn/docx/"))
+                    self.assertNotEqual(department_fields[column], team_fields[column])
 
 
 if __name__ == "__main__":
