@@ -69,7 +69,8 @@ class ServiceRegistryTests(unittest.TestCase):
         self.assertEqual(
             {job.id for job in scheduler.get_jobs()},
             {"workflow1_daily", "workflow2_daily",
-             "workflow1_daily_confirmation_auto_advance", "snapshot_cleanup"},
+             "workflow1_daily_confirmation_auto_advance", "snapshot_cleanup",
+             "organization_refresh"},
         )
 
     def test_configured_notification_jobs_are_registered(self) -> None:
@@ -92,6 +93,28 @@ class ServiceRegistryTests(unittest.TestCase):
         self.assertIn("hour='12'", jobs["workflow2_monthly_notification"])
         self.assertIn("hour='6'", jobs["workflow2_weekly"])
         self.assertIn("hour='9'", jobs["workflow2_weekly_notification"])
+
+    def test_organization_refresh_failure_notifies_admin_and_continues(self) -> None:
+        settings = replace(self.settings, admin_open_id="ou_admin")
+        cache = Mock()
+        cache.refresh.side_effect = RuntimeError("人员表读取失败")
+        messages = Mock()
+        runtime = Runtime(
+            settings=settings,
+            infrastructure=Mock(messages=messages),
+            organization_cache=cache,
+            workflows={},
+        )
+        schedules = ScheduleConfig(timezone="Asia/Shanghai", workflows={})
+        scheduler = _build_scheduler(schedules, runtime, settings)
+        job = next(job for job in scheduler.get_jobs() if job.id == "organization_refresh")
+
+        job.func()  # 刷新失败不应抛出，后续任务继续执行
+
+        cache.refresh.assert_called_once()
+        messages.send_text.assert_called_once()
+        self.assertEqual(messages.send_text.call_args.args[0], "ou_admin")
+        self.assertIn("组织缓存刷新失败", messages.send_text.call_args.args[1])
 
     def test_duplicate_table_registration_is_rejected(self) -> None:
         first = binding("workflow1_daily", "human")

@@ -54,25 +54,106 @@ def _partial_notice(omitted: set[str]) -> str:
             "以下仅分析可用记录。\n") if omitted else ""
 
 
-def _item_text(item: dict, code: str, department_ids: list[str] | None = None) -> str:
-    subject = (item.get("work_item") or item.get("topic") or item.get("technology_name")
-               or item.get("idea") or item.get("person_id") or NAMES[code])
-    people = item.get("participant_ids") or item.get("contributor_ids") or item.get("target_person_ids")
-    people = people or ([item["person_id"]] if item.get("person_id") else [])
-    departments = department_ids or item.get("department_ids") or []
-    detail = "; ".join(f"{key}: {value}" for key, value in item.items()
-                       if key not in {"department_ids", "participant_ids",
-                                      "contributor_ids", "target_person_ids"} and value not in ("", [], None))
-    return (f"-结果类别：{NAMES[code]}\n-主题或对象：{subject}\n"
-            f"-涉及人员及部门：{', '.join(map(str, people)) or '未指定'}；"
-            f"{', '.join(map(str, departments)) or '未指定'}\n"
-            f"-具体内容：{detail}")
+FIELD_LABELS = {
+    "work_item": "工作事项",
+    "current_progress": "当前进展",
+    "main_difficulties": "主要困难",
+    "action": "建议类型",
+    "reason": "理由",
+    "facts": "事实依据",
+    "idea": "想法",
+    "categories": "关注类别",
+    "evidence": "依据",
+    "technology_name": "技术名称",
+    "category": "类别",
+    "problem_solved": "解决的问题",
+    "existing_achievements": "已有成果",
+    "achievement_refs": "成果出处",
+    "suitable_scenarios": "适用场景",
+    "repository_suggestion": "入库建议",
+    "pending_items": "待完善事项",
+    "topic": "主题",
+    "target_audience": "面向人员",
+    "common_need": "共同需求",
+    "expected_effect": "预期效果",
+    "available_resource_ids": "可用资源",
+    "approach": "开展方式",
+    "course_suggestion": "课程建议",
+}
+
+# 已解析成姓名/部门名展示的编号字段，不再重复出现在“具体内容”里。
+_ID_FIELDS = {
+    "person_id", "proposer_id", "participant_ids", "contributor_ids",
+    "target_person_ids", "department_ids",
+}
 
 
-def _result_text(result: dict, code: str, department_ids: list[str] | None = None) -> str:
+def _item_text(item: dict, code: str, organization: Organization,
+               department_ids: list[str] | None = None) -> str:
+    people = organization.person_map()
+    departments = organization.department_map()
+
+    subject = None
+    subject_field = None
+    for key in ("work_item", "topic", "technology_name", "idea"):
+        if item.get(key):
+            subject = item[key]
+            subject_field = key
+            break
+    if subject is None and item.get("person_id"):
+        person = people.get(item["person_id"])
+        subject = person.name if person else str(item["person_id"])
+    subject = subject or NAMES[code]
+
+    person_ids: list[str] = []
+    for key in ("participant_ids", "contributor_ids", "target_person_ids"):
+        person_ids.extend(item.get(key) or [])
+    for key in ("person_id", "proposer_id"):
+        value = item.get(key)
+        if value:
+            person_ids.append(value)
+    names: list[str] = []
+    seen: set[str] = set()
+    for pid in person_ids:
+        if pid in seen:
+            continue
+        seen.add(pid)
+        person = people.get(pid)
+        names.append(person.name if person else str(pid))
+
+    dept_ids = list(department_ids or item.get("department_ids") or [])
+    dept_names: list[str] = []
+    seen_depts: set[str] = set()
+    for did in dept_ids:
+        if did in seen_depts:
+            continue
+        seen_depts.add(did)
+        department = departments.get(did)
+        dept_names.append(department.name if department else str(did))
+
+    excluded = set(_ID_FIELDS)
+    if subject_field:
+        excluded.add(subject_field)
+    detail_parts: list[str] = []
+    for key, value in item.items():
+        if key in excluded or value in ("", [], None):
+            continue
+        rendered = "、".join(map(str, value)) if isinstance(value, list) else str(value)
+        detail_parts.append(f"{FIELD_LABELS.get(key, key)}：{rendered}")
+
+    return (f"-结果类别：{NAMES[code]}\n"
+            f"-主题或对象：{subject}\n"
+            f"-涉及人员及部门：{'、'.join(names) or '未指定'}；"
+            f"{'、'.join(dept_names) or '未指定'}\n"
+            f"-具体内容：{'；'.join(detail_parts) or '—'}")
+
+
+def _result_text(result: dict, code: str, organization: Organization,
+                 department_ids: list[str] | None = None) -> str:
     content = result.get("content") or {}
     items = content.get("items") or []
-    return "\n\n".join(_item_text(item, code, department_ids) for item in items) or "本范围内暂无可确认的分析条目。"
+    return "\n\n".join(_item_text(item, code, organization, department_ids)
+                       for item in items) or "本范围内暂无可确认的分析条目。"
 
 
 class Workflow2:
@@ -294,7 +375,8 @@ class Workflow2:
                             items.extend((dump.get("content") or {}).get("items", []))
                         draft.drafts[code] = {"content": {"items": items}}
                     draft.draft_text[code] = notice + _result_text(
-                        draft.drafts[code], code, [department.department_id])
+                        draft.drafts[code], code, organization,
+                        [department.department_id])
                     self.store.save(run)
             task_id = f"{run.run_id}:{department.department_id}"
             common = {"minister_ref": [{"id": minister.open_id}],
@@ -515,7 +597,7 @@ class Workflow2:
                 blocks.append(text_block(run.issues["materials:weekly"]))
             if run.kind == "weekly":
                 blocks.append(text_block("团队总结", heading=2))
-                summary = _result_text(run.team_results[code], code)
+                summary = _result_text(run.team_results[code], code, organization)
                 blocks.extend(text_block(line) for line in summary.split("\n") if line)
                 names = organization.department_map()
                 for department_id, bucket in sorted(run.department_results.items()):
@@ -523,12 +605,14 @@ class Workflow2:
                     minister = organization.person_map()[department.minister_id]
                     blocks.append(divider_block())
                     blocks.append(text_block(f"{minister.name}老师部门（{department.name}）", heading=2))
-                    department_text = _result_text(bucket.get(code) or {}, code, [department_id])
+                    department_text = _result_text(bucket.get(code) or {}, code,
+                                                   organization, [department_id])
                     blocks.extend(text_block(line)
                                   for line in department_text.split("\n") if line)
                 blocks.append(divider_block())
                 blocks.append(text_block("团队参考版", heading=2))
-                reference_text = _result_text(run.weekly_reference.get(code) or {}, code)
+                reference_text = _result_text(run.weekly_reference.get(code) or {}, code,
+                                              organization)
                 blocks.extend(text_block(line) for line in reference_text.split("\n") if line)
             for department_id, draft in sorted(run.departments.items()):
                 department = organization.department_map()[department_id]

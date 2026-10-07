@@ -345,6 +345,32 @@ def _build_scheduler(
         cleanup, "cron", hour=3, minute=30, id="snapshot_cleanup",
         replace_existing=True, max_instances=1, coalesce=True,
     )
+
+    def refresh_organization() -> None:
+        try:
+            runtime.organization_cache.refresh()
+        except Exception as exc:
+            logger.exception("organization_refresh_failed")
+            if settings.admin_open_id:
+                try:
+                    runtime.infrastructure.messages.send_text(
+                        settings.admin_open_id,
+                        f"【组织缓存刷新失败】每日定时刷新人员信息时出错：{exc}",
+                        idempotency_key=(
+                            "org-refresh:"
+                            f"{datetime.now(ZoneInfo(schedules.timezone)).date()}"
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "admin_issue_notification_failed key=organization_refresh")
+
+    # 组织缓存每日刷新：需早于 workflow1_daily（默认 01:00），保证当天日报
+    # 使用最新的人员名单；刷新失败仅通知管理员，不影响后续任务继续执行。
+    scheduler.add_job(
+        refresh_organization, "cron", hour=0, minute=50, id="organization_refresh",
+        replace_existing=True, max_instances=1, coalesce=True,
+    )
     if settings.workflow2_enabled and runtime.workflow2 is not None:
         def run_workflow2(kind: str) -> None:
             today = datetime.now(ZoneInfo(schedules.timezone)).date()

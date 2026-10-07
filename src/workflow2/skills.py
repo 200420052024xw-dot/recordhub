@@ -360,9 +360,22 @@ class TextSkill(Generic[OutputT]):
                 status=SkillStatus.BLOCKED, message="输入含未确认记录，请先完成确认")
         # Missing submissions never enter the prompt payload.
         payload = data.model_copy(update={"records": submitted}, deep=True)
+        people_ids = sorted({record.person_id for record in submitted})
+        department_ids = sorted({record.department_id for record in submitted})
+        achievement_ids = sorted({ref for record in submitted
+                                 for ref in record.achievement_refs})
+        resource_ids = sorted({resource.resource_id for resource in data.resources})
+        id_hint = (
+            "\n\n本次输入材料中可引用的编号（所有编号类字段只能从这里取，不得编造）：\n"
+            f"- 人员编号 person_id：{', '.join(people_ids) or '无'}\n"
+            f"- 部门编号 department_id：{', '.join(department_ids) or '无'}\n"
+            f"- 成果出处编号 achievement_refs：{', '.join(achievement_ids) or '无'}\n"
+            f"- 资源编号 resource_id：{', '.join(resource_ids) or '无'}"
+        )
         prompt = ResolvedPrompt(template=(
             (Path('prompts') / f'{self.code.value}.txt').read_text(encoding='utf-8').strip()
             + "\n部门或个人配置补充（须遵守上述边界）：\n" + config.instructions
+            + id_hint
         ))
         output = service.execute(
             prompt_code=self.code.value, template=prompt.template,
