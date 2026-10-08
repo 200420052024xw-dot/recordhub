@@ -47,6 +47,19 @@ def _build_infrastructure(
     )
 
 
+def make_recipient_resolver(
+    organization_cache: OrganizationCache,
+) -> Callable[[str], tuple[str, str] | None]:
+    def resolve(open_id: str) -> tuple[str, str] | None:
+        organization = organization_cache.get()
+        for person in organization.persons:
+            if person.open_id == open_id:
+                return person.name, person.mobile or ""
+        return None
+
+    return resolve
+
+
 @dataclass(slots=True)
 class Runtime:
     settings: AppSettings
@@ -83,6 +96,9 @@ def build_runtime(settings: AppSettings) -> Runtime:
             use_person_field_ids=(settings.simulation_mode and
                                   bool(settings.message_override_open_id)),
         )
+    )
+    infrastructure.messages.recipient_resolver = make_recipient_resolver(
+        organization_cache
     )
     ai_evaluations = AiEvaluationRepository(
         infrastructure.bitable, tables, store

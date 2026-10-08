@@ -9,6 +9,8 @@ from unittest.mock import Mock
 
 from tool.errors import FeishuApiError
 from tool.feishu import MessageService
+from schema import Department, Organization, Person
+from service.runtime import make_recipient_resolver
 
 
 class OrganizationMobileParsingTests(unittest.TestCase):
@@ -99,3 +101,20 @@ class MessageServiceLoggingTests(unittest.TestCase):
         with self.assertLogs("tool.feishu", level="INFO") as captured:
             messages.send_text("ou_bad", "hi")
         self.assertIn("name=- mobile=-", captured.output[0])
+
+
+class RecipientResolverWiringTests(unittest.TestCase):
+    def test_make_recipient_resolver_maps_open_id_to_name_and_mobile(self):
+        cache = Mock()
+        cache.get.return_value = Organization(
+            persons=[
+                Person(person_id="B1", name="杨阳蕊", role="部长",
+                       open_id="ou_yyr", mobile="+8613837176209"),
+            ],
+            departments=[Department(department_id="D1", name="杨阳蕊部门",
+                                    minister_id="B1")],
+            team_leader_id=None,
+        )
+        resolve = make_recipient_resolver(cache)
+        self.assertEqual(resolve("ou_yyr"), ("杨阳蕊", "+8613837176209"))
+        self.assertIsNone(resolve("ou_unknown"))
