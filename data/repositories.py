@@ -180,6 +180,7 @@ class OrganizationRepository:
                     or None,
                     leader_id=leader_id or None,
                     open_id=person_open_id(item, values) or None,
+                    mobile=scalar(values.get(person_fields["mobile"])).strip() or None,
                     source_record_id=str(item.get("record_id", "")) or None,
                     active=field_boolean(values.get(person_fields.get("active"))),
                 )

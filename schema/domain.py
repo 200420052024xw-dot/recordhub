@@ -17,6 +17,7 @@ class Person(StrictModel):
     department_id: str | None = None
     leader_id: str | None = None
     open_id: str | None = None
+    mobile: str | None = None
     source_record_id: str | None = None
     active: bool = True
 
