@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
-from uuid import NAMESPACE_URL, uuid5
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator, Mapping
+from datetime import date, datetime
+from typing import Any, Callable, Iterable, Iterator, Mapping
+from uuid import NAMESPACE_URL, uuid5
 
 from config.settings import FeishuSettings
+from tool.bitable_fields import SHANGHAI
 from tool.errors import FeishuApiError
 from tool.http import HttpResponse, HttpTransport
+
+logger = logging.getLogger(__name__)
 
 
 class FeishuTokenProvider:
@@ -328,9 +333,37 @@ class ContactService:
 
 
 class MessageService:
-    def __init__(self, client: FeishuClient, *, recipient_override: str = "") -> None:
+    def __init__(
+        self,
+        client: FeishuClient,
+        *,
+        recipient_override: str = "",
+        recipient_resolver: Callable[[str], tuple[str, str] | None] | None = None,
+    ) -> None:
         self.client = client
         self.recipient_override = recipient_override.strip()
+        self.recipient_resolver = recipient_resolver
+        self._seq_date: date | None = None
+        self._seq = 0
+
+    def _next_seq(self, today: date) -> int:
+        if today != self._seq_date:
+            self._seq_date = today
+            self._seq = 0
+        self._seq += 1
+        return self._seq
+
+    def _recipient_info(self, open_id: str) -> tuple[str, str]:
+        if self.recipient_resolver is None:
+            return "-", "-"
+        try:
+            info = self.recipient_resolver(open_id)
+        except Exception:
+            return "-", "-"
+        if not info:
+            return "-", "-"
+        name, mobile = info
+        return name or "-", mobile or "-"
 
     def send(
         self,
@@ -341,17 +374,32 @@ class MessageService:
         receive_id_type: str = "open_id",
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        payload = self.client.request(
-            "POST",
-            "im/v1/messages",
-            query={"receive_id_type": receive_id_type},
-            json_body={
-                "receive_id": self.recipient_override or receive_id,
-                "msg_type": msg_type,
-                "content": content,
-                **({"uuid": str(uuid5(NAMESPACE_URL, idempotency_key))}
-                   if idempotency_key else {}),
-            },
+        effective = self.recipient_override or receive_id
+        seq = self._next_seq(datetime.now(SHANGHAI).date())
+        name, mobile = self._recipient_info(effective)
+        try:
+            payload = self.client.request(
+                "POST",
+                "im/v1/messages",
+                query={"receive_id_type": receive_id_type},
+                json_body={
+                    "receive_id": effective,
+                    "msg_type": msg_type,
+                    "content": content,
+                    **({"uuid": str(uuid5(NAMESPACE_URL, idempotency_key))}
+                       if idempotency_key else {}),
+                },
+            )
+        except FeishuApiError as exc:
+            logger.warning(
+                "message_send_failed seq=%d type=%s to=%s name=%s mobile=%s error=%s",
+                seq, msg_type, effective, name, mobile, str(exc),
+            )
+            raise
+        message_id = str(payload.get("data", {}).get("message_id", ""))
+        logger.info(
+            "message_sent seq=%d type=%s to=%s name=%s mobile=%s message_id=%s",
+            seq, msg_type, effective, name, mobile, message_id,
         )
         return dict(payload.get("data", {}))
 
