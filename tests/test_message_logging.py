@@ -7,7 +7,7 @@ from data.repositories import OrganizationRepository
 from datetime import date
 from unittest.mock import Mock
 
-from tool.errors import FeishuApiError
+from tool.errors import FeishuApiError, TransportError
 from tool.feishu import MessageService
 from schema import Department, Organization, Person
 from service.runtime import make_recipient_resolver
@@ -98,6 +98,24 @@ class MessageServiceLoggingTests(unittest.TestCase):
 
         client, messages = self._service(resolver=boom)
         client.request.return_value = {"code": 0, "data": {"message_id": "om_3"}}
+        with self.assertLogs("tool.feishu", level="INFO") as captured:
+            messages.send_text("ou_bad", "hi")
+        self.assertIn("name=- mobile=-", captured.output[0])
+
+    def test_send_logs_failure_on_transport_error_and_reraises(self):
+        client, messages = self._service()
+        client.request.side_effect = TransportError("network down")
+        with self.assertLogs("tool.feishu", level="WARNING") as captured:
+            with self.assertRaises(TransportError):
+                messages.send_text("ou_x", "hi")
+        self.assertIn(
+            "message_send_failed seq=1 type=text to=ou_x name=- mobile=- error=network down",
+            captured.output[0],
+        )
+
+    def test_resolver_malformed_return_logs_dash(self):
+        client, messages = self._service(resolver=lambda oid: ("only-name",))
+        client.request.return_value = {"code": 0, "data": {"message_id": "om_4"}}
         with self.assertLogs("tool.feishu", level="INFO") as captured:
             messages.send_text("ou_bad", "hi")
         self.assertIn("name=- mobile=-", captured.output[0])

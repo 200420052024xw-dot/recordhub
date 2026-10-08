@@ -345,24 +345,26 @@ class MessageService:
         self.recipient_resolver = recipient_resolver
         self._seq_date: date | None = None
         self._seq = 0
+        self._seq_lock = threading.Lock()
 
     def _next_seq(self, today: date) -> int:
-        if today != self._seq_date:
-            self._seq_date = today
-            self._seq = 0
-        self._seq += 1
-        return self._seq
+        with self._seq_lock:
+            if today != self._seq_date:
+                self._seq_date = today
+                self._seq = 0
+            self._seq += 1
+            return self._seq
 
     def _recipient_info(self, open_id: str) -> tuple[str, str]:
         if self.recipient_resolver is None:
             return "-", "-"
         try:
             info = self.recipient_resolver(open_id)
+            if not info:
+                return "-", "-"
+            name, mobile = info
         except Exception:
             return "-", "-"
-        if not info:
-            return "-", "-"
-        name, mobile = info
         return name or "-", mobile or "-"
 
     def send(
@@ -390,7 +392,7 @@ class MessageService:
                        if idempotency_key else {}),
                 },
             )
-        except FeishuApiError as exc:
+        except Exception as exc:
             logger.warning(
                 "message_send_failed seq=%d type=%s to=%s name=%s mobile=%s error=%s",
                 seq, msg_type, effective, name, mobile, str(exc),
