@@ -114,6 +114,18 @@ class ExternalStudentFlowTests(unittest.TestCase):
         self.assertEqual(parsed[1].person_id, "S")
         self.assertEqual(parsed[1].improvement, "具体建议")
 
+    def test_backbone_log_with_filled_name_uses_submitter(self):
+        rows = {"logs": [{"record_id": "log1", "fields": {
+            "自动编号": "L1", "提交时间": "2026-10-04T10:00:00+08:00",
+            "姓名：": "骨干", "提交人": [{"id": "ou_b"}],
+            "工作进展：": "完成任务"}}], "ai": []}
+        bitable = Bitable(rows)
+        repository = LogRepository(bitable, self.config,
+            SimpleNamespace(get=lambda: self.organization))
+        logs, issues = repository.get_logs_by_date(DAY)
+        self.assertEqual([log.person_id for log in logs], ["B"])
+        self.assertEqual(issues, {})
+
     def test_duplicate_basic_name_is_not_guessed(self):
         self.organization.persons.append(Person(
             person_id="S2", name="基层", role="基层学生", leader_id="B"))

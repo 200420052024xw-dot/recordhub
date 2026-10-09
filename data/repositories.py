@@ -455,7 +455,11 @@ class LogRepository:
                 referenced = resolve_reference(values.get(f["submitter_ref"]), person_aliases)
                 if named:
                     person_id = basic_names.get(named, "")
-                    if not person_id or (referenced and referenced != person_id):
+                    if not person_id and referenced:
+                        # 姓名栏填了但不在基层名单里：骨干/部长用 OpenID 提交时
+                        # 也会填姓名，提交人已解析到人员，以提交人为准。
+                        person_id = referenced
+                    elif not person_id or (referenced and referenced != person_id):
                         issues[f"log:{row['log_id']}:unknown-submitter"] = (
                             f"日志 {row['log_id']} 的基层姓名「{named}」无法唯一匹配人员表"
                             "或与提交人字段冲突，本条已跳过")
