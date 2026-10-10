@@ -51,23 +51,25 @@ class MobileIdentityTests(unittest.TestCase):
         self.assertEqual(contacts.calls, [(["13800000001"], "open_id")])
         self.assertEqual(organization.persons[0].open_id, "ou_13800000001")
 
-    def test_unresolved_mobile_is_skipped(self):
+    def test_unresolved_mobile_keeps_person_without_message_address(self):
         records = [{"record_id": "r1", "fields": {
             "person_id": "P1", "name": "Alice", "role": "member",
             "mobile": "13800000001"}}]
         organization = OrganizationRepository(
             FakeBitable(records), FakeContacts({"13800000001"}), config()
         ).load()
-        self.assertEqual(organization.persons, [])
+        self.assertEqual(organization.persons[0].name, "Alice")
+        self.assertIsNone(organization.persons[0].open_id)
 
-    def test_missing_mobile_is_skipped_before_lookup(self):
+    def test_missing_mobile_keeps_person_and_skips_contact_lookup(self):
         records = [{"record_id": "r1", "fields": {
             "person_id": "P1", "name": "Alice", "role": "member"}}]
         contacts = FakeContacts()
         organization = OrganizationRepository(
             FakeBitable(records), contacts, config()
         ).load()
-        self.assertEqual(organization.persons, [])
+        self.assertEqual(organization.persons[0].name, "Alice")
+        self.assertIsNone(organization.persons[0].open_id)
         self.assertEqual(contacts.calls, [])
 
     def test_lookup_is_chunked_at_fifty(self):

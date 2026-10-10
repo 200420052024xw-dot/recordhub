@@ -63,6 +63,8 @@ class LogEvaluationState(StrictModel):
     evaluation_id: str | None = None
     evaluated_at: datetime | None = None
     ai_evaluated_at: datetime | None = None
+    prompt_source: Literal["TABLE", "BUILTIN"] | None = None
+    prompt_record_id: str | None = None
     confirmed_at: datetime | None = None
     error: str | None = None
 
@@ -96,3 +98,48 @@ class ConfirmationRequest(StrictModel):
     record_id: str
     business_key: str
     modified_at: datetime | None = None
+
+
+class WorkBuddySubmission(StrictModel):
+    """一笔经对话入口提交、尚未写回飞书的日志。
+
+    缓存只增不改:同一天同一人交多次就是多笔文件,写回时取最后一笔。
+    """
+
+    schema_version: int = 1
+    submission_id: str
+    person_id: str
+    name: str
+    role: str
+    department_name: str = ""
+    submitted_at: datetime
+    target_date: date
+    progress: str = ""
+    difficulties: str = ""
+    reflection: str = ""
+    other: str = ""
+
+
+class WorkBuddyIdentityRequest(StrictModel):
+    name: str = Field(min_length=1, max_length=32)
+
+
+class WorkBuddySubmitRequest(StrictModel):
+    """对话入口已整理好的四栏日志;后端不再做归类。"""
+
+    name: str | None = None
+    person_id: str | None = None
+    progress: str = Field(default="", max_length=10000)
+    difficulties: str = Field(default="", max_length=10000)
+    reflection: str = Field(default="", max_length=10000)
+    other: str = Field(default="", max_length=10000)
+
+    @model_validator(mode="after")
+    def require_identity(self) -> "WorkBuddySubmitRequest":
+        if not (self.name or "").strip() and not (self.person_id or "").strip():
+            raise ValueError("name 与 person_id 至少需要一个")
+        return self
+
+    def content_is_empty(self) -> bool:
+        return not any(value.strip() for value in (
+            self.progress, self.difficulties, self.reflection, self.other))

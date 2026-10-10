@@ -80,6 +80,25 @@ class ExternalStudentFlowTests(unittest.TestCase):
         self.assertEqual({p.person_id for p in organization.persons}, {"B", "S"})
         self.assertIsNone(organization.person_map()["S"].open_id)
 
+    def test_backbone_without_resolvable_mobile_is_kept_for_name_matching(self):
+        people = [{"record_id": "b", "fields": {
+            "人员编号": "B", "姓名": "江鑫鑫", "角色": "骨干学生",
+            "手机号": "13800000000"}}]
+        tables = TableConfig.model_validate({"tables": {
+            "persons": {"table_id": "persons", "fields": {
+                "person_id": "人员编号", "name": "姓名", "role": "角色",
+                "leader_ref": "直属上级", "minister_ref": "本部部长",
+                "department_ref": "所属部门", "mobile": "手机号"}},
+            "departments": {"table_id": "departments", "fields": {
+                "department_id": "部门编号", "name": "部门名称",
+                "minister_ref": "部门部长"}},
+        }})
+        contacts = SimpleNamespace(batch_get_ids=lambda **kwargs: [])
+        organization = OrganizationRepository(
+            Bitable({"persons": people, "departments": []}), contacts, tables).load()
+        self.assertEqual(organization.persons[0].name, "江鑫鑫")
+        self.assertIsNone(organization.persons[0].open_id)
+
     def test_name_log_and_human_review_without_student_open_id(self):
         rows = {"logs": [{"record_id": "log1", "fields": {
             "自动编号": "L1", "提交时间": "2026-10-04T10:00:00+08:00",
@@ -114,10 +133,10 @@ class ExternalStudentFlowTests(unittest.TestCase):
         self.assertEqual(parsed[1].person_id, "S")
         self.assertEqual(parsed[1].improvement, "具体建议")
 
-    def test_backbone_log_with_filled_name_uses_submitter(self):
+    def test_unique_backbone_name_is_primary_even_when_submitter_differs(self):
         rows = {"logs": [{"record_id": "log1", "fields": {
             "自动编号": "L1", "提交时间": "2026-10-04T10:00:00+08:00",
-            "姓名：": "骨干", "提交人": [{"id": "ou_b"}],
+            "姓名：": "骨干", "提交人": [{"id": "ou_other"}],
             "工作进展：": "完成任务"}}], "ai": []}
         bitable = Bitable(rows)
         repository = LogRepository(bitable, self.config,
@@ -126,7 +145,7 @@ class ExternalStudentFlowTests(unittest.TestCase):
         self.assertEqual([log.person_id for log in logs], ["B"])
         self.assertEqual(issues, {})
 
-    def test_duplicate_basic_name_is_not_guessed(self):
+    def test_duplicate_name_without_matching_submitter_is_not_guessed(self):
         self.organization.persons.append(Person(
             person_id="S2", name="基层", role="基层学生", leader_id="B"))
         bitable = Bitable({"logs": [{"record_id": "log1", "fields": {
@@ -136,9 +155,17 @@ class ExternalStudentFlowTests(unittest.TestCase):
             SimpleNamespace(get=lambda: self.organization)).get_logs_by_date(DAY)
         self.assertEqual(logs, [])
         self.assertIn("log:L1:unknown-submitter", issues)
-        self.assertTrue(any("姓名" in anomaly and "重复" in anomaly
-                            for anomaly in OrganizationRepository._find_anomalies(
-                                self.organization.departments, self.organization.persons)))
+
+    def test_duplicate_name_is_disambiguated_by_submitter(self):
+        self.organization.persons.append(Person(
+            person_id="B2", name="骨干", role="骨干学生", open_id="ou_b2"))
+        bitable = Bitable({"logs": [{"record_id": "log1", "fields": {
+            "自动编号": "L1", "提交时间": "2026-10-04T10:00:00+08:00",
+            "姓名：": "骨干", "提交人": [{"id": "ou_b2"}]}}]})
+        logs, issues = LogRepository(bitable, self.config,
+            SimpleNamespace(get=lambda: self.organization)).get_logs_by_date(DAY)
+        self.assertEqual([log.person_id for log in logs], ["B2"])
+        self.assertEqual(issues, {})
 
     def test_rebuilder_matches_numbered_human_row_by_name_and_source_log(self):
         source = "工作进展:完成任务"

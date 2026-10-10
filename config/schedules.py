@@ -109,6 +109,14 @@ def _validate_type_options(name: str, schedule_type: str, values: dict[str, Any]
             raise ValueError(f"Workflow schedule {name} needs nonnegative confirmation_days")
     if "confirmation_time" in values and not _TIME_PATTERN.fullmatch(str(values["confirmation_time"])):
         raise ValueError(f"Workflow schedule {name} has invalid confirmation_time")
+    for key in ("submit_opens_at", "submit_closes_at"):
+        if key in values and not _TIME_PATTERN.fullmatch(str(values[key])):
+            raise ValueError(f"Workflow schedule {name} has invalid {key}")
+    if "submit_opens_at" in values and "submit_closes_at" in values:
+        if str(values["submit_opens_at"]) >= str(values["submit_closes_at"]):
+            raise ValueError(
+                f"Workflow schedule {name} needs submit_opens_at earlier than "
+                "submit_closes_at")
     if schedule_type == "weekly" and values.get("weekday") not in _WEEKDAYS:
         raise ValueError(f"Weekly task {name} needs weekday mon..sun")
     if schedule_type == "monthly":

@@ -14,12 +14,20 @@ time = "01:00"
 material_days_ago = 1
 # 次日向老师发送人工评价通知的本地时间，格式为 HH:MM；任务晚完成则完成后补发。
 notify_at = "08:00"
+# 人工评价当天向老师发送部门汇总报告的时间。报告晚于该时间生成则生成后立即发送。
+report_notify_at = "22:00"
 # 部长审核骨干日志时填写的表单。
 minister_review_form_url = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcnaBl2hPcNAs4nNBYI2STpGh"
 # 骨干审核基层日志时填写的表单。
 backbone_review_form_url = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcngOWTo1tmzxm4V9blwKA1Dd"
 # 次日人工评价截止时间；到点后使用现有 AI 结果放行，留空则不自动放行。
-auto_advance_at = "19:00"
+auto_advance_at = "21:50"
+
+# 每天检查审核结果为空的新 Skill，并在 Workflow1 启动前更新个人 Prompt 缓存。
+[workflows.skill_prompt_review]
+enabled = true
+schedule_type = "daily"
+time = "00:55"
 
 # S04 首次自动运行以服务器上 Workflow2 的首次启用日为基准；
 # 启用后的第一个完整自然日起累计 3 天，此后每 3 天执行一次。
@@ -133,6 +141,10 @@ schedule_type = "daily"
 time = "20:00"
 # 工作日志填写表单。
 form_url = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcnomQ0yUYQGvAODCOC3bZ5sf"
+# 学生通过对话入口提交日志的时间窗：窗外提交一律返回 CLOSED。
+# 每天 12:00 开放，23:50 关闭；关闭后到次日 12:00 之间不接受提交。
+submit_opens_at = "12:00"
+submit_closes_at = "23:50"
 
 [workflows.pending_confirmation_reminder]
 # 是否启用此任务。

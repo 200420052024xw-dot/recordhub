@@ -73,6 +73,15 @@ class LoggingSetupTests(unittest.TestCase):
         text = self._read_log()
         self.assertIn("probe 1", text)
         self.assertIn("uvicorn.access", text)
+        self.assertIn("中文说明=HTTP 请求访问记录。", text)
+
+    def test_application_event_includes_chinese_explanation(self) -> None:
+        setup_logging(settings_for(str(self.log_dir)))
+        logging.getLogger("service.api").error(
+            "workflow1_finalize_failed date=%s stage=%s", "2026-10-08", "advance")
+        text = self._read_log()
+        self.assertIn("workflow1_finalize_failed", text)
+        self.assertIn("中文说明=每日流程在截止收尾阶段失败", text)
 
     def test_setup_is_idempotent(self) -> None:
         setup_logging(settings_for(str(self.log_dir)))

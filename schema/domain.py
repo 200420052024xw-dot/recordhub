@@ -51,6 +51,19 @@ class Organization(StrictModel):
             people.sort(key=lambda item: item.person_id)
         return result
 
+    def persons_named(self, name: str) -> list[Person]:
+        """Active people whose name matches exactly.
+
+        Names are unique by policy (see scripts/fill_organization_production.py),
+        but nothing enforces it; callers must handle more than one hit rather
+        than picking a person.
+        """
+        target = name.strip()
+        if not target:
+            return []
+        return [person for person in self.persons
+                if person.active and person.name.strip() == target]
+
 
 class LogResource(StrictModel):
     resource_id: str = Field(min_length=1)
@@ -77,18 +90,25 @@ class WorkLog(StrictModel):
     achievement_refs: list[str] = Field(default_factory=list)
     resources: list[LogResource] = Field(default_factory=list)
 
-    def content(self) -> str:
-        if not any((self.progress, self.difficulties, self.reflection, self.other)):
-            return self.full_log.strip()
+    @staticmethod
+    def compose(progress: str, difficulties: str, reflection: str,
+                other: str, full_log: str = "") -> str:
+        """Single source of the 「完整日志」 text, shared by reads and writes."""
+        if not any((progress, difficulties, reflection, other)):
+            return full_log.strip()
         return "\n".join(
             f"{label}:{value.strip() or '未填写'}"
             for label, value in (
-                ("工作进展", self.progress),
-                ("工作困难", self.difficulties),
-                ("心得反思", self.reflection),
-                ("其他", self.other),
+                ("工作进展", progress),
+                ("工作困难", difficulties),
+                ("心得反思", reflection),
+                ("其他", other),
             )
         )
+
+    def content(self) -> str:
+        return self.compose(self.progress, self.difficulties,
+                            self.reflection, self.other, self.full_log)
 
 
 class SubmissionStatus(StrictModel):

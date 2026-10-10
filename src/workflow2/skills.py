@@ -1,15 +1,13 @@
 """Structured Skill contracts, shared execution boundary, S04-S09 definitions and dispatch.
 
 Scope and identities are supplied by the caller: Skills receive prepared JSON material
-only and never fetch or filter records. Resolution follows department/person config
-versions at call time.
+only and never fetch or filter records. Reviewed prompts resolve by user and function.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
-from dataclasses import dataclass
+import logging
 from datetime import date, datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -18,12 +16,12 @@ from uuid import NAMESPACE_URL, uuid5
 
 from pydantic import Field, field_validator, model_validator
 
-from llm import PromptService
+from llm import LLMError, PromptRepository, PromptService
 from schema import StrictModel
 
+logger = logging.getLogger(__name__)
 
-
-# --- Structured contracts: scope, records, config, input, result ---
+# --- Structured contracts: scope, records, input, result ---
 
 class SkillCode(StrEnum):
     S04 = "S04"
@@ -169,24 +167,6 @@ class SkillInput(TextModel):
         return self
 
 
-class SkillConfig(TextModel):
-    config_id: str = Field(min_length=1)
-    skill_code: SkillCode
-    department_id: str = Field(min_length=1)
-    user_id: str | None = None
-    version: str = Field(min_length=1)
-    based_on_version: str = "1.0"
-    instructions: str = ""
-    enabled: bool = True
-
-    @field_validator("user_id")
-    @classmethod
-    def validate_user(cls, value):
-        if value == "":
-            raise ValueError("个人配置的使用人编号不能为空")
-        return value
-
-
 class ProgressItem(TextModel):
     work_item: str = Field(min_length=1)
     participant_ids: list[str] = Field(min_length=1)
@@ -268,11 +248,9 @@ class SkillResult(StrictModel, Generic[OutputT]):
     result_id: str
     run_id: str
     skill_code: SkillCode
-    config_id: str
-    config_department_id: str
-    config_version: str
-    based_on_version: str
     user_id: str
+    prompt_source: Literal["TABLE", "BUILTIN"]
+    prompt_record_id: str | None = None
     status: SkillStatus
     scope: MaterialScope
     generated_at: datetime
@@ -284,11 +262,6 @@ class SkillResult(StrictModel, Generic[OutputT]):
 
 
 # --- Shared execution boundary ---
-
-@dataclass(frozen=True)
-class ResolvedPrompt:
-    template: str
-
 
 class TextSkill(Generic[OutputT]):
     code: SkillCode
@@ -322,41 +295,37 @@ class TextSkill(Generic[OutputT]):
         if len(values) != len(set(values)) or not set(values) <= allowed:
             raise ValueError(f"{name} 重复或不在本次材料范围内")
 
-    def run(self, service: PromptService, data: SkillInput,
-            config: SkillConfig, *, user_id: str) -> SkillResult[OutputT]:
+    def run(self, service: PromptService, data: SkillInput, *, user_id: str,
+            prompts: PromptRepository | None = None) -> SkillResult[OutputT]:
         # Revalidate mutable Pydantic instances at the call boundary.
         data = SkillInput.model_validate(data.model_dump())
-        config = SkillConfig.model_validate(config.model_dump())
         user_id = user_id.strip()
         if not user_id:
             raise ValueError("Skill 使用人编号不能为空")
-        if not config.enabled or config.skill_code != self.code:
-            raise ValueError("Skill 配置未启用或编号不匹配")
-        if config.user_id and config.user_id != user_id:
-            raise ValueError("不能使用其他人的个人 Skill 配置")
-        if config.based_on_version != self.version:
-            raise ValueError("Skill 基于版本与当前模板版本不一致，请显式迁移配置，不能静默升级")
-        metadata = dict(
-            result_id=str(uuid5(NAMESPACE_URL,
-                json.dumps(["recordhub", data.run_id, self.code.value,
-                            config.department_id, user_id, config.config_id,
-                            config.version], ensure_ascii=False))),
-            run_id=data.run_id, skill_code=self.code, config_id=config.config_id,
-            config_department_id=config.department_id, config_version=config.version,
-            based_on_version=config.based_on_version, user_id=user_id,
-            scope=data.scope.model_copy(deep=True),
-            generated_at=datetime.now(timezone.utc),
-        )
+        selected = prompts.resolve(self.code.value, user_id) if prompts else None
+
+        def metadata() -> dict:
+            source = "TABLE" if selected else "BUILTIN"
+            record_id = selected.record_id if selected else None
+            return dict(
+                result_id=str(uuid5(NAMESPACE_URL,
+                    json.dumps(["recordhub", data.run_id, self.code.value,
+                                user_id, source, record_id], ensure_ascii=False))),
+                run_id=data.run_id, skill_code=self.code, user_id=user_id,
+                prompt_source=source, prompt_record_id=record_id,
+                scope=data.scope.model_copy(deep=True),
+                generated_at=datetime.now(timezone.utc),
+            )
         if not data.scope.complete:
-            return SkillResult[self.output_model](**metadata,
+            return SkillResult[self.output_model](**metadata(),
                 status=SkillStatus.BLOCKED, message="输入材料缺失，请对应负责人补齐材料")
         self.validate_input(data)
         submitted = [record for record in data.records if record.submitted]
         if not submitted:
-            return SkillResult[self.output_model](**metadata,
+            return SkillResult[self.output_model](**metadata(),
                 status=SkillStatus.NO_MATERIAL, message="本范围内暂无可分析材料")
         if self.requires_confirmed and any(not record.confirmed for record in data.records):
-            return SkillResult[self.output_model](**metadata,
+            return SkillResult[self.output_model](**metadata(),
                 status=SkillStatus.BLOCKED, message="输入含未确认记录，请先完成确认")
         # Missing submissions never enter the prompt payload.
         payload = data.model_copy(update={"records": submitted}, deep=True)
@@ -372,17 +341,29 @@ class TextSkill(Generic[OutputT]):
             f"- 成果出处编号 achievement_refs：{', '.join(achievement_ids) or '无'}\n"
             f"- 资源编号 resource_id：{', '.join(resource_ids) or '无'}"
         )
-        prompt = ResolvedPrompt(template=(
-            (Path('prompts') / f'{self.code.value}.txt').read_text(encoding='utf-8').strip()
-            + "\n部门或个人配置补充（须遵守上述边界）：\n" + config.instructions
-            + id_hint
-        ))
-        output = service.execute(
-            prompt_code=self.code.value, template=prompt.template,
-            input_data=payload, output_model=self.output_model,
-            semantic_validator=lambda value: self.validate_output(value, data),
-        )
-        return SkillResult[self.output_model](**metadata,
+        builtin_template = (Path('prompts') / f'{self.code.value}.txt').read_text(
+            encoding='utf-8').strip()
+        template = (selected.template if selected else builtin_template) + id_hint
+        try:
+            output = service.execute(
+                prompt_code=self.code.value, template=template,
+                input_data=payload, output_model=self.output_model,
+                semantic_validator=lambda value: self.validate_output(value, data),
+            )
+        except LLMError:
+            if selected is None:
+                raise
+            logger.warning(
+                "personal_prompt_failed_fallback workflow=workflow2 code=%s "
+                "user_id=%s record_id=%s", self.code.value, user_id,
+                selected.record_id, exc_info=True)
+            selected = None
+            output = service.execute(
+                prompt_code=self.code.value, template=builtin_template + id_hint,
+                input_data=payload, output_model=self.output_model,
+                semantic_validator=lambda value: self.validate_output(value, data),
+            )
+        return SkillResult[self.output_model](**metadata(),
             status=SkillStatus.WAITING_CONFIRMATION, content=output)
 
 
@@ -474,38 +455,16 @@ SKILLS = {skill.code: skill for skill in (
 
 class SkillRunner:
     def __init__(self, service: PromptService,
-                 configs: Iterable[SkillConfig] = ()) -> None:
+                 prompts: PromptRepository | None = None) -> None:
         self.service = service
-        # Freeze caller-owned configs so later mutations cannot change resolution.
-        self.configs = tuple(SkillConfig.model_validate(item.model_dump()) for item in configs)
+        self.prompts = prompts
 
     @staticmethod
     def output_schema(code: SkillCode | str) -> dict:
         return SKILLS[SkillCode(code)].output_model.model_json_schema()
 
-    def resolve_config(self, code: SkillCode | str, *, department_id: str,
-                       user_id: str) -> SkillConfig:
-        code = SkillCode(code)
-        department_id, user_id = department_id.strip(), user_id.strip()
-        if not department_id or not user_id:
-            raise ValueError("配置归属部门和使用人编号不能为空")
-        matches = [item for item in self.configs
-                   if item.enabled and item.skill_code == code
-                   and item.department_id == department_id
-                   and item.user_id in {None, user_id}]
-        personal = [item for item in matches if item.user_id == user_id]
-        department = [item for item in matches if item.user_id is None]
-        selected = personal or department
-        if len(selected) > 1:
-            raise ValueError("同一优先级存在多个 Skill 版本，请由程序指定唯一生效版本")
-        if selected:
-            return selected[0].model_copy(deep=True)
-        return SkillConfig(config_id=f"builtin:{code.value}", skill_code=code,
-            department_id=department_id, version=SKILLS[code].version,
-            based_on_version=SKILLS[code].version)
-
     def run(self, code: SkillCode | str, data: SkillInput, *,
-            department_id: str, user_id: str) -> SkillResult:
+            user_id: str) -> SkillResult:
         code = SkillCode(code)
-        config = self.resolve_config(code, department_id=department_id, user_id=user_id)
-        return SKILLS[code].run(self.service, data, config, user_id=user_id.strip())
+        return SKILLS[code].run(self.service, data, user_id=user_id.strip(),
+                                prompts=self.prompts)

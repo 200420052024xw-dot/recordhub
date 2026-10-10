@@ -13,6 +13,7 @@ from config.settings import FeishuSettings
 from tool.bitable_fields import SHANGHAI
 from tool.errors import FeishuApiError
 from tool.http import HttpResponse, HttpTransport
+from tool.diagnostics import error_summary
 
 logger = logging.getLogger(__name__)
 
@@ -69,14 +70,28 @@ class FeishuClient:
         query: Mapping[str, Any] | None = None,
         json_body: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        response = self.transport.request(
-            method,
-            f"{self.settings.base_url}/{path.lstrip('/')}",
-            headers={"Authorization": f"Bearer {self.token_provider.get_token()}"},
-            query=query,
-            json_body=json_body,
-        )
-        return _require_success(response)
+        started = time.monotonic()
+        try:
+            response = self.transport.request(
+                method,
+                f"{self.settings.base_url}/{path.lstrip('/')}",
+                headers={"Authorization": f"Bearer {self.token_provider.get_token()}"},
+                query=query,
+                json_body=json_body,
+            )
+            result = _require_success(response)
+        except Exception as exc:
+            exc.method, exc.path = method, path
+            if 'response' in locals():
+                exc.request_id = next((v for k, v in response.headers.items()
+                                       if k.lower() in {"x-tt-logid", "x-request-id"}), None)
+            logger.exception("feishu_request_failed method=%s path=%s elapsed_ms=%d error=%s",
+                             method, path, (time.monotonic() - started) * 1000,
+                             error_summary(exc))
+            raise
+        logger.info("feishu_request_completed method=%s path=%s status=%s elapsed_ms=%d",
+                    method, path, response.status_code, (time.monotonic() - started) * 1000)
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,6 +394,8 @@ class MessageService:
         effective = self.recipient_override or receive_id
         seq = self._next_seq(datetime.now(SHANGHAI).date())
         name, mobile = self._recipient_info(effective)
+        logger.info("message_send_attempt seq=%d type=%s to=%s key=%s content_bytes=%d",
+                    seq, msg_type, effective, idempotency_key, len(content.encode("utf-8")))
         try:
             payload = self.client.request(
                 "POST",
@@ -393,15 +410,15 @@ class MessageService:
                 },
             )
         except Exception as exc:
-            logger.warning(
-                "message_send_failed seq=%d type=%s to=%s name=%s mobile=%s error=%s",
-                seq, msg_type, effective, name, mobile, str(exc),
+            logger.exception(
+                "message_send_failed seq=%d type=%s to=%s name=%s mobile=%s error=%s key=%s",
+                seq, msg_type, effective, name, mobile, str(exc), idempotency_key,
             )
             raise
         message_id = str(payload.get("data", {}).get("message_id", ""))
         logger.info(
-            "message_sent seq=%d type=%s to=%s name=%s mobile=%s message_id=%s",
-            seq, msg_type, effective, name, mobile, message_id,
+            "message_sent seq=%d type=%s to=%s name=%s mobile=%s message_id=%s key=%s",
+            seq, msg_type, effective, name, mobile, message_id, idempotency_key,
         )
         return dict(payload.get("data", {}))
 

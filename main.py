@@ -4,7 +4,7 @@ import argparse
 import json
 import logging
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 # Keep direct `python main.py` execution aligned with the src-layout package.
@@ -25,9 +25,10 @@ logger = logging.getLogger(__name__)
 
 def check_config(settings: AppSettings) -> int:
     schedules = load_schedule_config(settings.schedule_config_path)
-    from workflow1.settings import W1Settings
+    from workflow1.settings import LogSubmitSettings, W1Settings
 
     w1 = W1Settings.from_schedule(schedules)
+    log_submit = LogSubmitSettings.from_schedule(schedules)
     missing = settings.missing_variables()
     table_config_error = ""
     workflow2_missing: list[str] = []
@@ -63,6 +64,11 @@ def check_config(settings: AppSettings) -> int:
             "auto_advance_at": w1.auto_advance_at or None,
             "confirmation_webhook_configured": bool(w1.confirmation_webhook_token),
         },
+        "workbuddy_entry": {
+            "submit_window": f"{log_submit.submit_opens_at}-{log_submit.submit_closes_at}",
+            "fallback_form_configured": bool(log_submit.fallback_form_url),
+            "token_configured": bool(settings.workbuddy_token),
+        },
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if not missing and not table_config_error and (
@@ -75,6 +81,8 @@ def main() -> int:
     # Covers serve and every CLI branch; console goes to stderr so the JSON
     # printed by check-config and friends stays pipeable.
     setup_logging(settings)
+    from service.alerts import configure_admin_alerts
+    configure_admin_alerts(settings)
     parser = argparse.ArgumentParser(description="RecordHub Workflow1 and Workflow2 service")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("check-config")
@@ -89,6 +97,8 @@ def main() -> int:
     resume_parser.add_argument("--date", required=True, type=date.fromisoformat)
     finalize_parser = subparsers.add_parser("finalize-confirmations")
     finalize_parser.add_argument("--date", type=date.fromisoformat)
+    flush_parser = subparsers.add_parser("flush-workbuddy")
+    flush_parser.add_argument("--date", type=date.fromisoformat)
 
     refresh_parser = subparsers.add_parser("refresh-cache")
     refresh_parser.add_argument(
@@ -142,6 +152,15 @@ def main() -> int:
         ]
         print(json.dumps(results, ensure_ascii=False, indent=2))
         return 0
+    elif command == "flush-workbuddy":
+        from tool.bitable_fields import SHANGHAI
+
+        target = args.date or datetime.now(SHANGHAI).date()
+        workflow1.store.get_or_create_workflow(target)
+        written, issues = runtime.workbuddy.flush(target)
+        print(json.dumps({"date": target.isoformat(), "written": written,
+                          "issues": issues}, ensure_ascii=False, indent=2))
+        return 0
     elif command == "refresh-cache":
         payload: dict[str, object] = {}
         if args.cache in {"organization", "all"}:
@@ -161,4 +180,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception:
+        logger.exception("command_failed")
+        raise

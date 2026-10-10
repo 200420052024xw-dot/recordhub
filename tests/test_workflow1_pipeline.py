@@ -4,6 +4,7 @@ import tempfile
 import sys
 from urllib.parse import quote
 import unittest
+import logging
 from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import Mock
@@ -19,10 +20,12 @@ from schema import CloudObject, Department, Organization, Person, TableConfig, W
 from workflow1.models import DailySnapshot, UnitStatus
 from workflow1.documents import DailyDocuments
 from workflow1.evaluations import (AiEvaluationRepository,
-                                        HumanEvaluationRepository, evaluation_key)
+                                        HumanEvaluationRepository, evaluation_key,
+                                        review_day_timestamp)
 from workflow1.workflow import Workflow1
 from workflow1.reports import WorkflowReportRepository
 from workflow1.models import LogPromptOutput, WorkflowStatus
+from service.alerts import AdminAlertHandler
 
 DAY = date(2026, 10, 3)
 
@@ -82,6 +85,34 @@ class FakeDocs:
 
 
 class Workflow1PipelineTests(unittest.TestCase):
+    def test_log_prompt_is_selected_by_frozen_evaluator(self):
+        snapshot = sample_snapshot()
+        prompt_repository = Mock()
+        prompt_repository.resolve.side_effect = lambda code, user_id: Mock(
+            template={"B": "骨干个人Prompt", "D": "部长个人Prompt"}[user_id],
+            record_id=f"rec_{user_id}")
+        prompt_service = Mock()
+        prompt_service.execute.side_effect = lambda **kwargs: LogPromptOutput(
+            positive=kwargs["template"], improvement="继续")
+        with tempfile.TemporaryDirectory() as directory:
+            store = FileStateStore(directory, snapshot_model=DailySnapshot)
+            run = store.get_or_create_workflow(DAY)
+            snapshot.workflow_run_id = run.workflow_run_id
+            store.save_snapshot(snapshot)
+            workflow = Workflow1(
+                store=store, organization_cache=Mock(), log_repository=Mock(),
+                ai_evaluations=Mock(), human_evaluations=Mock(),
+                prompt_service=prompt_service, prompt_repository=prompt_repository,
+                messages=Mock(), documents=Mock(), reports=Mock(), llm_concurrency=1)
+
+            workflow._process_logs(DAY)
+
+            saved = store.load_snapshot(DAY)
+            self.assertEqual(saved.log_evaluations["L1"].positive_ai, "骨干个人Prompt")
+            self.assertEqual(saved.log_evaluations["L3"].positive_ai, "部长个人Prompt")
+            self.assertEqual(saved.log_evaluations["L1"].prompt_record_id, "rec_B")
+            self.assertEqual(saved.log_evaluations["L3"].prompt_record_id, "rec_D")
+
     def test_ai_rows_use_only_existing_columns_and_reconcile_partial_success(self):
         snapshot = sample_snapshot()
         for state in snapshot.log_evaluations.values():
@@ -123,6 +154,10 @@ class Workflow1PipelineTests(unittest.TestCase):
         self.assertEqual(set(bitable.created[0]), set(fields.values()) - {"评价人"})
         self.assertTrue(bitable.created[0]["业务编号"].startswith("2026-10-03:EVAL:"))
         self.assertEqual(bitable.created[0]["工作日志"], "第一条")
+        expected = int(datetime(2026, 10, 4, 0, 0,
+                                tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000)
+        self.assertEqual(review_day_timestamp(DAY), expected)
+        self.assertTrue(all(row["评价时间"] == expected for row in bitable.created))
 
     def test_log_content_uses_four_sections_without_blank_lines(self):
         log = WorkLog(
@@ -308,6 +343,10 @@ class Workflow1PipelineTests(unittest.TestCase):
         reports.publish.return_value = {}
         messages = Mock()
         messages.send_text.return_value = {"message_id": "msg"}
+        alerts = AdminAlertHandler(messages, "ou_admin")
+        logging.getLogger().addHandler(alerts)
+        self.addCleanup(alerts.close)
+        self.addCleanup(logging.getLogger().removeHandler, alerts)
         calls = []
         failed_once = {"L2": True}
 
@@ -331,12 +370,19 @@ class Workflow1PipelineTests(unittest.TestCase):
                 llm_concurrency=2, auto_advance_at="",
                 prompt_path="prompts/S01.txt", admin_open_id="ou_admin")
             first = workflow.start(DAY)
+            alerts.queue.join()
             # 失败单元不再拖垮全天：当天流程照常走到等待评价状态。
             self.assertEqual(first.status, WorkflowStatus.WAITING_EVALUATIONS)
             stored = store.load_snapshot(DAY)
             self.assertIn("log:L2:ai-failed", stored.issues)
             self.assertEqual(stored.log_evaluations["L2"].status, UnitStatus.FAILED)
             self.assertTrue(stored.evaluations_published)
+            expected_review_time = datetime(2026, 10, 4, 0, 0,
+                                            tzinfo=ZoneInfo("Asia/Shanghai"))
+            self.assertEqual(stored.log_evaluations["L1"].ai_evaluated_at,
+                             expected_review_time)
+            self.assertEqual(stored.log_evaluations["L3"].evaluated_at,
+                             expected_review_time)
             workflow.recover_incomplete()  # 自动恢复路径不碰 FAILED
             self.assertEqual(calls.count("L2"), 1)
             admin_msgs = [call for call in
@@ -345,6 +391,7 @@ class Workflow1PipelineTests(unittest.TestCase):
             self.assertEqual(len(admin_msgs), 1)
             # 自动重入（非 resume）绝不重评失败项。
             workflow.start(DAY)
+            alerts.queue.join()
             self.assertEqual(calls.count("L2"), 1)
             self.assertEqual(len([c for c in
                                   messages.send_text.call_args_list

@@ -51,7 +51,7 @@ class PromptService:
             except (StructuredOutputError, DeepSeekApiError, ValueError) as exc:
                 last_error = exc
                 logger.warning("llm_attempt_failed prompt_code=%s attempt=%d/%d error=%s",
-                               prompt_code, attempt, self.max_attempts, exc)
+                               prompt_code, attempt, self.max_attempts, exc, exc_info=True)
                 if attempt < self.max_attempts:
                     time.sleep(2 ** (attempt - 1))
         # Only reached when every attempt failed (the success path returns above).

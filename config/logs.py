@@ -8,6 +8,7 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from config.settings import AppSettings
+from tool.diagnostics import DiagnosticFormatter
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
@@ -37,9 +38,10 @@ def setup_logging(settings: AppSettings) -> None:
         raise ValueError(f"RECORDHUB_LOG_LEVEL 无效: {settings.log_level!r}")
     log_dir = Path(settings.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-    formatter = logging.Formatter(LOG_FORMAT)
+    formatter = DiagnosticFormatter(LOG_FORMAT)
     # stderr, not stdout: CLI subcommands print machine-readable JSON there.
     console = logging.StreamHandler(sys.stderr)
+    console.setLevel(level)
     console.setFormatter(formatter)
     file_handler = TimedRotatingFileHandler(
         log_dir / "recordhub.log",
@@ -49,5 +51,6 @@ def setup_logging(settings: AppSettings) -> None:
         delay=True,
     )
     file_handler.setFormatter(formatter)
+    file_handler.setLevel(level)
     logging.basicConfig(level=level, handlers=[console, file_handler], force=True)
     silence_third_party_console_handlers()

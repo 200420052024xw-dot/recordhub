@@ -22,6 +22,16 @@ def evaluation_key(target_date: date, evaluator_id: str, log_id: str) -> str:
     return f"{target_date.isoformat()}:EVAL:{evaluator_id}:{log_id}"
 
 
+def review_day_datetime(target_date: date) -> datetime:
+    """Midnight in Shanghai on the day the previous day's logs are reviewed."""
+    review_day = target_date + timedelta(days=1)
+    return datetime.combine(review_day, time.min, SHANGHAI)
+
+
+def review_day_timestamp(target_date: date) -> int:
+    return int(review_day_datetime(target_date).timestamp() * 1000)
+
+
 class AiEvaluationRepository:
     def __init__(self, bitable: BitableService, config: TableConfig,
                  store: FileStateStore) -> None:
@@ -70,6 +80,7 @@ class AiEvaluationRepository:
         existing_by_id = {str(record.get("record_id", "")): record for record in existing}
         by_evaluation: dict[str, tuple[str, str]] = {}
         source_rows: dict[str, list[dict]] = defaultdict(list)
+        evaluated_at = review_day_timestamp(snapshot.target_date)
         for record in existing:
             fields = record_fields(record)
             record_id = str(record.get("record_id", ""))
@@ -165,7 +176,7 @@ class AiEvaluationRepository:
                 business_field or f["evaluation_id"]: key,
                 **identity,
                 f["source_log"]: log.content(),
-                f["evaluated_at"]: int(datetime.now().timestamp() * 1000),
+                f["evaluated_at"]: evaluated_at,
                 f["positive_ai"]: state.positive_ai,
                 f["improvement_ai"]: state.improvement_ai,
             }))
@@ -193,7 +204,7 @@ class AiEvaluationRepository:
             creates.append((None, {
                 business_field or f["evaluation_id"]: key,
                 **identity,
-                f["evaluated_at"]: int(datetime.now().timestamp() * 1000),
+                f["evaluated_at"]: evaluated_at,
                 f["positive_ai"]: "未填写日志",
                 f["improvement_ai"]: "未填写日志",
             }))

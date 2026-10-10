@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from collections import defaultdict
 from collections.abc import Callable, Mapping
 from datetime import date, datetime, time, timedelta
 from typing import Any
@@ -85,15 +86,8 @@ class OrganizationRepository:
                     open_id = str(user.get("user_id") or "").strip()
                     if mobile and open_id:
                         mobile_open_ids[mobile] = open_id
-            # 基层学生只填写日志，不占用飞书组织名额，也没有 OpenID。
-            # 其他角色继续使用原有的手机号 -> OpenID 身份流程。
-            person_records = [
-                record for record in person_records
-                if scalar(record_fields(record).get(persons_table.fields["role"])).strip()
-                == "基层学生"
-                or scalar(record_fields(record).get(mobile_field)).strip()
-                in mobile_open_ids
-            ]
+            # 人员身份和消息地址分开处理：手机号无法解析 OpenID 时仍保留人员，
+            # 这样日志可以按唯一姓名归属；发送消息时再单独检查 OpenID。
             return self._parse_organization(
                 departments_table.fields,
                 department_records,
@@ -215,13 +209,6 @@ class OrganizationRepository:
     @staticmethod
     def _find_anomalies(departments, persons) -> list[str]:
         anomalies: list[str] = []
-        basic_names: set[str] = set()
-        for person in persons:
-            if person.active and person.role == "基层学生":
-                name = person.name.strip()
-                if name in basic_names:
-                    anomalies.append(f"基层学生姓名「{name}」重复，无法仅用姓名归属日志")
-                basic_names.add(name)
         person_by_id = {person.person_id: person for person in persons if person.person_id}
         person_ids = set(person_by_id)
         department_ids = {item.department_id for item in departments if item.department_id}
@@ -402,11 +389,10 @@ class LogRepository:
                 )
                 for person in organization.persons
             )
-            basic_names = alias_index(
-                (person.person_id, (person.name,))
-                for person in organization.persons
-                if person.active and person.role == "基层学生"
-            )
+            people_by_name: dict[str, list[str]] = defaultdict(list)
+            for person in organization.persons:
+                if person.active and person.name.strip():
+                    people_by_name[person.name.strip()].append(person.person_id)
             records = self.bitable.list_records(
                 self.table.table_id,
                 field_names=list(self.table.fields.values()),
@@ -454,15 +440,15 @@ class LogRepository:
                 named = scalar(values.get(f.get("submitter_name", ""))).strip()
                 referenced = resolve_reference(values.get(f["submitter_ref"]), person_aliases)
                 if named:
-                    person_id = basic_names.get(named, "")
-                    if not person_id and referenced:
-                        # 姓名栏填了但不在基层名单里：骨干/部长用 OpenID 提交时
-                        # 也会填姓名，提交人已解析到人员，以提交人为准。
+                    candidates = people_by_name.get(named, [])
+                    if len(candidates) == 1:
+                        person_id = candidates[0]
+                    elif referenced and referenced in candidates:
                         person_id = referenced
-                    elif not person_id or (referenced and referenced != person_id):
+                    else:
                         issues[f"log:{row['log_id']}:unknown-submitter"] = (
-                            f"日志 {row['log_id']} 的基层姓名「{named}」无法唯一匹配人员表"
-                            "或与提交人字段冲突，本条已跳过")
+                            f"日志 {row['log_id']} 的姓名「{named}」无法唯一匹配有效人员；"
+                            "重名时提交人字段也未能区分，本条已跳过")
                         row_day = submitted_at.astimezone(SHANGHAI).date()
                         if row_day in per_day:
                             per_day[row_day][1][f"log:{row['log_id']}:unknown-submitter"] = (
@@ -470,10 +456,6 @@ class LogRepository:
                         continue
                 else:
                     person_id = referenced
-                    matched = next((person for person in organization.persons
-                                    if person.person_id == person_id), None)
-                    if matched and matched.role == "基层学生" and f.get("submitter_name"):
-                        person_id = ""  # 基层必须使用姓名栏
                 if not person_id:
                     name = display_name(row["values"].get(f["submitter_ref"]))
                     issues[f"log:{row['log_id']}:unknown-submitter"] = (

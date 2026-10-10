@@ -48,6 +48,7 @@ class AppSettings:
     table_config_path: str = "config/tables.toml"
     schedule_config_path: str = "config/schedules.toml"
     admin_token: str = ""
+    workbuddy_token: str = ""
     admin_open_id: str = ""
     message_override_open_id: str = ""
     simulation_mode: bool = False
@@ -56,8 +57,6 @@ class AppSettings:
     snapshot_retention_days: int = 3
     scheduler_enabled: bool = True
     workflow2_enabled: bool = False
-    skill_config_path: str = "config/skill_versions.json"
-    team_skill_department_id: str = "TEAM_MANAGEMENT"
     event_stream_enabled: bool = True
     archive_parent_folder_token: str = ""
     log_dir: str = "logs"
@@ -93,6 +92,7 @@ class AppSettings:
                 "RECORDHUB_SCHEDULE_CONFIG", "config/schedules.toml"
             ),
             admin_token=os.getenv("RECORDHUB_ADMIN_TOKEN", ""),
+            workbuddy_token=os.getenv("RECORDHUB_WORKBUDDY_TOKEN", "").strip(),
             admin_open_id=os.getenv("RECORDHUB_ADMIN_OPEN_ID", ""),
             message_override_open_id=os.getenv("RECORDHUB_MESSAGE_OVERRIDE_OPEN_ID", ""),
             simulation_mode=_boolean("RECORDHUB_SIMULATION_MODE", False),
@@ -103,8 +103,6 @@ class AppSettings:
             ),
             scheduler_enabled=_boolean("RECORDHUB_SCHEDULER_ENABLED", True),
             workflow2_enabled=_boolean("RECORDHUB_WORKFLOW2_ENABLED", False),
-            skill_config_path=os.getenv("RECORDHUB_SKILL_CONFIG", "config/skill_versions.json"),
-            team_skill_department_id=os.getenv("RECORDHUB_TEAM_SKILL_DEPARTMENT_ID", "TEAM_MANAGEMENT").strip(),
             event_stream_enabled=_boolean("RECORDHUB_EVENT_STREAM_ENABLED", True),
             archive_parent_folder_token=os.getenv(
                 "RECORDHUB_ARCHIVE_PARENT_FOLDER_TOKEN", "").strip(),
@@ -129,8 +127,6 @@ class AppSettings:
     def validate(self) -> None:
         if self.simulation_mode and not self.message_override_open_id.strip():
             raise ValueError("RECORDHUB_SIMULATION_MODE requires RECORDHUB_MESSAGE_OVERRIDE_OPEN_ID")
-        if not self.team_skill_department_id.strip():
-            raise ValueError("团队 Skill 配置归属编号不能为空")
         missing = self.missing_variables()
         if missing:
             raise ValueError(f"Missing environment variables: {', '.join(missing)}")

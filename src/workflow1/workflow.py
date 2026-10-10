@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import sys
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta
@@ -12,13 +13,18 @@ from zoneinfo import ZoneInfo
 from data import FileStateStore, utc_now
 from data.repositories import LogRepository, OrganizationCache
 from workflow1.snapshot import SnapshotBuilder
-from llm import PromptService
+from llm import LLMError, PromptRepository, PromptService
 from schema import WorkflowRun
 from workflow1.models import ConfirmationRequest, DailySnapshot, LogPromptInput, LogPromptOutput, UnitStatus, WorkflowStatus
+from workflow1.workbuddy_inbox import LogSubmitService
 from tool.feishu import MessageService
 from tool.errors import FeishuApiError
+from tool.diagnostics import error_summary, workflow_diagnostics, diagnostic_context
+from tool.notifications import (NotificationPolicy, manual_delivery,
+                                manual_notifications, record_outcome, confirmed_unsent)
 from workflow1.documents import DailyDocuments
-from workflow1.evaluations import AiEvaluationRepository, HumanEvaluationRepository
+from workflow1.evaluations import (AiEvaluationRepository, HumanEvaluationRepository,
+                                   review_day_datetime)
 from workflow1.reports import WorkflowReportRepository
 
 logger = logging.getLogger(__name__)
@@ -45,35 +51,43 @@ class Workflow1:
                  messages: MessageService,
                  documents: DailyDocuments,
                  reports: WorkflowReportRepository,
+                 prompt_repository: PromptRepository | None = None,
+                 workbuddy: LogSubmitService | None = None,
                  llm_concurrency: int = 3,
                  auto_advance_at: str = "12:00",
                  notify_at: str = "08:00",
+                 report_notify_at: str = "22:00",
                  minister_review_form_url: str = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcnaBl2hPcNAs4nNBYI2STpGh",
                  backbone_review_form_url: str = "https://jwxnd3ayslt.feishu.cn/share/base/form/shrcngOWTo1tmzxm4V9blwKA1Dd",
                  prompt_path: str = "prompts/S01.txt",
-                 admin_open_id: str = "") -> None:
+                 admin_open_id: str = "",
+                 notifications: NotificationPolicy | None = None) -> None:
         self.store = store
         self.organization_cache = organization_cache
         self.log_repository = log_repository
         self.ai_evaluations = ai_evaluations
         self.human_evaluations = human_evaluations
         self.prompt_service = prompt_service
+        self.prompt_repository = prompt_repository
+        self.workbuddy = workbuddy
         self.messages = messages
         self.documents = documents
         self.reports = reports
         self.llm_concurrency = llm_concurrency
         self.auto_advance_at = auto_advance_at
         self.notify_at = notify_at
+        self.report_notify_at = report_notify_at
         self.review_form_urls = {
             "部长": minister_review_form_url,
             "骨干学生": backbone_review_form_url,
         }
         self.prompt_path = Path(prompt_path)
         self.admin_open_id = admin_open_id
+        self.notifications = notifications
         self._lock = threading.RLock()
 
     def _record_issue(self, target_date: date, key: str, reason: str) -> None:
-        """Append to the daily ledger and notify the admin exactly once."""
+        """Append to the daily ledger; the error handler alerts the administrator."""
         def mutate(snapshot: DailySnapshot) -> bool:
             if key in snapshot.issues:
                 return False
@@ -82,19 +96,24 @@ class Workflow1:
 
         added = self.store.update_snapshot(target_date, mutate)
         if added:
-            logger.warning("workflow1_issue_recorded date=%s key=%s reason=%s",
-                           target_date, key, reason)
-        if not added or not self.admin_open_id:
-            return
-        try:
-            self.messages.send_text(
-                self.admin_open_id,
-                f"【Workflow1 异常】{target_date}\n{reason}",
-                idempotency_key=f"issue:{target_date}:{key}",
-            )
-        except Exception:
-            logger.exception("admin_issue_notification_failed key=%s", key)
+            logger.error("workflow1_issue_recorded date=%s key=%s reason=%s",
+                         target_date, key, reason, exc_info=sys.exc_info()[0] is not None)
 
+    def _flush_workbuddy_inbox(self, target_date: date) -> dict[str, str]:
+        """把对话入口收到的日志写回飞书,必须发生在建快照之前。
+
+        写回失败就让异常冒出去(当日 FAILED、可 resume):宁可整日推迟,
+        也不能带着缺失的日志建快照——那会把已交的学生写成「未填写日志」。
+        """
+        if self.workbuddy is None:
+            return {}
+        written, issues = self.workbuddy.flush(target_date)
+        if written:
+            logger.info("workflow1_workbuddy_flushed date=%s written=%d",
+                        target_date, written)
+        return issues
+
+    @workflow_diagnostics("workflow1")
     def start(self, target_date: date) -> WorkflowRun:
         with self._lock:
             run = self.store.get_or_create_workflow(target_date)
@@ -106,6 +125,7 @@ class Workflow1:
                 snapshot = self.store.load_snapshot(target_date)
                 if snapshot is not None and snapshot.schema_version != 2:
                     raise ValueError("旧版 Workflow1 快照不能按新流程续跑；请人工迁移该日期状态")
+                pending_issues = self._flush_workbuddy_inbox(target_date)
                 if snapshot is None:
                     self.store.set_status(target_date, WorkflowStatus.SNAPSHOT_BUILDING)
                     organization = self.organization_cache.get()
@@ -121,6 +141,13 @@ class Workflow1:
                     self.store.set_status(target_date, WorkflowStatus.SNAPSHOT_READY)
                     for key, reason in read_issues.items():
                         self._record_issue(target_date, key, reason)
+                    for key, reason in pending_issues.items():
+                        self._record_issue(target_date, key, reason)
+                elif pending_issues:
+                    # 已有快照,登记不了 issue;留日志即可,不因为这条重跑整日。
+                    for key, reason in pending_issues.items():
+                        logger.error("workbuddy_flush_issue date=%s key=%s reason=%s",
+                                     target_date, key, reason)
                 self._process_logs(target_date)
                 snapshot = self.store.load_snapshot(target_date)
                 assert snapshot is not None
@@ -143,7 +170,7 @@ class Workflow1:
                 self.advance(target_date)
             except Exception as exc:
                 logger.exception("workflow1_failed date=%s", target_date)
-                self.store.set_status(target_date, WorkflowStatus.FAILED, error=str(exc))
+                self.store.set_status(target_date, WorkflowStatus.FAILED, error=error_summary(exc))
             result = self.store.load_workflow(target_date) or run
             logger.info("workflow1_finished date=%s status=%s", target_date, result.status)
             return result
@@ -177,20 +204,39 @@ class Workflow1:
         if not pending:
             return
         self.store.set_status(target_date, WorkflowStatus.LOGS_RUNNING)
-        template = self.prompt_path.read_text(encoding="utf-8").strip()
-        if not template:
+        builtin_template = self.prompt_path.read_text(encoding="utf-8").strip()
+        if not builtin_template:
             raise ValueError(f"Workflow1 prompt 为空：{self.prompt_path}")
         logs = {log.log_id: log for log in snapshot.logs}
 
-        def process(log_id: str) -> tuple[str, str, str]:
+        def process(log_id: str) -> tuple[str, str, str, str, str | None]:
             state = snapshot.log_evaluations[log_id]
             log = logs[log_id]
-            output = self.prompt_service.execute(
-                prompt_code="LOG", template=template,
-                input_data=LogPromptInput(target_date=target_date,
-                    person_id=state.person_id, log_id=log_id, log=log.content()),
-                output_model=LogPromptOutput)
-            return log_id, output.positive, output.improvement
+            selected = (self.prompt_repository.resolve("S01", state.evaluator_id)
+                        if self.prompt_repository and state.evaluator_id else None)
+            template = selected.template if selected else builtin_template
+            with diagnostic_context(workflow="workflow1", target_date=str(target_date),
+                                    log_id=log_id, person_id=state.person_id):
+                prompt_input = LogPromptInput(target_date=target_date,
+                    person_id=state.person_id, log_id=log_id, log=log.content())
+                try:
+                    output = self.prompt_service.execute(
+                        prompt_code="LOG", template=template,
+                        input_data=prompt_input, output_model=LogPromptOutput)
+                except LLMError:
+                    if selected is None:
+                        raise
+                    logger.warning(
+                        "personal_prompt_failed_fallback workflow=workflow1 log_id=%s "
+                        "user_id=%s record_id=%s", log_id, state.evaluator_id,
+                        selected.record_id, exc_info=True)
+                    output = self.prompt_service.execute(
+                        prompt_code="LOG", template=builtin_template,
+                        input_data=prompt_input, output_model=LogPromptOutput)
+                    selected = None
+            return (log_id, output.positive, output.improvement,
+                    "TABLE" if selected else "BUILTIN",
+                    selected.record_id if selected else None)
 
         failures = []
         with ThreadPoolExecutor(max_workers=self.llm_concurrency) as pool:
@@ -199,49 +245,73 @@ class Workflow1:
             for future in as_completed(futures):
                 log_id = futures[future]
                 try:
-                    _, positive, improvement = future.result()
+                    _, positive, improvement, prompt_source, prompt_record_id = future.result()
                     def save(item: DailySnapshot) -> None:
                         state = item.log_evaluations[log_id]
                         state.positive_ai = state.positive_final = positive
                         state.improvement_ai = state.improvement_final = improvement
+                        state.prompt_source = prompt_source
+                        state.prompt_record_id = prompt_record_id
                         state.status = (UnitStatus.WAITING_CONFIRMATION
                             if state.evaluator_id else UnitStatus.CONFIRMED)
-                        state.evaluated_at = utc_now()
+                        # 飞书查找引用的“等于今天”按当天 00:00:00 精确比较。
+                        # AI 评价统一使用审核日零点；人工确认仍保留真实发生时间。
+                        state.evaluated_at = review_day_datetime(target_date)
                         state.ai_evaluated_at = state.evaluated_at
                         if state.status == UnitStatus.CONFIRMED:
                             state.confirmed_at = state.evaluated_at
                         state.error = None
                     self.store.update_snapshot(target_date, save)
                 except Exception as exc:
+                    logger.exception("workflow1_log_failed date=%s log_id=%s", target_date, log_id)
                     failures.append(log_id)
                     def fail(item: DailySnapshot) -> None:
                         state = item.log_evaluations[log_id]
                         state.status = UnitStatus.FAILED
-                        state.error = str(exc)
+                        state.error = error_summary(exc)
                     self.store.update_snapshot(target_date, fail)
                     self._record_issue(
                         target_date, f"log:{log_id}:ai-failed",
-                        f"日志 {log_id} AI 评价生成失败（重试已耗尽）：{exc}；"
+                        f"日志 {log_id} AI 评价生成失败（重试已耗尽）：{error_summary(exc)}；"
                         "已跳过，可调用重评接口补评")
         logger.info("workflow1_logs_evaluated date=%s pending=%d failed=%d",
                     target_date, len(pending), len(failures))
 
+    @workflow_diagnostics("workflow1")
     def _notify_once(self, target_date: date, key: str,
                      open_id: str, message: str) -> None:
         if not open_id:
             raise ValueError(f"通知 {key} 缺少 OpenID")
-        if not self.store.reserve_notification(target_date, key):
+        if self.store.notification_sent(target_date, key):
+            record_outcome(key, "already_sent")
             return
-        try:
-            result = self.messages.send_text(
-                open_id, message, idempotency_key=key)
-        except FeishuApiError:
-            self.store.release_notification(target_date, key)
-            raise
-        message_id = str(result.get("message_id", ""))
-        if not message_id:
-            raise ValueError(f"飞书通知 {key} 未返回 message_id")
-        self.store.complete_notification(target_date, key, message_id)
+
+        def send():
+            if confirmed_unsent(target_date):
+                self.store.release_notification(target_date, key)
+            if not self.store.reserve_notification(target_date, key):
+                return {"message_id": ""}
+            try:
+                with diagnostic_context(notification_key=key, recipient=open_id):
+                    result = self.messages.send_text(open_id, message, idempotency_key=key)
+            except FeishuApiError:
+                self.store.release_notification(target_date, key)
+                raise
+            message_id = str(result.get("message_id", ""))
+            if not message_id:
+                raise ValueError(f"飞书通知 {key} 未返回 message_id")
+            self.store.complete_notification(target_date, key, message_id)
+            return result
+
+        if self.notifications is None:
+            send()
+        else:
+            run = self.store.load_workflow(target_date)
+            self.notifications.deliver(
+                key=key, target_date=target_date, created_at=run.started_at,
+                send_date=target_date + timedelta(days=1), receive_id=open_id, send=send,
+                message=message, workflow="workflow1",
+                message_type="review" if ":FORM:" in key else "report")
 
     def _notify_evaluators(self, target_date: date) -> None:
         snapshot = self.store.load_snapshot(target_date)
@@ -262,7 +332,7 @@ class Workflow1:
             open_id = evaluator.open_id or ""
             if open_id:
                 scope = "骨干" if evaluator.role == "部长" else "成员"
-                self._notify_once(target_date, key, open_id,
+                self._send_business_notification(target_date, key, open_id,
                     f"{greeting(evaluator)}"
                     f"请评价以下{scope} {date_cn(target_date)} 的工作日志"
                     f"（共 {len(progress.log_ids)} 条）：\n{'、'.join(names)}"
@@ -272,6 +342,7 @@ class Workflow1:
                     target_date, f"person:{evaluator_id}:missing-open-id",
                     f"评价人「{people[evaluator_id].name}」缺少 OpenID，"
                     "问卷通知未发送，请补录")
+                record_outcome(key, "failed", error="评价人缺少 OpenID")
             self.store.update_snapshot(target_date,
                 lambda item: setattr(item.evaluators[evaluator_id], "notified", True))
 
@@ -289,7 +360,8 @@ class Workflow1:
 
     def _reconcile_human(self, target_date: date) -> int:
         snapshot = self.store.load_snapshot(target_date)
-        assert snapshot is not None
+        if snapshot is None:
+            raise ValueError(f"{target_date} 缺少快照，不能核对人工评价；请先检查该日期的启动错误")
         if not snapshot.evaluations_published:
             return 0
         accepted = 0
@@ -362,11 +434,25 @@ class Workflow1:
         self.store.update_snapshot(target_date, close)
         return count
 
+    @workflow_diagnostics("workflow1")
     def finalize_pending_confirmations(self, target_date: date) -> dict:
         with self._lock:
+            human = auto = 0
+            stage = "check_snapshot"
             try:
+                snapshot = self.store.load_snapshot(target_date)
+                if snapshot is None or not snapshot.evaluations_published:
+                    reason = "missing_snapshot" if snapshot is None else "evaluations_not_ready"
+                    run = self.store.load_workflow(target_date)
+                    logger.error("workflow1_finalize_not_ready date=%s reason=%s previous_error=%s",
+                                 target_date, reason, run.last_error if run else None)
+                    return {"target_date": target_date.isoformat(), "human_confirmed": 0,
+                            "auto_confirmed": 0, "errors": [{"error": reason}], "status": "not_ready"}
+                stage = "reconcile_human"
                 human = self._reconcile_human(target_date)
+                stage = "close_remaining"
                 auto = self._close_remaining(target_date)
+                stage = "advance_documents_reports_notifications"
                 self.advance(target_date)
                 logger.info("workflow1_finalized date=%s human_confirmed=%d auto_confirmed=%d",
                             target_date, human, auto)
@@ -374,13 +460,13 @@ class Workflow1:
                         "human_confirmed": human, "auto_confirmed": auto,
                         "errors": []}
             except Exception as exc:
-                logger.warning("workflow1_finalize_failed date=%s error=%s",
-                               target_date, exc)
+                logger.exception("workflow1_finalize_failed date=%s stage=%s error=%s",
+                                 target_date, stage, error_summary(exc))
                 self.store.set_status(target_date, WorkflowStatus.FAILED,
-                                      error=str(exc))
+                                      error=f"stage={stage} {error_summary(exc)}")
                 return {"target_date": target_date.isoformat(),
-                        "human_confirmed": 0, "auto_confirmed": 0,
-                        "errors": [{"error": str(exc)}]}
+                        "human_confirmed": human, "auto_confirmed": auto,
+                        "errors": [{"error": error_summary(exc), "stage": stage}]}
 
     def handle_confirmation(self, request: ConfirmationRequest) -> dict:
         if request.table_name != "human_evaluations":
@@ -425,27 +511,45 @@ class Workflow1:
             report_issues.update(detail_issues)
         for key, reason in report_issues.items():
             self._record_issue(target_date, key, reason)
+        self.notify_documents_if_due(target_date, snapshot=snapshot, objects=objects)
+        if f"{target_date}:TEAM" in objects:
+            self.store.set_status(target_date, WorkflowStatus.COMPLETED)
+        else:
+            self.store.set_status(target_date, WorkflowStatus.WAITING_EVALUATIONS)
+
+    def _send_business_notification(self, target_date, key, open_id, message):
+        try:
+            self._notify_once(target_date, key, open_id, message)
+        except Exception as exc:
+            logger.exception("workflow1_notification_failed date=%s key=%s to=%s",
+                             target_date, key, open_id)
+            if manual_delivery(target_date):
+                record_outcome(key, "failed", error=error_summary(exc))
+
+    def _notify_documents(self, target_date, snapshot, objects):
         people = snapshot.organization.person_map()
         for department in snapshot.organization.departments:
             key = f"{target_date}:DEPARTMENT:{department.department_id}"
             if key in objects and department.minister_id:
                 minister = people[department.minister_id]
                 if minister.open_id:
-                    self._notify_once(target_date, f"{target_date}:DOC:{key}",
+                    department_name = department.name.removesuffix("部门")
+                    self._send_business_notification(target_date, f"{target_date}:DOC:{key}",
                         minister.open_id,
                         f"{greeting(minister)}{date_cn(target_date)} 的"
-                        f"{department.name}部门日志已生成：{objects[key].url}")
+                        f"{department_name}部门日志已生成：{objects[key].url}")
                 else:
                     self._record_issue(
                         target_date, f"person:{minister.person_id}:missing-open-id",
                         f"部长「{minister.name}」缺少 OpenID，部门日志通知未发送")
+                    record_outcome(f"{target_date}:DOC:{key}", "failed", error="部长缺少 OpenID")
         team_key = f"{target_date}:TEAM"
         if team_key in objects:
             if not snapshot.organization.team_leader_id:
                 raise ValueError("团队负责人缺失")
             leader = people[snapshot.organization.team_leader_id]
             if leader.open_id:
-                self._notify_once(target_date, f"{target_date}:DOC:{team_key}",
+                self._send_business_notification(target_date, f"{target_date}:DOC:{team_key}",
                     leader.open_id,
                     f"{greeting(leader)}{date_cn(target_date)} 的团队日志已生成："
                     f"{objects[team_key].url}")
@@ -453,9 +557,50 @@ class Workflow1:
                 self._record_issue(
                     target_date, f"person:{leader.person_id}:missing-open-id",
                     f"团队负责人「{leader.name}」缺少 OpenID，团队日志通知未发送")
-            self.store.set_status(target_date, WorkflowStatus.COMPLETED)
-        else:
-            self.store.set_status(target_date, WorkflowStatus.WAITING_EVALUATIONS)
+                record_outcome(f"{target_date}:DOC:{team_key}", "failed", error="团队负责人缺少 OpenID")
+
+    def notify_documents_if_due(self, target_date: date, *, snapshot=None,
+                                objects=None) -> None:
+        """Send generated reports at 22:00 on the evaluation day, or once ready later."""
+        hour, minute = map(int, self.report_notify_at.split(":"))
+        notify_time = datetime.combine(target_date + timedelta(days=1),
+                                       time(hour, minute), ZoneInfo("Asia/Shanghai"))
+        if datetime.now(ZoneInfo("Asia/Shanghai")) < notify_time:
+            return
+        snapshot = snapshot or self.store.load_snapshot(target_date)
+        if snapshot is None:
+            return
+        if objects is None:
+            objects = {key: item for key, item in snapshot.cloud_objects.items()
+                       if item.content_written and
+                       (":DEPARTMENT:" in key or key == f"{target_date}:TEAM")}
+        self._notify_documents(target_date, snapshot, objects)
+
+    @workflow_diagnostics("workflow1")
+    def send_notifications(self, target_date: date, message_type: str = "all",
+                           confirm_unsent: bool = False) -> dict:
+        with self._lock, manual_notifications(target_date, confirm_unsent) as results:
+            if self.store.load_workflow(target_date) is None:
+                raise LookupError(f"{target_date} 没有当日状态，可尝试从发送台账恢复")
+            snapshot = self.store.load_snapshot(target_date)
+            if snapshot is None:
+                raise LookupError(f"{target_date} 没有当日快照")
+            if message_type in {"all", "review"}:
+                if snapshot.evaluations_published:
+                    self._notify_evaluators(target_date)
+                else:
+                    record_outcome("review", "not_ready", reason="evaluations_not_ready")
+            if message_type in {"all", "report"}:
+                objects = {key: item for key, item in snapshot.cloud_objects.items()
+                           if item.content_written and
+                           (":DEPARTMENT:" in key or key == f"{target_date}:TEAM")}
+                self._notify_documents(target_date, snapshot, objects)
+                if not objects:
+                    record_outcome("report", "not_ready", reason="documents_not_ready")
+            # The policy and wrapper may observe the same error; return one outcome per key.
+            unique = {item["key"]: item for item in results}
+            return {"workflow": "workflow1", "target_date": target_date.isoformat(),
+                    "messages": list(unique.values())}
 
 
 DailyWorkflow = Workflow1

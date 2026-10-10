@@ -11,16 +11,17 @@ from zoneinfo import ZoneInfo
 
 from workflow2.materials import MaterialPreparer
 from workflow2.periods import due, material_window
-from workflow2.configs import SkillConfigRepository
 from config.schedules import ScheduleConfig
 from data.repositories import OrganizationCache
 from data.store import utc_now
-from llm import PromptService
+from llm import PromptRepository, PromptService
 from schema import Organization
 from workflow2.skills import SkillRunner, TechnologyOutput, TrainingOutput
 from tool.bitable_fields import field_datetime, record_fields, references, scalar
 from tool.cloud_docs import CloudDocsService, divider_block, text_block
 from tool.feishu import MessageService
+from tool.diagnostics import error_summary, workflow_diagnostics, diagnostic_context
+from tool.notifications import NotificationPolicy, manual_notifications, record_outcome
 from workflow1.documents import DailyDocuments
 from workflow2.models import (CycleRun, DepartmentAnalysis, DepartmentResult,
                               WeeklySummaryInput)
@@ -158,14 +159,16 @@ def _result_text(result: dict, code: str, organization: Organization,
 
 class Workflow2:
     def __init__(self, *, store: Workflow2Store, preparer: MaterialPreparer,
-                 organization: OrganizationCache, configs: SkillConfigRepository,
+                 organization: OrganizationCache, prompts: PromptRepository | None,
                  tables: Workflow2Tables, prompt_service: PromptService,
                  messages: MessageService, documents: CloudDocsService,
-                 schedules: ScheduleConfig, archive_parent: str):
+                 schedules: ScheduleConfig, archive_parent: str,
+                 notifications: NotificationPolicy | None = None):
         self.store, self.preparer, self.organization = store, preparer, organization
-        self.configs, self.tables, self.prompt_service = configs, tables, prompt_service
+        self.prompts, self.tables, self.prompt_service = prompts, tables, prompt_service
         self.messages, self.documents = messages, documents
         self.schedules, self.archive_parent = schedules, archive_parent
+        self.notifications = notifications
         self.lock = threading.RLock()
 
     def _schedule(self, kind: str):
@@ -223,9 +226,7 @@ class Workflow2:
         activation = self.store.activate(utc_now().astimezone(SHANGHAI).date())
         results = [self.resume(run.run_id) for run in self.store.pending()
                    if run.kind != "stage" or run.start_date > activation]
-        for run in self.store.all_runs():
-            if run.kind in {"monthly", "weekly"}:
-                self.notify_due(run.kind, run.scheduled_date)
+        # Recovery advances processing only; missed notifications require the admin API.
         logger.debug("workflow2_recover resumed=%d", len(results))
         return results
 
@@ -290,6 +291,7 @@ class Workflow2:
             "【周期分析报告已生成】\n" + "\n".join(
                 f"{NAMES[code]}：{run.document_urls[code]}" for code in CODES[run.kind]))
 
+    @workflow_diagnostics("workflow2")
     def _advance(self, run: CycleRun) -> CycleRun:
         if run.status == "COMPLETED":
             logger.debug("workflow2_already_completed run_id=%s", run.run_id)
@@ -315,12 +317,12 @@ class Workflow2:
             self.store.save(run)
             logger.info("workflow2_completed run_id=%s kind=%s", run.run_id, run.kind)
         except ValueError as exc:
-            run.status, run.last_error = "BLOCKED", str(exc)
+            run.status, run.last_error = "BLOCKED", error_summary(exc)
             self.store.save(run)
-            logger.warning("workflow2_blocked run_id=%s kind=%s error=%s",
-                           run.run_id, run.kind, exc)
+            logger.exception("workflow2_blocked run_id=%s kind=%s date=%s error=%s",
+                             run.run_id, run.kind, run.scheduled_date, error_summary(exc))
         except Exception as exc:
-            run.status, run.last_error = "FAILED", str(exc)
+            run.status, run.last_error = "FAILED", error_summary(exc)
             self.store.save(run)
             logger.exception("workflow2_failed run_id=%s kind=%s", run.run_id, run.kind)
         return run
@@ -330,8 +332,7 @@ class Workflow2:
         departments = [item for item in organization.departments if item.active and item.minister_id]
         if not departments:
             raise ValueError("没有有效的部门及部长")
-        configs = self.configs.load(organization)
-        runner = SkillRunner(self.prompt_service, configs)
+        runner = SkillRunner(self.prompt_service, self.prompts)
         for department in sorted(departments, key=lambda item: item.department_id):
             minister = people[department.minister_id]
             if not minister.active or not minister.open_id:
@@ -363,13 +364,12 @@ class Workflow2:
                 if code not in draft.drafts:
                     if run.kind == "stage":
                         result = runner.run(code, group_materials[0].input,
-                            department_id=department.department_id, user_id=minister.person_id)
+                            user_id=minister.person_id)
                         draft.drafts[code] = result.model_dump(mode="json")
                     else:
                         items: list[dict] = []
                         for group_material in group_materials:
                             result = runner.run(code, group_material.input,
-                                department_id=department.department_id,
                                 user_id=minister.person_id)
                             dump = result.model_dump(mode="json")
                             items.extend((dump.get("content") or {}).get("items", []))
@@ -499,7 +499,7 @@ class Workflow2:
         departments = [item for item in organization.departments
                        if item.active and item.minister_id]
         department_ids = sorted(item.department_id for item in departments)
-        runner = SkillRunner(self.prompt_service, self.configs.load(organization))
+        runner = SkillRunner(self.prompt_service, self.prompts)
 
         # ① team reference pass over the whole organization.
         team_material = self.preparer.prepare(run_id=run.run_id, start=run.start_date,
@@ -513,8 +513,7 @@ class Workflow2:
             self.store.save(run)
         for code in CODES["weekly"]:
             if code not in run.weekly_reference:
-                result = runner.run(code, team_material.input,
-                    department_id=self.configs.team_department_id, user_id=leader_id)
+                result = runner.run(code, team_material.input, user_id=leader_id)
                 run.weekly_reference[code] = result.model_dump(mode="json")
                 self.store.save(run)
 
@@ -533,7 +532,7 @@ class Workflow2:
             for code in CODES["weekly"]:
                 if code not in bucket:
                     result = runner.run(code, department_material.input,
-                        department_id=department_id, user_id=minister.person_id)
+                        user_id=minister.person_id)
                     bucket[code] = result.model_dump(mode="json")
                     self.store.save(run)
 
@@ -703,17 +702,74 @@ class Workflow2:
         self.store.save(run)
         return url
 
+    @workflow_diagnostics("workflow2")
     def _notify(self, run: CycleRun, key: str, open_id: str, message: str) -> None:
         if key in run.notification_ids:
+            record_outcome(f"workflow2:{run.run_id}:{key}", "already_sent")
             return
-        result = self.messages.send_text(open_id, message,
-            idempotency_key=f"workflow2:{run.run_id}:{key}")
+        business_key = f"workflow2:{run.run_id}:{key}"
+        def send():
+            with diagnostic_context(notification_key=business_key, recipient=open_id):
+                return self.messages.send_text(open_id, message, idempotency_key=business_key)
+        try:
+            if getattr(self, "notifications", None) is None:
+                result = send()
+            else:
+                result = self.notifications.deliver(
+                    key=business_key, target_date=run.scheduled_date, created_at=run.created_at,
+                    send_date=(self._cutoff(run).date() if key == "leader" and run.kind != "weekly"
+                               else run.scheduled_date), receive_id=open_id, send=send,
+                    message=message, workflow="workflow2", kind=run.kind,
+                    message_type="review" if key.startswith("minister:") else "report")
+                if result is None:
+                    return
+        except Exception as exc:
+            logger.exception("workflow2_notification_failed run_id=%s date=%s key=%s to=%s",
+                             run.run_id, run.scheduled_date, key, open_id)
+            record_outcome(business_key, "failed", error=error_summary(exc))
+            return
         message_id = scalar(result.get("message_id"))
         if not message_id:
             raise ValueError("周期通知没有返回 message_id")
         run.notification_ids[key] = message_id
         self.store.save(run)
         logger.info("workflow2_notification_sent run_id=%s key=%s", run.run_id, key)
+
+    @workflow_diagnostics("workflow2")
+    def send_notifications(self, scheduled_date: date, message_type: str = "all",
+                           kind: str = "all", confirm_unsent: bool = False) -> dict:
+        with self.lock, manual_notifications(scheduled_date, confirm_unsent) as results:
+            runs = [run for run in self.store.all_runs()
+                    if run.scheduled_date == scheduled_date and
+                    (kind == "all" or run.kind == kind)]
+            if not runs:
+                raise LookupError(f"{scheduled_date} 没有匹配的周期任务")
+            organization = self.organization.get()
+            people = organization.person_map()
+            for run in runs:
+                if message_type in {"all", "review"} and run.kind != "weekly":
+                    for draft in run.departments.values():
+                        key = f"workflow2:{run.run_id}:minister:{draft.department_id}"
+                        minister = people.get(draft.minister_id)
+                        if not draft.analysis_published:
+                            record_outcome(key, "not_ready", reason="analysis_not_published")
+                        elif minister is None or not minister.open_id:
+                            record_outcome(key, "failed", error="部长缺少 OpenID")
+                            logger.error("manual_notification_missing_recipient date=%s key=%s", scheduled_date, key)
+                        else:
+                            self._notify_minister(run, draft.department_id, minister.open_id)
+                if message_type in {"all", "report"}:
+                    key = f"workflow2:{run.run_id}:leader"
+                    leader = people.get(organization.team_leader_id or "")
+                    if not set(CODES[run.kind]) <= set(run.document_urls):
+                        record_outcome(key, "not_ready", reason="documents_not_ready")
+                    elif leader is None or not leader.open_id:
+                        record_outcome(key, "failed", error="团队负责人缺少 OpenID")
+                        logger.error("manual_notification_missing_recipient date=%s key=%s", scheduled_date, key)
+                    else:
+                        self._notify_leader(run, leader.open_id)
+            return {"workflow": "workflow2", "target_date": scheduled_date.isoformat(),
+                    "messages": list({item["key"]: item for item in results}.values())}
 
     def handle_confirmation(self, record_id: str) -> dict:
         # The event merely wakes recovery. Reconciliation checks row identity and cutoff.

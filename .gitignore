@@ -17,3 +17,9 @@ config/feishu_tables.toml
 .idea/
 *.log
 logs/
+
+# Local recovery archives (may contain full Git history and local configuration)
+/local-backups/
+
+# 交付给 WorkBuddy 的入口文档:含接口 token,不进版本库。
+docs/skill-template/

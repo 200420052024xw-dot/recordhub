@@ -65,7 +65,7 @@ class MessageServiceLoggingTests(unittest.TestCase):
         self.assertIn(
             "message_sent seq=1 type=text to=ou_yyr name=杨阳蕊 "
             "mobile=+8613837176209 message_id=om_1",
-            captured.output[0],
+            captured.output[-1],
         )
 
     def test_send_logs_failure_and_reraises(self):
@@ -76,7 +76,7 @@ class MessageServiceLoggingTests(unittest.TestCase):
                 messages.send_text("ou_x", "hi")
         self.assertIn(
             "message_send_failed seq=1 type=text to=ou_x name=- mobile=- error=boom",
-            captured.output[0],
+            captured.output[-1],
         )
 
     def test_sequence_increments_and_resets_per_day(self):
@@ -90,7 +90,7 @@ class MessageServiceLoggingTests(unittest.TestCase):
         client.request.return_value = {"code": 0, "data": {"message_id": "om_2"}}
         with self.assertLogs("tool.feishu", level="INFO") as captured:
             messages.send_text("ou_unknown", "hi")
-        self.assertIn("name=- mobile=-", captured.output[0])
+        self.assertIn("name=- mobile=-", captured.output[-1])
 
     def test_resolver_exception_logs_dash(self):
         def boom(oid):
@@ -100,7 +100,7 @@ class MessageServiceLoggingTests(unittest.TestCase):
         client.request.return_value = {"code": 0, "data": {"message_id": "om_3"}}
         with self.assertLogs("tool.feishu", level="INFO") as captured:
             messages.send_text("ou_bad", "hi")
-        self.assertIn("name=- mobile=-", captured.output[0])
+        self.assertIn("name=- mobile=-", captured.output[-1])
 
     def test_send_logs_failure_on_transport_error_and_reraises(self):
         client, messages = self._service()
@@ -110,7 +110,7 @@ class MessageServiceLoggingTests(unittest.TestCase):
                 messages.send_text("ou_x", "hi")
         self.assertIn(
             "message_send_failed seq=1 type=text to=ou_x name=- mobile=- error=network down",
-            captured.output[0],
+            captured.output[-1],
         )
 
     def test_resolver_malformed_return_logs_dash(self):
@@ -118,7 +118,7 @@ class MessageServiceLoggingTests(unittest.TestCase):
         client.request.return_value = {"code": 0, "data": {"message_id": "om_4"}}
         with self.assertLogs("tool.feishu", level="INFO") as captured:
             messages.send_text("ou_bad", "hi")
-        self.assertIn("name=- mobile=-", captured.output[0])
+        self.assertIn("name=- mobile=-", captured.output[-1])
 
 
 class RecipientResolverWiringTests(unittest.TestCase):

@@ -128,7 +128,7 @@ class Workflow2TableTests(unittest.TestCase):
         workflow = Workflow2.__new__(Workflow2)
         workflow.schedules = load_schedule_config("config/schedules.toml")
         workflow.store = SimpleNamespace(save=lambda state: None)
-        workflow.configs = SimpleNamespace(load=lambda org: [])
+        workflow.prompts = None
         workflow.prompt_service = Mock()
         workflow.preparer = SimpleNamespace(prepare=lambda **kwargs: SimpleNamespace(
             input=SimpleNamespace(scope=SimpleNamespace(

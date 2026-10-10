@@ -7,20 +7,38 @@ import hmac
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
-from typing import Annotated, Any, AsyncIterator
+from typing import Annotated, Any, AsyncIterator, Literal
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from config import AppSettings, load_env_file, load_schedule_config
 from config.schedules import ScheduleConfig, WorkflowSchedule
 from schema import Organization, PersonCreateRequest, PersonUpdateRequest
 from service.bitable_events import BitableEventStream
-from service.runtime import Runtime, WorkflowBinding, build_runtime
-from workflow1.models import ConfirmationRequest
+from service.runtime import Runtime, WorkflowBinding, build_runtime, capture_notification_backlog
+from workflow1.models import (
+    ConfirmationRequest,
+    WorkBuddyIdentityRequest,
+    WorkBuddySubmitRequest,
+)
+from workflow1.workbuddy_inbox import LogSubmitService
+from tool.diagnostics import error_summary
 
 logger = logging.getLogger(__name__)
+
+
+class NotificationSendRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    dates: list[date] = Field(min_length=1, max_length=31)
+    workflow: Literal["all", "workflow1", "workflow2"] = "all"
+    message_type: Literal["all", "review", "report"] = "all"
+    kind: Literal["all", "stage", "monthly", "weekly"] = "all"
+    confirm_unsent: bool = Field(default=False, strict=True)
 
 
 def _require_token(expected: str, authorization: str | None) -> None:
@@ -38,6 +56,9 @@ def create_app(
     if settings is None:
         load_env_file()
         settings = AppSettings.from_env()
+    if runtime is None:
+        from service.alerts import configure_admin_alerts
+        configure_admin_alerts(settings)
     active_runtime = runtime or build_runtime(settings)
     schedules = load_schedule_config(settings.schedule_config_path)
     app = FastAPI(
@@ -46,6 +67,13 @@ def create_app(
         lifespan=_make_lifespan(active_runtime, settings, schedules),
     )
     app.state.runtime = active_runtime
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(request: Request, exc: Exception):
+        logger.error("http_request_failed method=%s path=%s error=%s",
+                     request.method, request.url.path, error_summary(exc),
+                     exc_info=(type(exc), exc, exc.__traceback__))
+        return JSONResponse(status_code=500, content={"detail": "Internal server error; see service logs"})
 
     @app.get("/health/live")
     def live() -> dict[str, str]:
@@ -75,7 +103,7 @@ def _register_routes(app: FastAPI, runtime: Runtime, settings: AppSettings) -> N
         try:
             result = workflow1.workflow.handle_confirmation(request)
         except Exception as exc:
-            logger.warning("confirmation_rejected record_id=%s error=%s",
+            logger.exception("confirmation_rejected record_id=%s error=%s",
                            request.record_id, exc)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         logger.info("confirmation_received record_id=%s status=%s",
@@ -100,6 +128,52 @@ def _register_routes(app: FastAPI, runtime: Runtime, settings: AppSettings) -> N
         if snapshot is None:
             raise HTTPException(status_code=404, detail=f"{target_date} 没有当日快照")
         return {"target_date": target_date.isoformat(), "issues": snapshot.issues}
+
+    @app.post("/admin/notifications/send", dependencies=[Depends(require_admin)])
+    def send_notifications(request: NotificationSendRequest) -> dict:
+        results = []
+        logger.info("admin_notification_send_requested dates=%s workflow=%s type=%s kind=%s confirm_unsent=%s",
+                    request.dates, request.workflow, request.message_type, request.kind, request.confirm_unsent)
+        for target_date in dict.fromkeys(request.dates):
+            for name in ("workflow1", "workflow2"):
+                if request.workflow not in {"all", name}:
+                    continue
+                workflow = workflow1.workflow if name == "workflow1" else runtime.workflow2
+                if workflow is None:
+                    results.append({"workflow": name, "target_date": str(target_date), "status": "unavailable"})
+                    continue
+                try:
+                    if name == "workflow1":
+                        result = workflow.send_notifications(target_date, request.message_type,
+                                                             confirm_unsent=request.confirm_unsent)
+                    else:
+                        result = workflow.send_notifications(target_date, request.message_type, request.kind,
+                                                             confirm_unsent=request.confirm_unsent)
+                    results.append(result)
+                except LookupError as exc:
+                    policy = getattr(workflow1.workflow, "notifications", None)
+                    replayed = (policy.replay(target_date, runtime.infrastructure.messages,
+                                             workflow=name, message_type=request.message_type,
+                                             kind=request.kind, confirm_unsent=request.confirm_unsent) if policy else None)
+                    results.append(replayed or {"workflow": name, "target_date": str(target_date),
+                                                "status": "not_found", "error": str(exc)})
+                except Exception as exc:
+                    logger.exception("admin_notification_send_failed workflow=%s date=%s", name, target_date)
+                    results.append({"workflow": name, "target_date": str(target_date),
+                                    "status": "failed", "error": error_summary(exc)})
+        summary: dict[str, int] = {}
+        for result in results:
+            for item in result.get("messages", [result]):
+                status = item.get("status", "unknown")
+                summary[status] = summary.get(status, 0) + 1
+        logger.info("admin_notification_send_finished summary=%s", summary)
+        return {"results": results, "summary": summary}
+
+    @app.get("/admin/notifications/{target_date}", dependencies=[Depends(require_admin)])
+    def notification_status(target_date: date) -> dict:
+        policy = getattr(workflow1.workflow, "notifications", None)
+        return {"target_date": str(target_date),
+                "messages": policy.for_date(target_date) if policy else []}
 
     @app.post("/admin/cache/organization/refresh", dependencies=[Depends(require_admin)])
     def refresh_organization() -> dict:
@@ -157,6 +231,7 @@ def _register_routes(app: FastAPI, runtime: Runtime, settings: AppSettings) -> N
         try:
             return runtime.workflow2.start(kind, scheduled_date).model_dump(mode="json")
         except Exception as exc:
+            logger.exception("workflow2_admin_start_failed kind=%s date=%s", kind, scheduled_date)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/admin/workflow2/runs/{run_id}/resume", dependencies=[Depends(require_admin)])
@@ -164,6 +239,7 @@ def _register_routes(app: FastAPI, runtime: Runtime, settings: AppSettings) -> N
         try:
             return runtime.workflow2.resume(run_id).model_dump(mode="json")
         except Exception as exc:
+            logger.exception("workflow2_admin_resume_failed run_id=%s", run_id)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/admin/workflow2/runs/{run_id}", dependencies=[Depends(require_admin)])
@@ -172,6 +248,28 @@ def _register_routes(app: FastAPI, runtime: Runtime, settings: AppSettings) -> N
         if run is None:
             raise HTTPException(status_code=404, detail="Workflow2 run not found")
         return run.model_dump(mode="json")
+
+    # 对话入口(WorkBuddy)专用:独立 token,拿不到 admin 权限。
+    def require_workbuddy(
+        authorization: Annotated[str | None, Header()] = None
+    ) -> None:
+        _require_token(settings.workbuddy_token, authorization)
+
+    def workbuddy_service() -> LogSubmitService:
+        if runtime.workbuddy is None:
+            raise HTTPException(
+                status_code=503, detail="WorkBuddy endpoint is not configured")
+        return runtime.workbuddy
+
+    @app.post("/workbuddy/v1/work-logs/identity",
+              dependencies=[Depends(require_workbuddy)])
+    def workbuddy_identity(request: WorkBuddyIdentityRequest) -> dict:
+        return workbuddy_service().resolve(request.name)
+
+    @app.post("/workbuddy/v1/work-logs",
+              dependencies=[Depends(require_workbuddy)])
+    def workbuddy_submit(request: WorkBuddySubmitRequest) -> dict:
+        return workbuddy_service().submit(request)
 
 
 def _organization_payload(organization: Organization) -> dict:
@@ -224,6 +322,7 @@ def _make_lifespan(runtime: Runtime, settings: AppSettings, schedules: ScheduleC
             organization = runtime.organization_cache.get()
         logger.info("organization_cache_loaded persons=%d departments=%d",
                     len(organization.persons), len(organization.departments))
+        capture_notification_backlog(runtime)
         if settings.workflow2_enabled and runtime.workflow2 is not None:
             for kind in ("stage", "monthly", "weekly"):
                 runtime.workflow2._check_ready(kind)
@@ -307,16 +406,21 @@ def _build_scheduler(
                     id=f"{name}_evaluator_notification", replace_existing=True,
                     max_instances=1, coalesce=True,
                 )
+            if report_notify_at := schedule.options.get("report_notify_at"):
+                hour, minute = map(int, str(report_notify_at).split(":"))
 
-                def recover_notifications(one: WorkflowBinding = binding) -> None:
-                    for run in one.store.list_incomplete_workflows():
-                        one.workflow.notify_evaluators_if_due(run.target_date)
+                def notify_reports(one: WorkflowBinding = binding,
+                                   daily: WorkflowSchedule = schedule) -> None:
+                    today = datetime.now(ZoneInfo(schedules.timezone)).date()
+                    days_ago = int(daily.options.get("material_days_ago", 1))
+                    one.workflow.notify_documents_if_due(today - timedelta(days=days_ago))
 
                 scheduler.add_job(
-                    recover_notifications, "interval", minutes=15,
-                    id=f"{name}_evaluator_notification_recovery",
-                    replace_existing=True, max_instances=1, coalesce=True,
+                    notify_reports, "cron", hour=hour, minute=minute,
+                    id=f"{name}_report_notification", replace_existing=True,
+                    max_instances=1, coalesce=True,
                 )
+
         if binding.auto_advance_at:
             hour, minute = (int(value) for value in binding.auto_advance_at.split(":", 1))
 
@@ -349,21 +453,8 @@ def _build_scheduler(
     def refresh_organization() -> None:
         try:
             runtime.organization_cache.refresh()
-        except Exception as exc:
+        except Exception:
             logger.exception("organization_refresh_failed")
-            if settings.admin_open_id:
-                try:
-                    runtime.infrastructure.messages.send_text(
-                        settings.admin_open_id,
-                        f"【组织缓存刷新失败】每日定时刷新人员信息时出错：{exc}",
-                        idempotency_key=(
-                            "org-refresh:"
-                            f"{datetime.now(ZoneInfo(schedules.timezone)).date()}"
-                        ),
-                    )
-                except Exception:
-                    logger.exception(
-                        "admin_issue_notification_failed key=organization_refresh")
 
     # 组织缓存每日刷新：需早于 workflow1_daily（默认 01:00），保证当天日报
     # 使用最新的人员名单；刷新失败仅通知管理员，不影响后续任务继续执行。
@@ -371,6 +462,21 @@ def _build_scheduler(
         refresh_organization, "cron", hour=0, minute=50, id="organization_refresh",
         replace_existing=True, max_instances=1, coalesce=True,
     )
+    skill_review = schedules.workflows.get("skill_prompt_review")
+    if (runtime.prompt_repository is not None and skill_review is not None
+            and skill_review.enabled):
+        def review_skill_prompts() -> None:
+            organization = runtime.organization_cache.get()
+            runtime.prompt_repository.review_pending(organization)
+
+        # Use the freshly refreshed organization relations and finish before
+        # Workflow1 starts at 01:00.
+        review_hour, review_minute = map(int, skill_review.time.split(":"))
+        scheduler.add_job(
+            review_skill_prompts, "cron", hour=review_hour, minute=review_minute,
+            id="skill_prompt_review", replace_existing=True,
+            max_instances=1, coalesce=True,
+        )
     if settings.workflow2_enabled and runtime.workflow2 is not None:
         def run_workflow2(kind: str) -> None:
             today = datetime.now(ZoneInfo(schedules.timezone)).date()

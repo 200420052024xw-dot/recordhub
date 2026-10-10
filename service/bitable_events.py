@@ -102,7 +102,7 @@ class BitableEventStream:
         # client.start() is meant to block for the process lifetime; a return
         # means the long connection dropped and confirmation now relies on the
         # daily auto-advance until the service restarts.
-        logger.warning("feishu_event_stream_loop_exited")
+        logger.error("feishu_event_stream_loop_exited")
 
     def _run_worker(self) -> None:
         while not self.stop_event.is_set():

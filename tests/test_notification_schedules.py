@@ -93,6 +93,29 @@ class NotificationScheduleTests(unittest.TestCase):
             workflow.notify_evaluators_if_due(target)
             workflow._notify_evaluators.assert_called_once()
 
+    def test_department_reports_wait_until_evaluation_day_at_ten_pm(self):
+        workflow = Workflow1.__new__(Workflow1)
+        workflow.report_notify_at = "22:00"
+        workflow.store = SimpleNamespace(load_snapshot=Mock())
+        workflow._notify_documents = Mock()
+        snapshot = SimpleNamespace(cloud_objects={})
+        objects = {"ready": object()}
+
+        class At(datetime):
+            current = datetime(2026, 10, 6, 13, 59, tzinfo=timezone.utc)
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current.astimezone(tz)
+
+        target = date(2026, 10, 5)
+        with patch("workflow1.workflow.datetime", At):
+            workflow.notify_documents_if_due(target, snapshot=snapshot, objects=objects)
+            workflow._notify_documents.assert_not_called()
+            At.current = datetime(2026, 10, 6, 14, 0, tzinfo=timezone.utc)
+            workflow.notify_documents_if_due(target, snapshot=snapshot, objects=objects)
+            workflow._notify_documents.assert_called_once_with(target, snapshot, objects)
+
     def test_monthly_and_weekly_notifications_wait_for_their_times(self):
         schedules = load_schedule_config("config/schedules.toml")
         day = date(2026, 10, 5)

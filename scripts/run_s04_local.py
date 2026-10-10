@@ -54,8 +54,7 @@ def main() -> int:
     previous_directory = Path.cwd()
     try:
         os.chdir(ROOT)  # SkillRunner resolves prompts/S04.txt from cwd.
-        result = runner.run("S04", data, department_id=args.department_id,
-                            user_id=args.user_id)
+        result = runner.run("S04", data, user_id=args.user_id)
     finally:
         os.chdir(previous_directory)
     target.parent.mkdir(parents=True, exist_ok=True)

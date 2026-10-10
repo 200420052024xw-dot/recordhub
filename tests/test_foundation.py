@@ -182,8 +182,11 @@ class FoundationTests(unittest.TestCase):
         )
         with patch.dict("os.environ", {"RECORDHUB_AUTO_ADVANCE_AT": "23:59"}):
             self.assertEqual(W1Settings.from_schedule(schedules).auto_advance_at,
-                              "19:00")
+                             schedules.workflows["workflow1_daily"].options[
+                                 "auto_advance_at"])
         self.assertEqual(W1Settings.from_schedule(schedules).notify_at, "08:00")
+        self.assertEqual(W1Settings.from_schedule(schedules).report_notify_at,
+                         "22:00")
 
     def test_invalid_confirmation_deadline_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

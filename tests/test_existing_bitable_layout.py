@@ -116,11 +116,12 @@ reported_at = "报告时间"
 [tables.prompts]
 table_id = ""
 [tables.prompts.fields]
-config_id = "文本"
 user_ref = "使用人"
 role = "角色"
-template = "分析skill"
-modified_at = "修改日期"
+template = "Skill内容"
+function = "功能"
+review_result = "审核结果"
+failure_reason = "未通过原因"
 
 [tables.department_analysis]
 table_id = ""

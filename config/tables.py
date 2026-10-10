@@ -13,6 +13,7 @@ REQUIRED_TABLES = {
     "evaluations",
     "human_evaluations",
     "reports",
+    "prompts",
 }
 
 REQUIRED_FIELDS = {
@@ -61,6 +62,14 @@ REQUIRED_FIELDS = {
         "reporter_ref",
         "role",
         "reported_at",
+    },
+    "prompts": {
+        "user_ref",
+        "role",
+        "template",
+        "function",
+        "review_result",
+        "failure_reason",
     },
 }
 

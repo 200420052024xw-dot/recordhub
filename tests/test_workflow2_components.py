@@ -19,7 +19,7 @@ from llm import LLMError, PromptService
 from service.runtime import build_runtime
 from workflow1.models import DailySnapshot, UnitStatus
 from workflow2.materials import MaterialPreparer
-from workflow2.skills import (MaterialScope, SkillCode, SkillConfig, SkillInput,
+from workflow2.skills import (MaterialScope, SkillCode, SkillInput,
                               SkillRunner, SkillStatus, TextRecord)
 from test_workflow1_pipeline import DAY, sample_snapshot
 
@@ -51,7 +51,7 @@ class Workflow2ComponentTests(unittest.TestCase):
         for code in SkillCode:
             with self.subTest(code=code):
                 result = SkillRunner(PromptService(client, max_attempts=1)).run(
-                    code, self.material(), department_id="dep", user_id="D")
+                    code, self.material(), user_id="D")
                 self.assertEqual(result.status, SkillStatus.WAITING_CONFIRMATION)
                 template = client.complete_json.call_args.args[0][0]["content"]
                 self.assertIn((ROOT / "prompts" / f"{code.value}.txt")
@@ -64,7 +64,7 @@ class Workflow2ComponentTests(unittest.TestCase):
             "current_progress": "完成"}]})
         with self.assertRaises(LLMError):
             SkillRunner(PromptService(client, max_attempts=1)).run(
-                "S04", self.material(), department_id="dep", user_id="D")
+                "S04", self.material(), user_id="D")
 
     def test_only_finalized_evaluation_reaches_material(self):
         prepared = MaterialPreparer(self.daily).prepare(
@@ -109,13 +109,18 @@ class Workflow2ComponentTests(unittest.TestCase):
                             for source in prepared.input.scope.omitted_sources))
         self.assertTrue(any(record.submitted for record in prepared.input.records))
 
-    def test_personal_skill_config_precedes_department_default(self):
-        department = SkillConfig(config_id="dept", skill_code="S04",
-                                 department_id="dep", version="1")
-        personal = department.model_copy(update={"config_id": "person", "user_id": "D"})
-        runner = SkillRunner(PromptService(Mock()), [department, personal])
-        self.assertEqual(runner.resolve_config("S04", department_id="dep",
-                                               user_id="D").config_id, "person")
+    def test_reviewed_personal_prompt_replaces_builtin_template(self):
+        client = Mock()
+        client.complete_json.side_effect = lambda messages, validator: validator({"items": []})
+        prompts = Mock()
+        prompts.resolve.return_value = SimpleNamespace(
+            template="个人阶段分析规则", record_id="rec_prompt")
+        result = SkillRunner(PromptService(client, max_attempts=1), prompts).run(
+            "S04", self.material(), user_id="D")
+        template = client.complete_json.call_args.args[0][0]["content"]
+        self.assertIn("个人阶段分析规则", template)
+        self.assertEqual(result.prompt_source, "TABLE")
+        self.assertEqual(result.prompt_record_id, "rec_prompt")
 
     def test_completed_daily_snapshot_deleted_after_retention(self):
         self.daily.set_status(DAY, "COMPLETED")
