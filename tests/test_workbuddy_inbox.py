@@ -172,15 +172,15 @@ class WorkBuddyInboxTests(unittest.TestCase):
         self.assertEqual(result["log_date"], "2026-10-10")
         self.assertEqual(result["archive_at"], "2026-10-11T01:00:00+08:00")
         stored = self.service.inbox.pending(DAY)
-        self.assertEqual(len(stored), 1)
-        self.assertEqual(stored[0].person_id, "B")
-        self.assertEqual(stored[0].submitted_at.tzinfo is not None, True)
+        self.assertEqual(list(stored), ["B"])
+        self.assertEqual(stored["B"].submitted_at.tzinfo is not None, True)
+        self.assertTrue(self.service.inbox.path("骨干甲").exists())
         self.assertEqual(self.bitable.created, [])
 
     def test_empty_content_is_rejected_without_storing(self):
         self.assertEqual(self.service.submit(WorkBuddySubmitRequest(
             name="骨干甲", progress="   "))["code"], EMPTY_CONTENT)
-        self.assertEqual(self.service.inbox.pending(DAY), [])
+        self.assertEqual(self.service.inbox.pending(DAY), {})
 
     def test_submit_outside_window_is_rejected_without_storing(self):
         self.freeze(23, 55)
@@ -188,21 +188,24 @@ class WorkBuddyInboxTests(unittest.TestCase):
             name="骨干甲", progress="半夜交"))
         self.assertEqual(result["code"], CLOSED)
         self.assertEqual(result["next_open_at"], "2026-10-11T12:00:00+08:00")
-        self.assertEqual(self.service.inbox.pending(DAY), [])
+        self.assertEqual(self.service.inbox.pending(DAY), {})
 
     def test_person_id_must_match_the_name(self):
         self.assertEqual(self.service.submit(WorkBuddySubmitRequest(
             person_id="S001", name="骨干甲", progress="今天"))["code"],
             PERSON_ID_UNKNOWN)
-        self.assertEqual(self.service.inbox.pending(DAY), [])
+        self.assertEqual(self.service.inbox.pending(DAY), {})
 
     # ----------------------------------------------------------- 写回
 
-    def test_flush_writes_latest_submission_only_and_is_idempotent(self):
+    def test_resubmit_overwrites_and_flush_writes_only_the_last(self):
         self.service.submit(WorkBuddySubmitRequest(name="基层乙", progress="第一版"))
         self.service.submit(WorkBuddySubmitRequest(name="基层乙", progress="第二版"))
         self.service.submit(WorkBuddySubmitRequest(name="基层乙", progress="第三版"))
-        self.assertEqual(len(self.service.inbox.pending(DAY)), 3)
+        # 一人一天一个文件,后交的覆盖先交的
+        self.assertEqual(list(self.service.inbox.pending(DAY)), ["S001"])
+        stored = self.service.inbox.pending(DAY)["S001"]
+        self.assertEqual(stored.progress, "第三版")
 
         written, issues = self.service.flush(DAY)
         self.assertEqual((written, issues), (1, {}))
@@ -210,18 +213,20 @@ class WorkBuddyInboxTests(unittest.TestCase):
         self.assertEqual(self.bitable.created[0]["工作进展："], "第三版")
         self.assertIn("工作进展:第三版", self.bitable.created[0]["完整日志"])
         # 提交时间写的是学生提交那一刻,不是写回时刻
-        self.assertEqual(self.bitable.created[0]["提交时间"], int(
-            self.service.inbox.pending(DAY)[-1].submitted_at.timestamp() * 1000))
+        self.assertEqual(self.bitable.created[0]["提交时间"],
+                         int(stored.submitted_at.timestamp() * 1000))
         # 基层学生没有 open_id,就不写提交人字段,也不写空栏位
         self.assertNotIn("提交人", self.bitable.created[0])
         self.assertNotIn("工作困难：", self.bitable.created[0])
+        # 写回成功后暂存被清掉
+        self.assertEqual(self.service.inbox.pending(DAY), {})
 
         self.assertEqual(self.service.flush(DAY), (0, {}))
         self.assertEqual(len(self.bitable.created), 1)
 
     def test_flush_adopts_an_existing_row_when_the_key_was_lost(self):
         self.service.submit(WorkBuddySubmitRequest(name="骨干甲", progress="已建行"))
-        submission = self.service.inbox.pending(DAY)[0]
+        submission = self.service.inbox.pending(DAY)["B"]
         stamp = int(submission.submitted_at.timestamp() * 1000)
         self.bitable.rows["logs"] = [{"record_id": "existing", "fields": {
             "姓名：": "骨干甲", "提交时间": stamp}}]
@@ -232,6 +237,8 @@ class WorkBuddyInboxTests(unittest.TestCase):
         self.assertEqual(
             self.workflow_store.get_external_record(DAY, "workbuddy:log:B")[
                 "record_id"], "existing")
+        # 认领成功也算处理完,暂存清掉
+        self.assertEqual(self.service.inbox.pending(DAY), {})
 
     def test_flush_records_an_issue_when_the_person_disappeared(self):
         self.service.submit(WorkBuddySubmitRequest(name="基层乙", progress="今天"))
@@ -240,6 +247,8 @@ class WorkBuddyInboxTests(unittest.TestCase):
         written, issues = self.service.flush(DAY)
         self.assertEqual(written, 0)
         self.assertIn("workbuddy:S001:person-missing", issues)
+        # 写不回去的暂存要留着,等人补回组织表
+        self.assertEqual(list(self.service.inbox.pending(DAY)), ["S001"])
 
     def test_flush_writes_the_submitter_field_for_people_with_open_id(self):
         self.service.submit(WorkBuddySubmitRequest(name="骨干甲", progress="有 open_id"))

@@ -58,66 +58,59 @@ def _day_bounds_ms(day: date) -> tuple[int, int]:
     return _millis(start), _millis(start + timedelta(days=1))
 
 
+def _safe(value: str) -> str:
+    """姓名进文件名前的清洗:中文与字母数字保留,其余换下划线。"""
+    return "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in value)
+
+
 def _department_name(person: Person, organization: Organization) -> str:
     department = organization.department_map().get(person.department_id or "")
     return department.name if department else ""
 
 
 class WorkBuddyInbox:
-    """只增不改的提交缓存:一天一个目录,一笔一个文件。
+    """待写回的提交暂存:**一人一个文件,以姓名为文件名**,重复提交覆盖,写回成功后删除。
 
-    文件名 = 到达序号 + 提交时刻毫秒 + 随机 id。序号让"同一毫秒的两笔"
-    也有确定的先后(=到达先后),排序键是(提交时刻, 文件名),可重放。
-    序号靠扫描当天目录取最大+1 得到,不需要锁:万一并发撞号,退化成
-    提交时刻+uuid 的确定顺序,不会写坏文件(os.replace 是原子的)。
+    目录里只剩"还没进飞书表"的东西,所以始终很小(一天最多一份人数量级)。
+    文件名不带日期——日期以文件里的 ``target_date`` 为准,写回时只取当天那份。
+    姓名按约定唯一(重名在认人那一步就被拒了),所以用它做文件名是安全的。
     """
 
     def __init__(self, state_dir: str | Path) -> None:
-        self.root = Path(state_dir) / "workbuddy_inbox" / "work-log"
+        self.root = Path(state_dir) / "workbuddy_inbox"
 
-    def directory(self, target_date: date) -> Path:
-        return self.root / target_date.isoformat()
+    def path(self, name: str) -> Path:
+        return self.root / f"{_safe(name)}.json"
 
-    def append(self, submission: WorkBuddySubmission) -> Path:
-        stamp = _millis(submission.submitted_at)
-        sequence = self._next_sequence(submission.target_date)
-        path = self.directory(submission.target_date) / (
-            f"{sequence:06d}-{stamp:013d}-{submission.submission_id}.json")
+    def save(self, submission: WorkBuddySubmission) -> Path:
+        path = self.path(submission.name)
         FileStateStore._atomic_write(path, submission.model_dump(mode="json"))
         return path
 
-    def pending(self, target_date: date) -> list[WorkBuddySubmission]:
-        directory = self.directory(target_date)
-        if not directory.is_dir():
-            return []
-        rows: list[tuple[str, WorkBuddySubmission]] = []
-        for path in directory.glob("*.json"):
-            try:
-                rows.append((path.name, WorkBuddySubmission.model_validate(
-                    json.loads(path.read_text(encoding="utf-8")))))
-            except (OSError, ValueError) as exc:
-                # 缓存读不出来就不能建快照:宁可整日推迟,也不把交过的人写成未交。
-                raise ValueError(f"提交缓存文件损坏:{path}") from exc
-        rows.sort(key=lambda row: (row[1].submitted_at, row[0]))
-        return [submission for _, submission in rows]
-
-    def _next_sequence(self, target_date: date) -> int:
-        highest = 0
-        for path in self.directory(target_date).glob("*.json"):
-            head = path.name.split("-", 1)[0]
-            if head.isdigit():
-                highest = max(highest, int(head))
-        return highest + 1
-
-    def latest_by_person(self, target_date: date) -> dict[str, WorkBuddySubmission]:
+    def pending(self, target_date: date) -> dict[str, WorkBuddySubmission]:
+        """该日期尚未写回的提交,每人的最后一笔。"""
+        if not self.root.is_dir():
+            return {}
         latest: dict[str, WorkBuddySubmission] = {}
-        for submission in self.pending(target_date):
+        for path in sorted(self.root.glob("*.json")):
+            try:
+                submission = WorkBuddySubmission.model_validate(
+                    json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, ValueError) as exc:
+                # 暂存读不出来就不能建快照:宁可整日推迟,也不把交过的人写成未交。
+                raise ValueError(f"提交缓存文件损坏:{path}") from exc
+            if submission.target_date != target_date:
+                # 别的日期还没写回的旧文件,跳过(不会拿它当今天的日志写进表)。
+                continue
             latest[submission.person_id] = submission
         return latest
 
-    def has_pending(self, target_date: date) -> bool:
-        directory = self.directory(target_date)
-        return directory.is_dir() and any(directory.glob("*.json"))
+    def discard(self, submission: WorkBuddySubmission) -> None:
+        """写回成功(或已确认写回过)后清掉暂存。"""
+        try:
+            self.path(submission.name).unlink()
+        except FileNotFoundError:
+            pass
 
 
 class LogSubmitService:
@@ -188,7 +181,7 @@ class LogSubmitService:
             reflection=request.reflection.strip(),
             other=request.other.strip(),
         )
-        path = self.inbox.append(submission)
+        path = self.inbox.save(submission)
         logger.info("workbuddy_submission_stored person_id=%s date=%s file=%s",
                     person.person_id, submission.target_date, path.name)
         return {"code": OK, "person_id": person.person_id, "name": person.name,
@@ -237,27 +230,31 @@ class LogSubmitService:
     # ------------------------------------------------------------------ 写回
 
     def flush(self, target_date: date) -> tuple[int, dict[str, str]]:
-        """把某天的缓存写回日志表,返回(新建行数, 需登记的问题)。
+        """把某天的暂存写回日志表,返回(新建行数, 需登记的问题)。
 
         幂等:业务键记在 ``external_records`` 里;键丢了但行已存在的,靠
-        (姓名, 提交时间)认领,不重复建行。
+        (姓名, 提交时间)认领,不重复建行。写回成功后删掉暂存文件。
         """
-        pending = self.inbox.latest_by_person(target_date)
+        pending = self.inbox.pending(target_date)
         if not pending:
             return 0, {}
         organization = self.organization_cache.get()
         people = organization.person_map()
         known = self._rows_by_submitter(target_date)
-        creates: list[tuple[str, dict[str, Any]]] = []
+        creates: list[tuple[str, WorkBuddySubmission, dict[str, Any]]] = []
         issues: dict[str, str] = {}
-        adopted = 0
+        cleaned = 0
         for person_id in sorted(pending):
             submission = pending[person_id]
             business_key = f"{_BUSINESS_KEY_PREFIX}:{person_id}"
             if self.workflow_store.get_external_record(target_date, business_key):
+                # 上一轮已经落过表,只是没来得及清暂存。
+                self.inbox.discard(submission)
+                cleaned += 1
                 continue
             person = people.get(person_id)
             if person is None or not person.active:
+                # 这份暂存不删:等人补回组织表之后还能写回。
                 issues[f"workbuddy:{person_id}:person-missing"] = (
                     f"「{submission.name}」已不在人员表,这笔日志未写回")
                 continue
@@ -266,35 +263,39 @@ class LogSubmitService:
                 # 上一轮已经建过这一行(或者建完就中断了),认领它。
                 self.workflow_store.map_external_record(
                     target_date, business_key, "logs", found[0])
-                adopted += 1
+                self.inbox.discard(submission)
+                cleaned += 1
                 continue
             if len(found) > 1:
                 issues[f"workbuddy:{person_id}:duplicate-rows"] = (
                     f"「{person.name}」当日已有 {len(found)} 行提交时间相同的日志,"
                     "本次仍按最后一笔写入,请核对原表")
-            creates.append((business_key,
+            creates.append((business_key, submission,
                             self._fields(submission, person)))
         if creates:
             self._create_rows(target_date, creates)
-        if adopted:
-            logger.info("workbuddy_rows_adopted date=%s count=%d", target_date, adopted)
+        if cleaned:
+            logger.info("workbuddy_inbox_reconciled date=%s count=%d",
+                        target_date, cleaned)
         return len(creates), issues
 
     def _create_rows(self, target_date: date,
-                     creates: list[tuple[str, dict[str, Any]]]) -> None:
+                     creates: list[tuple[str, WorkBuddySubmission, dict[str, Any]]]) -> None:
         table_id = self.logs_table.table_id
         for offset in range(0, len(creates), _BATCH_SIZE):
             chunk = creates[offset:offset + _BATCH_SIZE]
             created = self.bitable.batch_create(
-                table_id, [fields for _, fields in chunk])
+                table_id, [fields for _, _, fields in chunk])
             if len(created) != len(chunk):
                 raise ValueError("飞书批量创建日志返回数量不一致")
-            for (business_key, _), record in zip(chunk, created, strict=True):
+            for (business_key, submission, _), record in zip(chunk, created, strict=True):
                 record_id = str(record.get("record_id", ""))
                 if not record_id:
                     raise ValueError("日志创建后没有记录 ID")
                 self.workflow_store.map_external_record(
                     target_date, business_key, "logs", record_id)
+                # 落到飞书、并且登记了业务键之后,才丢暂存。
+                self.inbox.discard(submission)
 
     def _rows_by_submitter(self, target_date: date) -> dict[tuple[str, int], list[str]]:
         """当日日志表里 (姓名, 提交时间毫秒) → record_id。
