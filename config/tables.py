@@ -54,7 +54,7 @@ REQUIRED_FIELDS = {
         "improvement_ai",
     },
     "human_evaluations": {
-        "evaluation_id", "basic_name", "backbone_ref", "source_log",
+        "evaluation_id", "source_log",
         "positive_final", "improvement_final", "submitted_by",
     },
     "reports": {
@@ -73,14 +73,21 @@ REQUIRED_FIELDS = {
     },
 }
 
+HUMAN_EVALUATION_TABLES = ("human_evaluations", "human_evaluations_backbone")
+
+
+def human_evaluation_tables(config: TableConfig) -> dict:
+    """The original table is now the minister form; the backbone form is separate."""
+    return {name: config.tables[name] for name in HUMAN_EVALUATION_TABLES
+            if name in config.tables}
+
 
 def load_table_config(path: str | Path) -> TableConfig:
     config_path = Path(path)
     if not config_path.exists():
         raise ValueError(
             f"Feishu table configuration does not exist: {config_path}. "
-            "Create it with the table registry from "
-            "tests/test_existing_bitable_layout.py and fill in table IDs."
+            "Copy config/tables.example.toml and fill in table IDs."
         )
     with config_path.open("rb") as stream:
         config = TableConfig.model_validate(tomllib.load(stream))
@@ -92,8 +99,20 @@ def load_table_config(path: str | Path) -> TableConfig:
     )
     if empty_ids:
         raise ValueError(f"Feishu table IDs are empty: {', '.join(empty_ids)}")
-    for table_name in REQUIRED_TABLES:
-        required_fields = REQUIRED_FIELDS[table_name]
+    checked_tables = REQUIRED_TABLES | set(human_evaluation_tables(config))
+    for table_name in checked_tables:
+        if not config.tables[table_name].table_id.strip():
+            raise ValueError(f"Feishu table IDs are empty: {table_name}")
+        required_fields = REQUIRED_FIELDS.get(table_name, REQUIRED_FIELDS["human_evaluations"])
+        if table_name in HUMAN_EVALUATION_TABLES:
+            fields = config.tables[table_name].fields
+            if not any(fields.get(key, "").strip()
+                       for key in ("basic_name", "backbone_ref", "person_ref")):
+                raise ValueError(f"Feishu table {table_name} is missing review subject mapping")
+            if "human_evaluations_backbone" in config.tables:
+                subject = "basic_name" if table_name.endswith("_backbone") else "backbone_ref"
+                required_fields = required_fields | {subject, "evaluated_at",
+                    "positive_confirmed", "improvement_confirmed"}
         missing_fields = sorted(
             required_fields - set(config.tables[table_name].fields)
         )

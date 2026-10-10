@@ -16,6 +16,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from data.repositories import LogRepository, OrganizationCache
+from config.tables import human_evaluation_tables
 from data.store import utc_now
 from schema import (Organization, SubmissionStatus, TableConfig, WorkLog)
 from tool.bitable_fields import (SHANGHAI, alias_index, field_datetime,
@@ -181,7 +182,14 @@ class SnapshotRebuilder:
 
     def _read_human_rows(self, organization: Organization,
                          ai_rows: dict[tuple[date, str], dict]) -> dict[tuple[date, str], dict]:
-        table = self.tables.tables.get("human_evaluations")
+        rows: dict[tuple[date, str], dict] = {}
+        for table in human_evaluation_tables(self.tables).values():
+            for key, value in self._read_human_table(table, organization, ai_rows).items():
+                rows.setdefault(key, value)
+        return rows
+
+    def _read_human_table(self, table, organization: Organization,
+                          ai_rows: dict[tuple[date, str], dict]) -> dict[tuple[date, str], dict]:
         rows: dict[tuple[date, str], dict] = {}
         if table is None or not table.table_id.strip():
             return rows

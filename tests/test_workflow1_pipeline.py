@@ -286,7 +286,7 @@ class Workflow1PipelineTests(unittest.TestCase):
         edited_late = row(18, 0, last_modified_time=row(19)["fields"]["filled_at"])
         repo = HumanEvaluationRepository(Mock(), config, cutoff_at="19:00")
         repo.bitable.list_records.return_value = [on_time, at_cutoff, edited_late]
-        self.assertEqual(repo.for_date(snapshot), [on_time])
+        self.assertEqual(repo.for_date(snapshot), [{**on_time, "_table_id": "human"}])
         self.assertIsNotNone(repo.parse(snapshot, on_time))
         self.assertIsNone(repo.parse(snapshot, at_cutoff))
         self.assertIsNone(repo.parse(snapshot, edited_late))

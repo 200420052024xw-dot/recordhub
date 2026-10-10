@@ -102,15 +102,16 @@ def main() -> int:
     client = bitable.client
     existing_journal = (json.loads(journal_path.read_text(encoding="utf-8"))
                         if journal_path.exists() else None)
-    if existing_journal and "human_evaluations" in existing_journal["manifest"]["records"]:
-        records["human_evaluations"] = existing_journal["manifest"]["records"]["human_evaluations"]
-    elif args.include_human_evaluations:
-        table = tables["human_evaluations"]
-        field = table.fields["evaluated_at"]
-        records["human_evaluations"] = sorted(
-            str(row["record_id"]) for row in bitable.list_records(table.table_id)
-            if field_datetime(record_fields(row).get(field)).date() == args.date
-        )
+    for name in ("human_evaluations", "human_evaluations_backbone"):
+        if existing_journal and name in existing_journal["manifest"]["records"]:
+            records[name] = existing_journal["manifest"]["records"][name]
+        elif args.include_human_evaluations and name in tables:
+            table = tables[name]
+            field = table.fields["evaluated_at"]
+            records[name] = sorted(
+                str(row["record_id"]) for row in bitable.list_records(table.table_id)
+                if field_datetime(record_fields(row).get(field)).date() == args.date
+            )
 
     manifest = {"run_id": state["run"]["workflow_run_id"],
                 "records": records, "documents": documents}

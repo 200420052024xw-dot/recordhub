@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from collections.abc import Callable
 from typing import Any
 
@@ -155,7 +156,8 @@ def build_runtime(settings: AppSettings) -> Runtime:
         auto_advance_at=w1.auto_advance_at,
         confirmation_webhook_token=w1.confirmation_webhook_token,
         record_handlers={
-            human_evaluations.table.table_id: workflow.handle_human_record,
+            table.table_id: partial(workflow.handle_human_record, table_id=table.table_id)
+            for table in human_evaluations.tables.values()
         },
     )
     workflow2 = None

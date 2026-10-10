@@ -23,12 +23,14 @@ Workflow1 使用人员表、部门表、工作日志表、AI评价表、人工�
 
 在 `config/tables.toml` 中填写实际表 ID。归档父文件夹 Token 配在 `.env` 的 `RECORDHUB_ARCHIVE_PARENT_FOLDER_TOKEN`。云文档按 `YYYY-MM-DD / 部长_部门编号 / 骨干_人员编号` 归档，并在上级文档放置可点击的下级引用。
 
+人工评价分为两张表：`human_evaluations` 对应「人工评价表_部长」，按「被审核骨干：」读取；`human_evaluations_backbone` 对应「人工评价表_骨干」，按「被审核基层：」读取。定时核对、长连接事件及周期材料重建均读取两表，各自的自动评价编号可以重复。Webhook 的 `table_name` 使用对应配置键，`table_id` 必须匹配该表。旧版单表配置仍兼容。部署字段模板以 `config/tables.example.toml` 为准。
+
 ## 运行
 
 ```powershell
 Copy-Item .env.example .env
-# 手工创建 config/tables.toml：表集合与字段映射以
-# tests/test_existing_bitable_layout.py 的 _TABLE_REGISTRY_TOML 为唯一参照
+# 用当前模板创建 config/tables.toml，填写各表 ID
+Copy-Item config/tables.example.toml config/tables.toml
 .\.venv\Scripts\python.exe -m pip install --no-build-isolation -e .
 .\.venv\Scripts\python.exe main.py check-config
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
@@ -51,6 +53,6 @@ Copy-Item .env.example .env
 - `prompts/S04.txt` 至 `prompts/S09.txt`：各项周期分析的提示词；`prompts/S10.txt` 用于团队汇总，边界规则已写入每个提示词，详见 [Prompt 用途](prompts/README.md)。
 - `data/state/checked/workflow1/`：已完成的每日快照，供三天、周度和月度分析使用。
 
-个人 Skill 从飞书 Skill 表读取，字段为“使用人、角色、Skill内容、功能、审核结果、未通过原因”。系统每天 00:55 扫描“审核结果”为空的新记录，用固定案例检查输出 JSON 结构；通过后将该记录设为“通过”并把同一使用人、同一功能的旧版本设为“未使用”，未通过时写明原因并通知使用人。审核通过的 Prompt 缓存在 `data/state/skill_prompt_cache.json`；没有有效个人版本时使用 `prompts/` 中的内置版本。
+个人 Skill 从飞书 Skill 表读取，字段为“使用人、角色、自定义Skill、功能、审核结果、未通过原因”。系统每天 00:55 扫描“审核结果”为空的新记录，用固定案例检查输出 JSON 结构；通过后将该记录设为“通过”并把同一使用人、同一功能的旧版本设为“未使用”，未通过时写明原因并通知使用人。审核通过的 Prompt 缓存在 `data/state/skill_prompt_cache.json`；没有有效个人版本时使用 `prompts/` 中的内置版本。
 
 设置 `RECORDHUB_WORKFLOW2_ENABLED=true` 后启用自动调度。首次启用日期保存在 `data/state/workflow2_activation.toml`，重启不会重新计时；S04 的等待天数、运行时刻和间隔配置在 `config/schedules.toml`。服务启动时不补跑历史周期；S04 从启用后的第一个完整自然日开始收集，满 3 天后首次运行，此后每 3 天运行一次。周报在周一、月报在每月 1 日按原周期运行，有多少已完成且可用的材料就分析多少，并在结果中注明跳过的材料数量。关闭再开启 Workflow2 不会重置首次启用日期。

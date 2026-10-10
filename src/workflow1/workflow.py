@@ -469,18 +469,21 @@ class Workflow1:
                         "errors": [{"error": error_summary(exc), "stage": stage}]}
 
     def handle_confirmation(self, request: ConfirmationRequest) -> dict:
-        if request.table_name != "human_evaluations":
+        if request.table_name not in self.human_evaluations.tables:
             raise ValueError("Workflow1 仅处理人工评价表事件")
-        if request.table_id != self.human_evaluations.table.table_id:
+        if request.table_id != self.human_evaluations.tables[request.table_name].table_id:
             raise ValueError("人工评价表 ID 不匹配")
         target_date = date.fromisoformat(request.business_key.split(":", 1)[0])
         return self.handle_human_record(request.record_id, target_date=target_date,
-                                        expected_key=request.business_key)
+                                        expected_key=request.business_key,
+                                        table_id=request.table_id)
 
     def handle_human_record(self, record_id: str, *, target_date: date | None = None,
-                            expected_key: str | None = None) -> dict:
+                            expected_key: str | None = None,
+                            table_id: str | None = None) -> dict:
         with self._lock:
-            record = self.human_evaluations.load_record(record_id)
+            record = (self.human_evaluations.load_record(record_id, table_id=table_id)
+                      if table_id else self.human_evaluations.load_record(record_id))
             dates = ([target_date] if target_date else
                 [run.target_date for run in self.store.list_incomplete_workflows()])
             for one_date in dates:

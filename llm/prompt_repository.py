@@ -275,7 +275,7 @@ class PromptRepository:
             raise ValueError(f"未知功能：{function or '空'}")
         template = scalar(fields.get(f["template"])).strip()
         if not template:
-            raise ValueError("Skill内容不能为空")
+            raise ValueError(f"{f['template']}不能为空")
         return PromptEntry(
             user_id=user_id, skill_code=skill_code, function=function,
             template=template, record_id=record_id,

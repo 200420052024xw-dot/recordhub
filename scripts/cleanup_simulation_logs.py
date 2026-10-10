@@ -90,7 +90,7 @@ def main() -> int:
     }
 
     if args.hard_mode:
-        task_tables = ("evaluations", "human_evaluations", "stage_analysis",
+        task_tables = ("evaluations", "human_evaluations", "human_evaluations_backbone", "stage_analysis",
                        "stage_confirmation", "stage_report",
                        "monthly_department_analysis",
                        "monthly_department_confirmation",

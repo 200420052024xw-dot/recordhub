@@ -6,6 +6,7 @@ from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 
 from data.store import FileStateStore
+from config.tables import human_evaluation_tables
 from tool.bitable_fields import (
     SHANGHAI,
     record_fields,
@@ -236,13 +237,24 @@ class HumanEvaluationRepository:
                  cutoff_at: str = "19:00") -> None:
         self.bitable = bitable
         self.table = config.tables["human_evaluations"]
+        self.tables = human_evaluation_tables(config)
+        self.tables_by_id = {table.table_id: table for table in self.tables.values()}
         self.cutoff_at = cutoff_at
 
-    def load_record(self, record_id: str) -> dict:
-        return self.bitable.get_record(self.table.table_id, record_id)
+    def load_record(self, record_id: str, *, table_id: str | None = None) -> dict:
+        table_id = table_id or self.table.table_id
+        if table_id not in self.tables_by_id:
+            raise ValueError("人工评价表 ID 不匹配")
+        return {**self.bitable.get_record(table_id, record_id), "_table_id": table_id}
+
+    def _record_table(self, record: dict):
+        table_id = record.get("_table_id", self.table.table_id)
+        if table_id not in self.tables_by_id:
+            raise ValueError("人工评价表 ID 不匹配")
+        return self.tables_by_id[table_id]
 
     def _within_window(self, snapshot: DailySnapshot, record: dict) -> bool:
-        field = self.table.fields.get("evaluated_at")
+        field = self._record_table(record).fields.get("evaluated_at")
         if not field:
             return True
         submitted = record_submission_time(record, field)
@@ -260,12 +272,14 @@ class HumanEvaluationRepository:
         return start <= submitted < end
 
     def for_date(self, snapshot: DailySnapshot) -> list[dict]:
-        records = self.bitable.list_records(self.table.table_id)
+        records = [{**record, "_table_id": table.table_id}
+                   for table in self.tables.values()
+                   for record in self.bitable.list_records(table.table_id)]
         return [record for record in records if self._within_window(snapshot, record)]
 
     def parse(self, snapshot: DailySnapshot,
               record: dict) -> tuple[str, FinalEvaluation] | None:
-        f = self.table.fields
+        f = self._record_table(record).fields
         if not self._within_window(snapshot, record):
             return None
         values = record_fields(record)

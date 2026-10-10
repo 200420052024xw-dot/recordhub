@@ -93,7 +93,7 @@ class DailySnapshot(StrictModel):
 
 
 class ConfirmationRequest(StrictModel):
-    table_name: Literal["human_evaluations"]
+    table_name: Literal["human_evaluations", "human_evaluations_backbone"]
     table_id: str
     record_id: str
     business_key: str

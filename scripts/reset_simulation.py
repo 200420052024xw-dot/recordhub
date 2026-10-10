@@ -29,7 +29,7 @@ ARCHIVE_FOLDER_NAMES = [
 
 OUTPUT_TABLES = [
     "persons", "departments", "logs",
-    "evaluations", "human_evaluations", "reports", "check_details",
+    "evaluations", "human_evaluations", "human_evaluations_backbone", "reports", "check_details",
     "stage_analysis", "stage_confirmation", "stage_report",
     "monthly_department_analysis", "monthly_department_confirmation",
     "monthly_department_report", "team_analysis",
