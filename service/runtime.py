@@ -18,6 +18,7 @@ from workflow1.documents import DailyDocuments
 from workflow1.evaluations import AiEvaluationRepository, HumanEvaluationRepository
 from workflow1.models import DailySnapshot
 from workflow1.reports import WorkflowReportRepository
+from workflow1.submission_statistics import SubmissionStatisticsRepository
 from workflow1.settings import LogSubmitSettings, W1Settings
 from workflow1.workbuddy_inbox import LogSubmitService, WorkBuddyInbox
 from workflow1.workflow import Workflow1
@@ -140,6 +141,7 @@ def build_runtime(settings: AppSettings) -> Runtime:
         documents=DailyDocuments(infrastructure.cloud_docs, store,
                                  settings.archive_parent_folder_token),
         reports=WorkflowReportRepository(infrastructure.bitable, tables, store),
+        statistics=SubmissionStatisticsRepository(infrastructure.bitable, tables, store),
         llm_concurrency=settings.llm_concurrency,
         llm_retry_interval_minutes=settings.llm_retry_interval_minutes,
         llm_retry_limit=settings.llm_retry_limit,

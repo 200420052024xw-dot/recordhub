@@ -14,7 +14,7 @@ from data import FileStateStore, utc_now
 from data.repositories import LogRepository, OrganizationCache
 from workflow1.snapshot import SnapshotBuilder
 from llm import LLMError, PromptRepository, PromptService
-from schema import WorkflowRun
+from schema import WorkLog, WorkflowRun
 from workflow1.models import ConfirmationRequest, DailySnapshot, LogPromptInput, LogPromptOutput, UnitStatus, WorkflowStatus
 from workflow1.workbuddy_inbox import LogSubmitService
 from tool.feishu import MessageService
@@ -26,6 +26,7 @@ from workflow1.documents import DailyDocuments
 from workflow1.evaluations import (AiEvaluationRepository, HumanEvaluationRepository,
                                    review_day_datetime)
 from workflow1.reports import WorkflowReportRepository
+from workflow1.submission_statistics import SubmissionStatisticsRepository
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,7 @@ class Workflow1:
                  messages: MessageService,
                  documents: DailyDocuments,
                  reports: WorkflowReportRepository,
+                 statistics: SubmissionStatisticsRepository | None = None,
                  prompt_repository: PromptRepository | None = None,
                  workbuddy: LogSubmitService | None = None,
                  llm_concurrency: int = 3,
@@ -100,6 +102,7 @@ class Workflow1:
         self.messages = messages
         self.documents = documents
         self.reports = reports
+        self.statistics = statistics
         self.llm_concurrency = llm_concurrency
         self.llm_retry_delay = timedelta(minutes=llm_retry_interval_minutes)
         self.llm_retry_limit = llm_retry_limit
@@ -143,8 +146,51 @@ class Workflow1:
         return issues
 
     @workflow_diagnostics("workflow1")
+    def refresh_submission_statistics(self, target_date: date) -> dict:
+        """Read source logs and publish counts without evaluating or reporting.
+
+        Share the daily lock so reading the inbox cannot race daily startup.
+        A historical snapshot supplies its original roster, but is not required.
+        """
+        with self._lock:
+            if self.statistics is None:
+                return {"target_date": str(target_date), "status": "disabled",
+                        "expected": 0, "written": 0, "issues": {}}
+            try:
+                snapshot = self.store.load_check_snapshot(target_date)
+                organization = snapshot.organization if snapshot else self.organization_cache.get()
+                logs, read_issues = self.log_repository.get_logs_by_date(
+                    target_date, organization=organization)
+                if self.workbuddy is not None:
+                    # Pending submissions are real submissions too. Counting
+                    # them does not flush files or start an evaluation workflow.
+                    logs = list(logs) + [WorkLog(log_id=item.submission_id,
+                        person_id=item.person_id, submitted_at=item.submitted_at,
+                        progress=item.progress, difficulties=item.difficulties,
+                        reflection=item.reflection, other=item.other)
+                        for item in self.workbuddy.inbox.pending(target_date).values()]
+                result = self.statistics.publish(target_date, organization, logs)
+                # Superseded submissions are expected under the last-one-wins rule.
+                result["issues"].update({key: reason for key, reason in read_issues.items()
+                                         if not key.endswith(":superseded")})
+                if result["issues"]:
+                    result["status"] = "partial"
+                for key, reason in result["issues"].items():
+                    logger.error("submission_statistics_issue date=%s key=%s reason=%s",
+                                 target_date, key, reason)
+                logger.info("submission_statistics_finished date=%s expected=%s written=%s status=%s",
+                            target_date, result["expected"], result["written"], result["status"])
+                return result
+            except Exception as exc:
+                logger.exception("submission_statistics_failed date=%s", target_date)
+                return {"target_date": str(target_date), "status": "failed",
+                        "expected": 0, "written": 0, "issues": {"statistics:failed": error_summary(exc)}}
+
+    @workflow_diagnostics("workflow1")
     def start(self, target_date: date) -> WorkflowRun:
         with self._lock:
+            # Statistics neither wait for nor change evaluation/report status.
+            self.refresh_submission_statistics(target_date)
             run = self.store.get_or_create_workflow(target_date)
             if run.status == WorkflowStatus.COMPLETED:
                 logger.debug("workflow1_already_completed date=%s", target_date)
@@ -652,9 +698,6 @@ class Workflow1:
             target_date,
             on_issue=lambda key, reason: self._record_issue(target_date, key, reason))
         report_issues = self.reports.publish(snapshot, objects)
-        detail_issues = self.reports.publish_details(snapshot, objects)
-        if isinstance(detail_issues, dict):
-            report_issues.update(detail_issues)
         for key, reason in report_issues.items():
             self._record_issue(target_date, key, reason)
         self.notify_documents_if_due(target_date, snapshot=snapshot, objects=objects)

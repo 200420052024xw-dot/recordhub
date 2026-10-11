@@ -169,7 +169,8 @@ class SkillInput(TextModel):
 
 class ProgressItem(TextModel):
     work_item: str = Field(min_length=1)
-    participant_ids: list[str] = Field(min_length=1)
+    # S04 的输入只有姓名，没有人员编号，所以参与者按姓名引用（见 S04Skill.prompt_payload）。
+    participant_names: list[str] = Field(min_length=1)
     current_progress: str = Field(min_length=1)
     main_difficulties: str = ""
 
@@ -272,6 +273,10 @@ class TextSkill(Generic[OutputT]):
     def validate_input(self, data: SkillInput) -> None:
         """Specialized Skills may add structural constraints, never filtering."""
 
+    def prompt_payload(self, data: SkillInput) -> StrictModel | str:
+        """默认发材料 JSON；只汇总日志原文的 Skill（S04）改发纯文本。"""
+        return data
+
     def validate_output(self, output: OutputT, data: SkillInput) -> None:
         """Anchor conclusions to the people and departments actually supplied."""
         records = [record for record in data.records if record.submitted]
@@ -341,6 +346,11 @@ class TextSkill(Generic[OutputT]):
             f"- 成果出处编号 achievement_refs：{', '.join(achievement_ids) or '无'}\n"
             f"- 资源编号 resource_id：{', '.join(resource_ids) or '无'}"
         )
+        if self.code == SkillCode.S04:
+            id_hint = (
+                "\n\nparticipant_names 只能取输入中出现过的姓名，原样引用，不得编造。"
+            )
+        payload = self.prompt_payload(payload)
         builtin_template = (Path('prompts') / f'{self.code.value}.txt').read_text(
             encoding='utf-8').strip()
         template = (selected.template if selected else builtin_template) + id_hint
@@ -370,11 +380,44 @@ class TextSkill(Generic[OutputT]):
 # --- Skill definitions ---
 
 # S04: extract stage progress and difficulties from prepared check text.
+def _s04_material(data: SkillInput) -> str:
+    """S04 的输入是一段纯文本：日期 → 姓名 → 段落，靠缩进分三层，没填的段落不出现。
+
+    只用姓名：阶段汇总读的是工作内容，编号对模型只是噪声。
+    日志是整篇原文（没有分段）时给一行“完整日志:”，由模型自己分辨进展和困难。
+    """
+    blocks: list[str] = []
+    for day in sorted({record.work_start for record in data.records}):
+        lines = [f"{day:%m-%d}:"]
+        for record in (item for item in data.records if item.work_start == day):
+            lines.append(f"  {record.name}:")
+            sections = (("进展", record.progress), ("困难", record.difficulties),
+                        ("心得", record.reflection), ("其他", record.other))
+            filled = [(label, text.strip()) for label, text in sections if text.strip()]
+            lines.extend(f"    {label}: {text}" for label, text in filled)
+            if not filled:
+                lines.append(f"    完整日志: {record.full_log.strip()}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
 class S04Skill(TextSkill[ProgressOutput]):
     code = SkillCode.S04
     output_model = ProgressOutput
     # 只汇总日志原文，材料里不含评价，所以不等评价定稿（见 MaterialPreparer.with_evaluations）。
     requires_confirmed = False
+
+    def prompt_payload(self, data: SkillInput) -> str:
+        return _s04_material(data)
+
+    def validate_output(self, output: ProgressOutput, data: SkillInput) -> None:
+        super().validate_output(output, data)
+        names = {record.name for record in data.records if record.submitted}
+        for item in output.items:
+            if len(set(item.participant_names)) != len(item.participant_names):
+                raise ValueError("participant_names 重复")
+            if not set(item.participant_names) <= names:
+                raise ValueError("participant_names 不在本次材料人员名单内")
 
 # S05: evidence-backed personnel suggestions, never personnel mutations.
 class S05Skill(TextSkill[PersonnelOutput]):

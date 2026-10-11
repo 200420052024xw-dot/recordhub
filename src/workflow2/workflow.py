@@ -83,9 +83,10 @@ FIELD_LABELS = {
 }
 
 # 已解析成姓名/部门名展示的编号字段，不再重复出现在“具体内容”里。
+# participant_names 本身就是姓名（S04 输入不含编号），直接进“涉及人员”。
 _ID_FIELDS = {
     "person_id", "proposer_id", "participant_ids", "contributor_ids",
-    "target_person_ids", "department_ids",
+    "target_person_ids", "department_ids", "participant_names",
 }
 
 
@@ -121,6 +122,11 @@ def _item_text(item: dict, code: str, organization: Organization,
         seen.add(pid)
         person = people.get(pid)
         names.append(person.name if person else str(pid))
+    for name in item.get("participant_names") or []:
+        if name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
 
     dept_ids = list(department_ids or item.get("department_ids") or [])
     dept_names: list[str] = []
@@ -513,6 +519,9 @@ class Workflow2:
         person = organization.person_map()[draft.minister_id]
         task_id = f"{run.run_id}:{draft.department_id}"
         matches = []
+        legacy_matches = []
+        shared_minister = sum(item.minister_id == draft.minister_id
+                              for item in run.departments.values()) > 1
         for row in self.tables.bitable.list_records(table.table_id):
             values = record_fields(row)
             supplied_id = scalar(values.get(f["task_id"]))
@@ -523,15 +532,22 @@ class Workflow2:
             author_key = "submitted_by" if run.kind == "stage" else "minister_ref"
             if not identities.intersection(references(values.get(f[author_key]))):
                 continue
+            if supplied_id == task_id:
+                matches.append(row)
+                continue
+            # Without a task ID the minister alone cannot identify a department.
+            if shared_minister:
+                continue
             try:
                 recorded_day = field_datetime(values.get(f["analysis_date"])).astimezone(SHANGHAI).date()
             except ValueError:
                 continue
             # The form date is the day the minister submits it. A confirmation
             # may arrive on the next day before the configured cutoff.
-            if (supplied_id == task_id or
-                    run.scheduled_date <= recorded_day <= self._cutoff(run).date()):
-                matches.append(row)
+            if run.scheduled_date <= recorded_day <= self._cutoff(run).date():
+                legacy_matches.append(row)
+        # An explicit task ID takes precedence over nearby unassigned forms.
+        matches = matches or legacy_matches
         if len(matches) > 1:
             raise ValueError(f"部长 {draft.minister_id} 的周期确认记录重复")
         late = utc_now().astimezone(SHANGHAI) >= self._cutoff(run)

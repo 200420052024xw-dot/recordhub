@@ -23,6 +23,16 @@ Workflow1 使用人员表、部门表、工作日志表、AI评价表、人工�
 
 在 `config/tables.toml` 中填写实际表 ID。归档父文件夹 Token 配在 `.env` 的 `RECORDHUB_ARCHIVE_PARENT_FOLDER_TOKEN`。云文档按 `YYYY-MM-DD / 部长_部门编号 / 骨干_人员编号` 归档，并在上级文档放置可点击的下级引用。
 
+「提交详情表」独立统计日志提交人数，不等待 AI 评价、人工确认或报告生成。每天启动时先按完整有效名单写入骨干的小组统计、部长的部门统计和负责人的团队统计；没有提交的人员也计入未交人数，同一人多条日志只计一人。统计也读取对话入口尚未写入飞书的当日暂存，但不清除暂存。基层学生包含在人数中，不各建一行。缺少负责人的 OpenID、部门配置不完整或单行写入失败时，返回具体姓名和原因，继续写其余行，并报告应写和成功行数。默认 02:25、03:25、04:25 独立重试，日报已完成也可补齐统计。
+
+单独补跑某个业务日期的统计（不会运行评价、报告或发送业务消息）：
+
+```powershell
+.venv\Scripts\python.exe main.py refresh-submission-statistics --date 2026-10-08
+```
+
+HTTP 入口为 `POST /admin/submission-statistics/2026-10-08`，使用管理员 Bearer Token。结果 `complete` 表示全部成功，`partial` 表示存在缺项，`failed` 表示读取或整体处理失败；不会把读取失败误记为全员未交。统计行按业务日期和统计范围保存记录对应关系，存放于 `data/state/submission_statistics/YYYY-MM-DD.json`，不随日报快照清理。已有日报中的统计记录对应关系会自动沿用；无对应关系的历史行不会按姓名和相近日期猜测认领。清理提交详情表后，应同步清理其对应日期的统计状态。
+
 人工评价分为两张表：`human_evaluations` 对应「人工评价表_部长」，按「被审核骨干：」读取；`human_evaluations_backbone` 对应「人工评价表_骨干」，按「被审核基层：」读取。定时核对、长连接事件及周期材料重建均读取两表，各自的自动评价编号可以重复。Webhook 的 `table_name` 使用对应配置键，`table_id` 必须匹配该表。旧版单表配置仍兼容。部署字段模板以 `config/tables.example.toml` 为准。
 
 ## 运行

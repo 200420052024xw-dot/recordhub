@@ -57,14 +57,54 @@ class Workflow2ComponentTests(unittest.TestCase):
                 self.assertIn((ROOT / "prompts" / f"{code.value}.txt")
                               .read_text(encoding="utf-8").strip(), template)
 
-    def test_skill_rejects_unknown_participant(self):
+    def test_s04_rejects_unknown_participant_name(self):
         client = Mock()
         client.complete_json.side_effect = lambda messages, validator: validator({"items": [{
-            "work_item": "工作", "participant_ids": ["ghost"],
+            "work_item": "工作", "participant_names": ["查无此人"],
             "current_progress": "完成"}]})
         with self.assertRaises(LLMError):
             SkillRunner(PromptService(client, max_attempts=1)).run(
                 "S04", self.material(), user_id="D")
+
+    def test_s04_prompt_sends_indented_plain_text_material(self):
+        material = self.material()
+        record = material.records[0]
+        record.department_name = "研发部"
+        record.difficulties = "接口格式不一致"
+        record.reflection = "先核对接口"
+        record.other = "明天联调"
+        record.full_log = "重复的完整日志，不应再次发送"
+        client = Mock()
+        client.complete_json.side_effect = lambda messages, validator: validator({"items": []})
+        SkillRunner(PromptService(client, max_attempts=1)).run("S04", material, user_id="D")
+        messages = client.complete_json.call_args.args[0]
+        self.assertEqual(messages[1]["content"], "\n".join([
+            f"{DAY:%m-%d}:",
+            "  成员:",
+            "    进展: 完成检查",
+            "    困难: 接口格式不一致",
+            "    心得: 先核对接口",
+            "    其他: 明天联调",
+        ]))
+        # 材料只有日志原文：不带编号、不带部门、不重复整篇日志。
+        self.assertNotIn("重复的完整日志", messages[1]["content"])
+        self.assertNotIn("研发部", messages[1]["content"])
+        self.assertNotIn("资源编号 resource_id", messages[0]["content"])
+        self.assertEqual(material.records[0].record_id, "rec1")
+
+    def test_s04_plain_text_material_keeps_full_text_only_logs(self):
+        material = self.material()
+        material.records[0].progress = ""
+        material.records[0].full_log = "整篇原文，必须完整保留"
+        prompts = Mock()
+        prompts.resolve.return_value = SimpleNamespace(template="个人规则", record_id="personal")
+        service = Mock()
+        from workflow2.skills import ProgressOutput
+        service.execute.side_effect = [LLMError("个人规则失败"), ProgressOutput(items=[])]
+        SkillRunner(service, prompts).run("S04", material, user_id="D")
+        expected = f"{DAY:%m-%d}:\n  成员:\n    完整日志: 整篇原文，必须完整保留"
+        for call in service.execute.call_args_list:
+            self.assertEqual(call.kwargs["input_data"], expected)
 
     def test_only_finalized_evaluation_reaches_material(self):
         prepared = MaterialPreparer(self.daily).prepare(

@@ -203,16 +203,19 @@ class SnapshotRebuilder:
             submitted_at = record_submission_time(record, f.get("evaluated_at", ""))
             if submitted_at is None:
                 continue
+            name = scalar(values.get(f.get("basic_name", ""))).strip()
+            if name and resolve_reference(values.get(f.get("backbone_ref", "")), people):
+                continue
+            person_id = (basic_names.get(name, "") if name else
+                         resolve_reference(values.get(
+                             f.get("backbone_ref") or f.get("person_ref", "")), people))
+            author_id = resolve_reference(values.get(f["submitted_by"]), people)
+            original = scalar(values.get(f.get("source_log", ""))).strip()
             parts = self._eval_key(scalar(values.get(f["evaluation_id"])))
             if parts is None:
-                name = scalar(values.get(f.get("basic_name", ""))).strip()
-                if name and resolve_reference(values.get(f.get("backbone_ref", "")), people):
+                if ":EVAL:" in scalar(values.get(f["evaluation_id"])):
                     continue
-                person_id = (basic_names.get(name, "") if name else
-                             resolve_reference(values.get(
-                                 f.get("backbone_ref") or f.get("person_ref", "")), people))
-                evaluator_id = resolve_reference(values.get(f["submitted_by"]), people)
-                original = scalar(values.get(f.get("source_log", ""))).strip()
+                evaluator_id = author_id
                 candidates = [(day, log_id) for (day, log_id), ai in ai_rows.items()
                               if ai["person_id"] == person_id
                               and ai["evaluator_id"] == evaluator_id
@@ -223,6 +226,16 @@ class SnapshotRebuilder:
                 day, log_id = candidates[0]
             else:
                 day, evaluator_id, log_id = parts
+            # A copied business key does not establish who submitted the form.
+            # Check the same identities and source as the live daily workflow.
+            ai = ai_rows.get((day, log_id))
+            if (ai is None or ai["person_id"] != person_id
+                    or ai["evaluator_id"] != evaluator_id or author_id != evaluator_id
+                    or (original and ai["source_log"].strip() != original)):
+                continue
+            reviewer = resolve_reference(values.get(f.get("evaluator_ref", "")), people)
+            if reviewer and reviewer != evaluator_id:
+                continue
             if not self._human_within_window(day, submitted_at):
                 continue
             positive = self._final_text(values, f, "positive_confirmed", "positive_final")

@@ -267,6 +267,8 @@ def _build_workflow1(folder: str, settings: AppSettings,
                                        cutoff_at=w1.auto_advance_at)
     reports = WorkflowReportRepository(runtime.infrastructure.bitable,
                                         table_cfg, store)
+    from workflow1.submission_statistics import SubmissionStatisticsRepository
+    statistics = SubmissionStatisticsRepository(runtime.infrastructure.bitable, table_cfg, store)
     docs = DailyDocuments(runtime.infrastructure.cloud_docs, store,
                           settings.archive_parent_folder_token)
     messages = DemoMessages(runtime.infrastructure.messages)
@@ -283,6 +285,7 @@ def _build_workflow1(folder: str, settings: AppSettings,
         messages=messages,
         documents=docs,
         reports=reports,
+        statistics=statistics,
         llm_concurrency=settings.llm_concurrency,
         auto_advance_at=w1.auto_advance_at,
         notify_at=w1.notify_at,

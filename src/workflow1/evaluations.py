@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 
 from data.store import FileStateStore
@@ -80,7 +79,7 @@ class AiEvaluationRepository:
         existing = self.bitable.list_records(self.table.table_id)
         existing_by_id = {str(record.get("record_id", "")): record for record in existing}
         by_evaluation: dict[str, tuple[str, str]] = {}
-        source_rows: dict[str, list[dict]] = defaultdict(list)
+        duplicate_keys: set[str] = set()
         evaluated_at = review_day_timestamp(snapshot.target_date)
         for record in existing:
             fields = record_fields(record)
@@ -90,10 +89,9 @@ class AiEvaluationRepository:
             if record_id and business_id:
                 if business_field and not evaluation_id:
                     raise ValueError(f"AI 评价记录 {record_id} 缺少自动评价编号")
+                if business_id in by_evaluation:
+                    duplicate_keys.add(business_id)
                 by_evaluation[business_id] = (record_id, evaluation_id)
-            source = scalar(fields.get(f["source_log"]))
-            if source:
-                source_rows[source].append(record)
         mapped: dict[str, tuple[str, str]] = {}
         # log_id is None for marker rows, which need no local mapping.
         creates: list[tuple[str | None, dict]] = []
@@ -127,6 +125,8 @@ class AiEvaluationRepository:
                 continue
             key = evaluation_key(
                 snapshot.target_date, state.evaluator_id, state.log_id)
+            if key in duplicate_keys:
+                raise ValueError(f"AI 评价业务编号 {key} 存在重复记录")
             hit = by_evaluation.get(key)
             if hit is not None:
                 current = record_fields(existing_by_id[hit[0]])
@@ -140,36 +140,8 @@ class AiEvaluationRepository:
                     self.bitable.update_record(self.table.table_id, hit[0], updates)
                 mapped[state.log_id] = hit
                 continue
-            matches = []
-            candidates = source_rows.get(log.source_record_id, []) + source_rows.get(log.content(), [])
-            for record in candidates:
-                prior = record_fields(record)
-                same_person = (scalar(prior.get(f["person_name"])).strip() == person.name
-                               or person.open_id in references(prior.get(f["person_ref"]))
-                               if person.role == "基层学生" and f.get("person_name")
-                               else person.open_id in references(prior.get(f["person_ref"])))
-                if not same_person:
-                    raise ValueError(f"AI 评价表中日志 {log.log_id} 已有关联但人员不匹配")
-                matches.append(record)
-            if len(matches) > 1:
-                raise ValueError(f"AI 评价表中日志 {log.log_id} 存在重复记录")
-            if matches:
-                record = matches[0]
-                record_id = str(record.get("record_id", ""))
-                evaluation_id = scalar(record_fields(record).get(f["evaluation_id"]))
-                if not record_id or not evaluation_id:
-                    raise ValueError(f"AI 评价表中日志 {log.log_id} 缺少评价编号")
-                current = record_fields(record)
-                updates = {}
-                if scalar(current.get(f["source_log"])) != log.content():
-                    updates[f["source_log"]] = log.content()
-                if person.role == "基层学生" and f.get("person_name") and (
-                        scalar(current.get(f["person_name"])).strip() != person.name):
-                    updates[f["person_name"]] = person.name
-                if updates:
-                    self.bitable.update_record(self.table.table_id, record_id, updates)
-                mapped[state.log_id] = (record_id, evaluation_id)
-                continue
+            # Equal log text does not identify a submission, day, or evaluator.
+            # Only a saved record ID or the full business key can reclaim a row.
             identity = ({f["person_name"]: person.name}
                         if person.role == "基层学生" and f.get("person_name")
                         else {f["person_ref"]: [{"id": person.open_id}]})
@@ -187,6 +159,8 @@ class AiEvaluationRepository:
                 continue
             person = people[person_id]
             key = f"{target}:MISSING:{person_id}"
+            if key in duplicate_keys:
+                raise ValueError(f"AI 评价业务编号 {key} 存在重复记录")
             if key in by_evaluation:
                 hit = by_evaluation[key]
                 if person.role == "基层学生" and f.get("person_name") and (
@@ -289,12 +263,19 @@ class HumanEvaluationRepository:
         matches = [state for state in snapshot.log_evaluations.values()
                    if state.evaluation_id == evaluation_id]
         if not matches:
+            # Explicit business keys must never fall back to a different log.
+            if ":EVAL:" in evaluation_id:
+                return None
             people = snapshot.organization.person_map()
             authors = set(references(values.get(f["submitted_by"])))
+            original = scalar(values.get(f.get("source_log", ""))).strip()
+            logs = {log.log_id: log for log in snapshot.logs}
             matches = [state for state in snapshot.log_evaluations.values()
                        if state.evaluator_id
                        and self._matches_person(values, f, people[state.person_id])
-                       and people[state.evaluator_id].open_id in authors]
+                       and people[state.evaluator_id].open_id in authors
+                       and (not original or (state.log_id in logs
+                            and logs[state.log_id].content().strip() == original))]
             if not matches:
                 return None
         if len(matches) != 1:

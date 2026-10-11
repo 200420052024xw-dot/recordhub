@@ -52,6 +52,21 @@ class ServiceRegistryTests(unittest.TestCase):
         self.assertIn("/admin/workflows/daily/{target_date}", paths)
         self.assertIn("/admin/organization/persons", paths)
         self.assertIn("/admin/workflow2/retry", paths)
+        self.assertIn("/admin/submission-statistics/{target_date}", paths)
+
+    def test_statistics_endpoint_is_independent_and_requires_admin_token(self) -> None:
+        from fastapi.testclient import TestClient
+        daily = binding("workflow1_daily", "human")
+        daily.workflow.refresh_submission_statistics.return_value = {"status": "complete", "written": 3}
+        runtime = Runtime(settings=self.settings, infrastructure=Mock(), organization_cache=Mock(),
+                          workflows={daily.name: daily})
+        client = TestClient(create_app(self.settings, runtime))
+        path = "/admin/submission-statistics/2026-10-08"
+        self.assertEqual(client.post(path).status_code, 401)
+        response = client.post(path, headers={"Authorization": "Bearer admin-token"})
+        self.assertEqual(response.json(), {"status": "complete", "written": 3})
+        daily.workflow.start.assert_not_called()
+        daily.workflow.resume.assert_not_called()
 
     def test_admin_retry_endpoint_needs_the_admin_token(self) -> None:
         from fastapi.testclient import TestClient
@@ -102,6 +117,7 @@ class ServiceRegistryTests(unittest.TestCase):
 
         workflow = Workflow1.__new__(Workflow1)
         workflow.retry_failed_evaluations = Mock()
+        workflow.refresh_submission_statistics = Mock()
         daily = WorkflowBinding(
             name="workflow1_daily", workflow=workflow, store=Mock(),
             auto_advance_at="", confirmation_webhook_token="token",
@@ -119,6 +135,11 @@ class ServiceRegistryTests(unittest.TestCase):
 
         jobs = {job.id: job for job in scheduler.get_jobs()}
         self.assertIn("workflow1_daily_evaluation_retry", jobs)
+        self.assertIn("workflow1_daily_statistics_retry", jobs)
+        self.assertIn("hour='2,3,4'", str(jobs["workflow1_daily_statistics_retry"].trigger))
+        jobs["workflow1_daily_statistics_retry"].func()
+        workflow.refresh_submission_statistics.assert_called_once()
+        daily.store.list_incomplete_workflows.assert_not_called()
         # 01:00 起跑 → 02:20 / 03:20 重试没跑完的当天，04:20 是最后一轮（标人工补评）
         self.assertIn("hour='2,3'", str(jobs["workflow1_daily_incomplete_retry"].trigger))
         self.assertIn("hour='4'", str(jobs["workflow1_daily_incomplete_retry_final"].trigger))

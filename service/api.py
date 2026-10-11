@@ -121,6 +121,10 @@ def _register_routes(app: FastAPI, runtime: Runtime, settings: AppSettings) -> N
     def run_workflow(target_date: date) -> dict:
         return workflow1.workflow.start(target_date).model_dump(mode="json")
 
+    @app.post("/admin/submission-statistics/{target_date}", dependencies=[Depends(require_admin)])
+    def refresh_submission_statistics(target_date: date) -> dict:
+        return workflow1.workflow.refresh_submission_statistics(target_date)
+
     @app.post(
         "/admin/workflows/{target_date}/resume", dependencies=[Depends(require_admin)]
     )
@@ -462,6 +466,22 @@ def _build_scheduler(
             )
 
         if isinstance(binding.workflow, Workflow1):
+            # Independently repair counts even if the daily report completed or
+            # failed. Never use incomplete-workflow status as the eligibility gate.
+            if schedule.enabled:
+                def refresh_statistics(one: WorkflowBinding = binding,
+                                       daily: WorkflowSchedule = schedule) -> None:
+                    today = datetime.now(ZoneInfo(schedules.timezone)).date()
+                    days_ago = int(daily.options.get("material_days_ago", 1))
+                    one.workflow.refresh_submission_statistics(today - timedelta(days=days_ago))
+
+                start_hour = int(schedule.time.split(":", 1)[0])
+                scheduler.add_job(
+                    refresh_statistics, "cron", hour=",".join(str((start_hour + n) % 24)
+                                                             for n in (1, 2, 3)), minute=25,
+                    id=f"{name}_statistics_retry", replace_existing=True,
+                    max_instances=1, coalesce=True,
+                )
             # 接口/网络失败的日志评价按 RECORDHUB_LLM_RETRY_INTERVAL_MINUTES 延后重试；
             # 每 10 分钟看一眼有没有到点的，到了才重跑，避免整天没有评价。
             def retry_failed_evaluations(one: WorkflowBinding = binding) -> None:

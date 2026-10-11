@@ -48,7 +48,7 @@ class _S01Output(_AuditModel):
 
 class _S04Item(_AuditModel):
     work_item: str
-    participant_ids: list[str]
+    participant_names: list[str]
     current_progress: str
     main_difficulties: str
 
@@ -114,11 +114,20 @@ AUDIT_OUTPUTS: dict[str, type[BaseModel]] = {
 }
 
 
-class _AuditInput(RootModel[dict[str, Any]]):
+class _AuditInput(RootModel[dict[str, Any] | str]):
     pass
 
 
 def _audit_input(code: str) -> _AuditInput:
+    if code == "S04":
+        # S04 的材料是纯文本，审核也要照真实格式喂，否则测的不是同一个输入。
+        return _AuditInput(
+            "01-01:\n"
+            "  测试学生:\n"
+            "    进展: 完成一个可复用的日志检查工具并验证有效。\n"
+            "    困难: 团队多人遇到相同的接口超时问题。\n"
+            "    心得: 建议整理公共技术文档并组织一次培训。\n"
+            "    其他: 提出自动汇总日志的 idea，希望在例会上继续讨论。")
     if code == "S01":
         return _AuditInput({
             "target_date": "2026-01-01",

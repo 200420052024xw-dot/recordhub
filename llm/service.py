@@ -65,6 +65,12 @@ def _repair_note(exc: Exception, output_model: type[BaseModel]) -> str:
     )
 
 
+def _material_message(input_data: BaseModel | str) -> str:
+    """纯文本材料（S04 的阶段日志）原样发送，结构化材料序列化成 JSON。"""
+    payload = input_data if isinstance(input_data, str) else input_data.model_dump(mode="json")
+    return payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+
+
 class PromptService:
     def __init__(self, client: DeepSeekClient, *, max_attempts: int = 3) -> None:
         self.client = client
@@ -72,7 +78,7 @@ class PromptService:
 
     def execute(
         self, *, prompt_code: str, template: str,
-        input_data: BaseModel, output_model: type[T],
+        input_data: BaseModel | str, output_model: type[T],
         semantic_validator: Callable[[T], None] | None = None,
         retry_feedback: bool = True,
     ) -> T:
@@ -85,8 +91,7 @@ class PromptService:
                 "输出必须符合以下 JSON Schema：\n"
                 + json.dumps(output_model.model_json_schema(), ensure_ascii=False)
             )},
-            {"role": "user", "content": json.dumps(
-                input_data.model_dump(mode="json"), ensure_ascii=False)},
+            {"role": "user", "content": _material_message(input_data)},
         ]
         last_error: Exception | None = None
         raw_output: str | None = None

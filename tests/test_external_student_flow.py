@@ -198,6 +198,22 @@ class ExternalStudentFlowTests(unittest.TestCase):
             {"被审核基层：": "骨干"},
             self.config.tables["human_evaluations"].fields, backbone))
 
+    def test_rebuilder_checks_identity_even_when_human_business_key_is_exact(self):
+        ai_rows = {(DAY, "L1"): {"person_id": "S", "evaluator_id": "B", "source_log": "原文"}}
+        fields = {"评价编号": f"{DAY}:EVAL:B:L1", "被审核基层：": "基层",
+                  "填写人": [{"id": "ou_b"}], "日志原文": "原文",
+                  "评价时间": "2026-10-05T09:00:00+08:00",
+                  "肯定之处_AI是否确认": "确认无误", "需改进之处_AI是否确认：": "确认无误"}
+        rows = {"human": [{"record_id": "human", "fields": dict(fields)}]}
+        rebuild = SnapshotRebuilder(Bitable(rows), self.config,
+            SimpleNamespace(get=lambda: self.organization), SimpleNamespace())
+        self.assertIn((DAY, "L1"), rebuild._read_human_rows(self.organization, ai_rows))
+        for changes in ({"填写人": [{"id": "ou_t"}]}, {"被审核基层：": "其他人"},
+                        {"日志原文": "另一条日志"}, {"评价编号": f"{DAY}:EVAL:T:L1"}):
+            with self.subTest(changes=changes):
+                rows["human"][0]["fields"] = {**fields, **changes}
+                self.assertEqual(rebuild._read_human_rows(self.organization, ai_rows), {})
+
 
 if __name__ == "__main__":
     unittest.main()

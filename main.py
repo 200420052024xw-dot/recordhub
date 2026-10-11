@@ -93,6 +93,8 @@ def main() -> int:
 
     run_parser = subparsers.add_parser("run-workflow")
     run_parser.add_argument("--date", required=True, type=date.fromisoformat)
+    statistics_parser = subparsers.add_parser("refresh-submission-statistics")
+    statistics_parser.add_argument("--date", required=True, type=date.fromisoformat)
     resume_parser = subparsers.add_parser("resume-workflow")
     resume_parser.add_argument("--date", required=True, type=date.fromisoformat)
     finalize_parser = subparsers.add_parser("finalize-confirmations")
@@ -139,6 +141,10 @@ def main() -> int:
         result = runtime.workflow2.resume(args.run_id)
     elif command == "run-workflow":
         result = workflow1.workflow.start(args.date)
+    elif command == "refresh-submission-statistics":
+        result = workflow1.workflow.refresh_submission_statistics(args.date)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["status"] == "complete" else 1
     elif command == "resume-workflow":
         result = workflow1.workflow.resume(args.date)
     elif command == "finalize-confirmations":
