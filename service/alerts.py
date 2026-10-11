@@ -11,11 +11,17 @@ logger = logging.getLogger(__name__)
 
 
 class AdminAlertHandler(logging.Handler):
+    # 同一个错误只打扰管理员一次。重试（周期任务的恢复轮询等）会反复抛同一条异常，
+    # 全发出来会把真正的新问题淹掉，所以按"日志内容"去重。
+    DEDUPE_LIMIT = 1000
+
     def __init__(self, messages, admin_open_id: str):
         super().__init__(logging.WARNING)
         self.messages, self.admin_open_id = messages, admin_open_id
         self.setFormatter(DiagnosticFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         self.queue = queue.Queue()
+        self._seen: set[str] = set()
+        self._seen_lock = threading.Lock()
         self.worker = threading.Thread(target=self._run, name="admin-alerts", daemon=True)
         self.worker.start()
 
@@ -30,6 +36,14 @@ class AdminAlertHandler(logging.Handler):
             if getattr(exc, "_recordhub_alert_handler", None) is self:
                 return
             exc._recordhub_alert_handler = self
+        fingerprint = f"{record.name}|{record.levelno}|{record.getMessage()}"
+        with self._seen_lock:
+            if fingerprint in self._seen:
+                return
+            if len(self._seen) >= self.DEDUPE_LIMIT:
+                # 只防重，不要求永久记忆；记满了就从头再来一轮。
+                self._seen.clear()
+            self._seen.add(fingerprint)
         event_id = uuid4().hex
         self.queue.put((event_id, self.format(record)))
         logger.info("admin_alert_queued event_id=%s source=%s", event_id, record.name)

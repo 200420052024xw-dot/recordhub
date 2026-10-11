@@ -41,4 +41,11 @@ class DeepSeekApiError(ProviderApiError):
 
 
 class StructuredOutputError(RecordHubError):
-    """The model response was invalid or did not match the requested contract."""
+    """The model response was invalid or did not match the requested contract.
+
+    raw 保留模型这次返回的原始文本，重试时可以把上一版输出连同纠正说明一起送回模型。
+    """
+
+    def __init__(self, message: str, *, raw: str | None = None) -> None:
+        super().__init__(message)
+        self.raw = raw

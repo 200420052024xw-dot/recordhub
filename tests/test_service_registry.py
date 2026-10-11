@@ -51,6 +51,27 @@ class ServiceRegistryTests(unittest.TestCase):
         self.assertIn("/webhooks/feishu/confirmations", paths)
         self.assertIn("/admin/workflows/daily/{target_date}", paths)
         self.assertIn("/admin/organization/persons", paths)
+        self.assertIn("/admin/workflow2/retry", paths)
+
+    def test_admin_retry_endpoint_needs_the_admin_token(self) -> None:
+        from fastapi.testclient import TestClient
+
+        workflow2 = Mock()
+        workflow2.retry_blocked.return_value = []
+        runtime = Runtime(
+            settings=self.settings, infrastructure=Mock(), organization_cache=Mock(),
+            workflows={"workflow1_daily": binding("workflow1_daily", "human")},
+            workflow2=workflow2,
+        )
+        client = TestClient(create_app(self.settings, runtime))
+
+        self.assertEqual(client.post("/admin/workflow2/retry").status_code, 401)
+
+        response = client.post("/admin/workflow2/retry?kind=stage",
+                               headers={"Authorization": "Bearer admin-token"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"retried": []})
+        workflow2.retry_blocked.assert_called_once_with("stage")
 
     def test_handlers_and_schedules_are_isolated_by_registration(self) -> None:
         first = binding("workflow1_daily", "human", auto_advance_at="12:00")
@@ -75,6 +96,33 @@ class ServiceRegistryTests(unittest.TestCase):
              "snapshot_cleanup", "organization_refresh"},
         )
 
+    def test_failed_evaluation_retry_job_is_registered_for_workflow1(self) -> None:
+        """接口失败的日志评价要有人定期去看有没有到点该重跑。"""
+        from workflow1.workflow import Workflow1
+
+        workflow = Workflow1.__new__(Workflow1)
+        workflow.retry_failed_evaluations = Mock()
+        daily = WorkflowBinding(
+            name="workflow1_daily", workflow=workflow, store=Mock(),
+            auto_advance_at="", confirmation_webhook_token="token",
+            record_handlers={},
+        )
+        runtime = Runtime(settings=self.settings, infrastructure=Mock(),
+                          organization_cache=Mock(),
+                          workflows={daily.name: daily})
+        schedules = ScheduleConfig(
+            timezone="Asia/Shanghai",
+            workflows={daily.name: WorkflowSchedule(daily.name, True, "daily", "01:00")},
+        )
+
+        scheduler = _build_scheduler(schedules, runtime, self.settings)
+
+        jobs = {job.id: job for job in scheduler.get_jobs()}
+        self.assertIn("workflow1_daily_evaluation_retry", jobs)
+        # 01:00 起跑 → 02:20 / 03:20 重试没跑完的当天，04:20 是最后一轮（标人工补评）
+        self.assertIn("hour='2,3'", str(jobs["workflow1_daily_incomplete_retry"].trigger))
+        self.assertIn("hour='4'", str(jobs["workflow1_daily_incomplete_retry_final"].trigger))
+
     def test_configured_notification_jobs_are_registered(self) -> None:
         settings = replace(self.settings, workflow2_enabled=True)
         runtime = Runtime(
@@ -92,7 +140,12 @@ class ServiceRegistryTests(unittest.TestCase):
         self.assertIn("hour='22'", jobs["workflow1_daily_report_notification"])
         self.assertNotIn("workflow1_daily_evaluator_notification_recovery", jobs)
         self.assertIn("hour='19'", jobs["workflow1_daily_confirmation_auto_advance"])
-        self.assertIn("hour='12'", jobs["workflow2_stage"])
+        # 阶段分析不等人工评价定稿（材料只带日志原文），所以凌晨就开跑；
+        # 部长那边等 08:00 的通知。
+        self.assertIn("hour='4'", jobs["workflow2_stage"])
+        self.assertIn("hour='8'", jobs["workflow2_stage_notification"])
+        # 22:00 才把定稿报告推给团队负责人
+        self.assertIn("hour='22'", jobs["workflow2_stage_report_notification"])
         self.assertIn("hour='4'", jobs["workflow2_monthly"])
         self.assertIn("hour='12'", jobs["workflow2_monthly_notification"])
         self.assertIn("hour='6'", jobs["workflow2_weekly"])

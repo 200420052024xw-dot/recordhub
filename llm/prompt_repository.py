@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from datetime import datetime, timezone
 from typing import Any
@@ -10,7 +11,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, RootModel
 
 from data.store import FileStateStore
-from llm.errors import LLMError
+from llm.errors import LLMError, LLMValidationError
 from llm.service import PromptService
 from schema import Organization, TableConfig
 from tool.bitable_fields import record_fields, references, scalar
@@ -29,6 +30,11 @@ FUNCTION_CODES = {
     "公共技术": "S08",
     "公共培训建议": "S09",
 }
+
+# 飞书单选字段有时只回传选项 ID（形如 optwbBg3XN），要回查选项表才能换成选项文字。
+OPTION_ID = re.compile(r"opt[A-Za-z0-9]{6,}")
+# 字段类型 19 = 查找引用，它的值只给选项 ID，选项表要回到源字段取。
+LOOKUP_TYPE = 19
 
 
 class _AuditModel(BaseModel):
@@ -192,6 +198,7 @@ class PromptRepository:
                  store: FileStateStore, prompt_service: PromptService,
                  messages: MessageService) -> None:
         self.bitable = bitable
+        self.tables = tables
         self.store = store
         self.prompt_service = prompt_service
         self.messages = messages
@@ -204,6 +211,7 @@ class PromptRepository:
             raise ValueError(f"Skill 配置表缺少字段映射：{', '.join(missing)}")
         self.table = table
         self.entries: dict[str, PromptEntry] = {}
+        self.option_cache: dict[str, str] | None = None
         cached = self.store.load_cache(self.CACHE_KEY)
         if isinstance(cached, dict):
             for key, value in cached.get("entries", {}).items():
@@ -258,6 +266,75 @@ class PromptRepository:
             raise ValueError("使用人不在当前有效人员名单中")
         return user_id
 
+    def _option_names(self) -> dict[str, str]:
+        """选项 ID → 选项文字。读不到时保持未加载状态，下次再试。"""
+        if self.option_cache is None:
+            self.option_cache = self._collect_option_names()
+        return self.option_cache or {}
+
+    @staticmethod
+    def _merge_options(names: dict[str, str], field: Any) -> None:
+        property_ = (field or {}).get("property") or {}
+        for option in property_.get("options") or []:
+            option_id = str((option or {}).get("id") or "").strip()
+            name = str((option or {}).get("name") or "").strip()
+            if option_id and name:
+                names.setdefault(option_id, name)
+
+    def _collect_option_names(self) -> dict[str, str] | None:
+        """选项 ID → 选项文字。单选字段自带选项表，查找引用字段要去源表取。
+
+        返回 None 表示字段定义没读到。这不是"表里没有选项"，不能缓存：
+        缓存了就再也不会重试，一次接口抖动会让整个进程都还原不出选项文字。
+        """
+        names: dict[str, str] = {}
+        try:
+            fields = self.bitable.list_fields(self.table.table_id)
+        except Exception:
+            logger.warning("skill_option_names_unavailable table_id=%s",
+                           self.table.table_id, exc_info=True)
+            return None
+        lookups: list[tuple[str, str]] = []
+        for field in fields:
+            self._merge_options(names, field)
+            if field.get("type") != LOOKUP_TYPE:
+                continue
+            property_ = field.get("property") or {}
+            target = str(property_.get("target_field") or "").strip()
+            source = str((property_.get("filter_info") or {}).get(
+                "target_table") or "").strip()
+            if target:
+                lookups.append((source, target))
+        # 查找引用字段只回传源字段的选项 ID，选项表要去源字段取。
+        for source, target in lookups:
+            for table_id in self._source_table_ids(source):
+                try:
+                    candidates = self.bitable.list_fields(table_id)
+                except Exception:
+                    logger.warning("skill_option_source_unavailable table_id=%s",
+                                   table_id, exc_info=True)
+                    continue
+                matched = [item for item in candidates
+                           if str(item.get("field_id") or "") == target]
+                if matched:
+                    self._merge_options(names, matched[0])
+                    break
+        return names
+
+    def _source_table_ids(self, declared: str) -> list[str]:
+        """先看元数据写明的源表，再看配置里登记的表。"""
+        table_ids = [declared] if declared else []
+        table_ids.extend(table.table_id for table in self.tables.tables.values()
+                         if table.table_id)
+        return list(dict.fromkeys(table_ids))
+
+    def _field_choice(self, value: Any) -> str:
+        """读单选/查找引用字段：优先取文字，只拿到选项 ID 时换成选项名。"""
+        text = scalar(value).strip()
+        if OPTION_ID.fullmatch(text):
+            return self._option_names().get(text, text)
+        return text
+
     def _parse(self, record: dict[str, Any], organization: Organization) -> PromptEntry:
         record_id = str(record.get("record_id") or "").strip()
         if not record_id:
@@ -265,11 +342,9 @@ class PromptRepository:
         fields = record_fields(record)
         f = self.table.fields
         user_id = self._resolve_user_id(record, organization)
-        person = organization.person_map()[user_id]
-        role = scalar(fields.get(f["role"])).strip()
-        if role != person.role:
-            raise ValueError(f"角色查找值“{role or '空'}”与人员表角色“{person.role}”不一致")
-        function = scalar(fields.get(f["function"])).strip()
+        # 角色列是查找引用，由系统按姓名从人员表推出来，人不填也不读；
+        # 身份由 _resolve_user_id 把关（使用人必须唯一解析到在职人员）。
+        function = self._field_choice(fields.get(f["function"]))
         skill_code = FUNCTION_CODES.get(function)
         if skill_code is None:
             raise ValueError(f"未知功能：{function or '空'}")
@@ -306,11 +381,13 @@ class PromptRepository:
         )
 
     def _audit(self, entry: PromptEntry) -> None:
+        # 审核只判断模板本身是否合格，不能用纠正说明把不合格的模板救回来。
         self.prompt_service.execute(
             prompt_code=f"{entry.skill_code}-FORMAT-REVIEW",
             template=f"{entry.template}\n\n{AUDIT_SUFFIX}",
             input_data=_audit_input(entry.skill_code),
             output_model=AUDIT_OUTPUTS[entry.skill_code],
+            retry_feedback=False,
         )
 
     def review_pending(self, organization: Organization) -> dict[str, int]:
@@ -323,8 +400,8 @@ class PromptRepository:
             result = {"reviewed": 0, "passed": 0, "failed": 0}
             for record in records:
                 record_id = str(record.get("record_id") or "")
-                statuses[record_id] = scalar(
-                    record_fields(record).get(f["review_result"])).strip()
+                statuses[record_id] = self._field_choice(
+                    record_fields(record).get(f["review_result"]))
                 try:
                     parsed[record_id] = self._parse(record, organization)
                 except ValueError as exc:
@@ -340,7 +417,8 @@ class PromptRepository:
                         try:
                             self._notify_failure(
                                 user_id=user_id,
-                                function=scalar(record_fields(record).get(f["function"])).strip(),
+                                function=self._field_choice(
+                                    record_fields(record).get(f["function"])),
                                 record_id=record_id, reason=reason,
                                 organization=organization)
                         except Exception:
@@ -377,10 +455,11 @@ class PromptRepository:
                 key=lambda item: (item.created_time, item.record_id),
             )
             for entry in pending:
-                result["reviewed"] += 1
                 try:
                     self._audit(entry)
-                except LLMError as exc:
+                except LLMValidationError as exc:
+                    # 模型确实产不出规定格式，才说明这条模板本身不合格。
+                    result["reviewed"] += 1
                     reason = ("固定案例输出无法按规定格式解析：" +
                               error_summary(exc))[:1500]
                     try:
@@ -398,6 +477,13 @@ class PromptRepository:
                     logger.warning("skill_review_failed record_id=%s reason=%s",
                                    entry.record_id, reason, exc_info=True)
                     continue
+                except LLMError as exc:
+                    # 接口/网络故障不是模板的错：不写"未通过"、不通知本人，
+                    # 留空让后面几轮审核重来（不能把系统的故障算到提交人头上）。
+                    logger.warning("skill_review_deferred record_id=%s user_id=%s error=%s",
+                                   entry.record_id, entry.user_id, error_summary(exc))
+                    continue
+                result["reviewed"] += 1
                 key = self._key(entry.user_id, entry.skill_code)
                 old = self.entries.get(key)
                 self._update_review(entry.record_id, "通过", "")

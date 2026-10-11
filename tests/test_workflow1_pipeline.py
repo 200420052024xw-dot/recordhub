@@ -5,9 +5,9 @@ import sys
 from urllib.parse import quote
 import unittest
 import logging
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
@@ -22,10 +22,13 @@ from workflow1.documents import DailyDocuments
 from workflow1.evaluations import (AiEvaluationRepository,
                                         HumanEvaluationRepository, evaluation_key,
                                         review_day_timestamp)
-from workflow1.workflow import Workflow1
+from workflow1.workflow import (FAILED_EVALUATION_TEXT, RETRY_DELAY, RETRY_LIMIT,
+                                UNPARSED_IMPROVEMENT, Workflow1)
 from workflow1.reports import WorkflowReportRepository
 from workflow1.models import LogPromptOutput, WorkflowStatus
+from llm.errors import LLMError, LLMValidationError
 from service.alerts import AdminAlertHandler
+from tool.errors import StructuredOutputError
 
 DAY = date(2026, 10, 3)
 
@@ -374,8 +377,11 @@ class Workflow1PipelineTests(unittest.TestCase):
             # 失败单元不再拖垮全天：当天流程照常走到等待评价状态。
             self.assertEqual(first.status, WorkflowStatus.WAITING_EVALUATIONS)
             stored = store.load_snapshot(DAY)
-            self.assertIn("log:L2:ai-failed", stored.issues)
+            # 单次失败只延后重试：不记台账、不惊动管理员，等 30 分钟后自动重跑。
+            self.assertNotIn("log:L2:ai-failed", stored.issues)
             self.assertEqual(stored.log_evaluations["L2"].status, UnitStatus.FAILED)
+            self.assertEqual(stored.log_evaluations["L2"].retry_count, 1)
+            self.assertIsNotNone(stored.log_evaluations["L2"].retry_after)
             self.assertTrue(stored.evaluations_published)
             expected_review_time = datetime(2026, 10, 4, 0, 0,
                                             tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -388,14 +394,14 @@ class Workflow1PipelineTests(unittest.TestCase):
             admin_msgs = [call for call in
                           messages.send_text.call_args_list
                           if call.args and call.args[0] == "ou_admin"]
-            self.assertEqual(len(admin_msgs), 1)
+            self.assertEqual(len(admin_msgs), 0)  # 还没到"重试也不管用"的地步
             # 自动重入（非 resume）绝不重评失败项。
             workflow.start(DAY)
             alerts.queue.join()
             self.assertEqual(calls.count("L2"), 1)
             self.assertEqual(len([c for c in
                                   messages.send_text.call_args_list
-                                  if c.args and c.args[0] == "ou_admin"]), 1)
+                                  if c.args and c.args[0] == "ou_admin"]), 0)
             # resume（重评接口）只重置并重跑失败项。
             second = workflow.resume(DAY)
             self.assertEqual(second.status, WorkflowStatus.WAITING_EVALUATIONS)
@@ -403,6 +409,205 @@ class Workflow1PipelineTests(unittest.TestCase):
             self.assertEqual(calls.count("L1"), 1)
             self.assertEqual(calls.count("L3"), 1)
             self.assertEqual(logs.get_logs_by_date.call_count, 1)
+
+    def test_unparseable_ai_output_is_kept_in_the_positive_field(self):
+        """解析不了不等于丢掉：原始输出原样进「肯定之处」，改进栏指向它，照常等人工确认。"""
+        snapshot = sample_snapshot()
+        cache = Mock()
+        cache.get.return_value = snapshot.organization
+        logs = Mock()
+        logs.get_logs_by_date.return_value = (snapshot.logs, {})
+        ai = Mock()
+        ai.publish.return_value = ({}, {})
+        human = Mock()
+        human.for_date.return_value = []
+        messages = Mock()
+        messages.send_text.return_value = {"message_id": "msg"}
+        raw = "只有一段话，没有分成两个字段：本周完成了检查工具。"
+
+        def execute(**kwargs):
+            if kwargs["input_data"].log_id == "L2":
+                raise LLMValidationError("Structured output validation failed") from \
+                    StructuredOutputError("Structured output validation failed", raw=raw)
+            return LogPromptOutput(positive="好", improvement="继续")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = FileStateStore(directory, snapshot_model=DailySnapshot)
+            prompt = Mock()
+            prompt.execute.side_effect = execute
+            workflow = Workflow1(
+                store=store, organization_cache=cache,
+                log_repository=logs, ai_evaluations=ai,
+                human_evaluations=human, prompt_service=prompt,
+                messages=messages, documents=Mock(advance=Mock(return_value={})),
+                reports=Mock(publish=Mock(return_value={})),
+                llm_concurrency=2, auto_advance_at="",
+                prompt_path="prompts/S01.txt", admin_open_id="ou_admin")
+            workflow.start(DAY)
+
+            stored = store.load_snapshot(DAY)
+            state = stored.log_evaluations["L2"]
+            self.assertEqual(state.status, UnitStatus.WAITING_CONFIRMATION)
+            self.assertEqual(state.positive_ai, raw)
+            self.assertEqual(state.positive_final, raw)
+            self.assertEqual(state.improvement_ai, UNPARSED_IMPROVEMENT)
+            self.assertEqual(state.improvement_final, UNPARSED_IMPROVEMENT)
+            self.assertIn("log:L2:ai-unparsed", stored.issues)
+            # 降级项仍然会发布到评价表，人工可以照常核对确认。
+            published = ai.publish.call_args.args[0]
+            self.assertIn("L2", published.log_evaluations)
+
+    def _api_failure_workflow(self, directory, *, fail_times: int,
+                              retry_minutes: int = 60):
+        """L2 的评价前 fail_times 次报接口错误，之后成功。"""
+        snapshot = sample_snapshot()
+        cache = Mock()
+        cache.get.return_value = snapshot.organization
+        logs = Mock()
+        logs.get_logs_by_date.return_value = (snapshot.logs, {})
+        messages = Mock()
+        messages.send_text.return_value = {"message_id": "msg"}
+        alerts = AdminAlertHandler(messages, "ou_admin")
+        logging.getLogger().addHandler(alerts)
+        self.addCleanup(alerts.close)
+        self.addCleanup(logging.getLogger().removeHandler, alerts)
+        remaining = {"L2": fail_times}
+
+        def execute(**kwargs):
+            if kwargs["input_data"].log_id == "L2" and remaining["L2"] > 0:
+                remaining["L2"] -= 1
+                raise LLMError("DeepSeek API request failed")
+            return LogPromptOutput(positive="好", improvement="继续")
+
+        store = FileStateStore(directory, snapshot_model=DailySnapshot)
+        prompt = Mock()
+        prompt.execute.side_effect = execute
+        workflow = Workflow1(
+            store=store, organization_cache=cache, log_repository=logs,
+            ai_evaluations=Mock(publish=Mock(return_value=({}, {}))),
+            human_evaluations=Mock(for_date=Mock(return_value=[])),
+            prompt_service=prompt, messages=messages,
+            documents=Mock(advance=Mock(return_value={})),
+            reports=Mock(publish=Mock(return_value={})),
+            llm_concurrency=1, auto_advance_at="",
+            llm_retry_interval_minutes=retry_minutes,
+            prompt_path="prompts/S01.txt", admin_open_id="ou_admin")
+        return workflow, store, messages, alerts
+
+    def test_retry_interval_is_configurable(self):
+        """重试间隔来自配置：默认一小时，设成别的就按别的来。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workflow, store, _, _ = self._api_failure_workflow(
+                directory, fail_times=1, retry_minutes=240)
+            before = datetime.now(UTC)
+
+            workflow.start(DAY)
+
+            retry_after = store.load_snapshot(DAY).log_evaluations["L2"].retry_after
+            self.assertGreaterEqual(retry_after - before, timedelta(minutes=239))
+            self.assertLessEqual(retry_after - before, timedelta(minutes=241))
+
+    def test_failed_evaluation_is_retried_after_the_delay(self):
+        """接口失败先延后，不到点不重跑，到点自动重跑，成功就当没事发生。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workflow, store, messages, _ = self._api_failure_workflow(
+                directory, fail_times=1)
+            workflow.start(DAY)
+            self.assertEqual(store.load_snapshot(DAY).log_evaluations["L2"].status,
+                             UnitStatus.FAILED)
+
+            workflow.retry_failed_evaluations()  # 还没到点
+            self.assertEqual(store.load_snapshot(DAY).log_evaluations["L2"].status,
+                             UnitStatus.FAILED)
+
+            later = datetime.now(UTC) + RETRY_DELAY + timedelta(minutes=1)
+            with patch("workflow1.workflow.utc_now", return_value=later):
+                retried = workflow.retry_failed_evaluations()
+
+            self.assertEqual(retried, [DAY.isoformat()])
+            state = store.load_snapshot(DAY).log_evaluations["L2"]
+            self.assertEqual(state.status, UnitStatus.WAITING_CONFIRMATION)
+            self.assertEqual(state.positive_final, "好")
+            self.assertEqual(state.fallback, "")
+            self.assertEqual(state.retry_after, None)
+            self.assertEqual([call for call in messages.send_text.call_args_list
+                              if call.args and call.args[0] == "ou_admin"], [])
+
+    def test_exhausted_retries_mark_for_manual_review_and_alert_admin(self):
+        """三次重试都不管用：标成待人工补评、写进评价表、只报管理员不打扰老师。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workflow, store, messages, alerts = self._api_failure_workflow(
+                directory, fail_times=RETRY_LIMIT + 1)
+            clock = {"now": datetime.now(UTC)}
+
+            def tick():
+                clock["now"] += RETRY_DELAY + timedelta(minutes=1)
+                return clock["now"]
+
+            with patch("workflow1.workflow.utc_now", side_effect=tick):
+                workflow.start(DAY)                     # 首次失败 → 延后
+                for _ in range(RETRY_LIMIT):            # 三次重试全部失败
+                    workflow.retry_failed_evaluations()
+                    alerts.queue.join()
+            stored = store.load_snapshot(DAY)
+            state = stored.log_evaluations["L2"]
+            self.assertEqual(state.status, UnitStatus.WAITING_CONFIRMATION)
+            self.assertEqual(state.positive_final, FAILED_EVALUATION_TEXT)
+            self.assertEqual(state.improvement_final, FAILED_EVALUATION_TEXT)
+            self.assertEqual(state.fallback, "failed")
+            self.assertIn("log:L2:ai-failed", stored.issues)
+            admin_msgs = [call for call in messages.send_text.call_args_list
+                          if call.args and call.args[0] == "ou_admin"]
+            self.assertEqual(len(admin_msgs), 1)
+            # 老师只收到例行的"请评价日志"，不该收到任何失败相关的通知。
+            teacher_msgs = [call.args[1] for call in messages.send_text.call_args_list
+                            if call.args and call.args[0] in {"ou_b", "ou_m"}]
+            self.assertTrue(all("失败" not in text for text in teacher_msgs),
+                            teacher_msgs)
+
+    def test_incomplete_day_is_retried_then_flagged_for_manual_review(self):
+        """跑挂的当天逐小时重试；最后一轮仍没完成就标“需人工补评”，之后不再自动折腾。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workflow, store, messages, alerts = self._api_failure_workflow(
+                directory, fail_times=RETRY_LIMIT + 1)
+            clock = datetime(2026, 10, 4, 2, 20, tzinfo=UTC)   # 北京 10-04 10:20
+            with patch("workflow1.workflow.utc_now", return_value=clock):
+                workflow.start(DAY)
+                self.assertNotIn("workflow1:manual-review",
+                                 store.load_snapshot(DAY).issues)
+
+                retried = workflow.retry_incomplete(final=True)
+
+                self.assertEqual([item["target_date"] for item in retried],
+                                 [DAY.isoformat()])
+                self.assertNotEqual(retried[0]["status"], WorkflowStatus.COMPLETED)
+                self.assertIn("workflow1:manual-review",
+                              store.load_snapshot(DAY).issues)
+                alerts.queue.join()
+                admin_msgs = [call for call in messages.send_text.call_args_list
+                              if call.args and call.args[0] == "ou_admin"]
+                self.assertEqual(len(admin_msgs), 1)
+
+                # 已经标过人工补评：不再自动重试，也不再重复报警。
+                self.assertEqual(workflow.retry_incomplete(final=True), [])
+                alerts.queue.join()
+                self.assertEqual(len([call for call in messages.send_text.call_args_list
+                                      if call.args and call.args[0] == "ou_admin"]), 1)
+
+    def test_unparsed_marker_stays_out_of_the_report(self):
+        """「详情见肯定之处」是给填表人的指路话，报告里只写内容本身。"""
+        snapshot = sample_snapshot()
+        state = snapshot.log_evaluations["L2"]
+        state.positive_final = "本周完成了检查工具。"
+        state.improvement_final = UNPARSED_IMPROVEMENT
+        state.fallback = "unparsed"
+        documents = DailyDocuments.__new__(DailyDocuments)
+
+        text = str(documents._evaluation_blocks(snapshot, state))
+
+        self.assertIn("本周完成了检查工具", text)
+        self.assertNotIn("详情见", text)
+        self.assertNotIn("-改进之处", text)
 
 
 if __name__ == "__main__":

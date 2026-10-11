@@ -88,6 +88,69 @@ class Workflow2ComponentTests(unittest.TestCase):
                 self.assertEqual(record.evaluations[0].source, "HUMAN")
                 self.assertEqual(record.evaluations[0].positive, "老师肯定")
 
+    def test_placeholders_never_reach_the_material(self):
+        """降级/失败的占位文案是指路话，不能当评价内容喂给月报周报的技能。"""
+        snapshot = self.daily.load_snapshot(DAY)
+        states = sorted(snapshot.log_evaluations.values(), key=lambda item: item.log_id)
+        states[0].fallback = "unparsed"
+        states[0].improvement_final = "详情见「肯定之处_AI」"
+        states[1].fallback = "failed"
+        states[1].positive_final = "AI 评价失败，请人工补评"
+        states[1].improvement_final = "AI 评价失败，请人工补评"
+        self.daily.save_snapshot(snapshot)
+
+        prepared = MaterialPreparer(self.daily).prepare(
+            run_id="placeholders", start=DAY, end=DAY, department_ids=["dep"])
+        submitted = [record for record in prepared.input.records if record.submitted]
+
+        for record in prepared.input.records:
+            for review in record.evaluations:
+                self.assertNotIn("详情见", review.improvement)
+                self.assertNotIn("请人工补评", review.positive)
+        # 降级那条：正文保留，指路话去掉
+        self.assertTrue(any(review.improvement == ""
+                            for record in submitted for review in record.evaluations))
+        # 彻底失败那条：整条评价就是占位，按"没有评价"处理
+        self.assertTrue(any(record.evaluations == [] for record in submitted))
+
+    def test_stage_material_does_not_wait_for_evaluations(self):
+        """S04 只汇总日志原文：评价还没确认，材料也该完整；月报/周报仍要定稿评价。"""
+        snapshot = self.daily.load_snapshot(DAY)
+        for state in snapshot.log_evaluations.values():
+            state.status = UnitStatus.PENDING
+        self.daily.save_snapshot(snapshot)
+
+        strict = MaterialPreparer(self.daily).prepare(
+            run_id="strict", start=DAY, end=DAY, department_ids=["dep"])
+        stage = MaterialPreparer(self.daily).prepare(
+            run_id="stage", start=DAY, end=DAY, department_ids=["dep"],
+            with_evaluations=False)
+
+        self.assertFalse(strict.input.scope.complete)
+        self.assertTrue(any("尚未完成评价确认" in item
+                            for item in strict.input.scope.missing_sources))
+        self.assertTrue(stage.input.scope.complete)
+        submitted = [record for record in stage.input.records if record.submitted]
+        self.assertTrue(submitted)
+        for record in submitted:
+            self.assertEqual(record.evaluations, [])
+            self.assertFalse(record.confirmed)
+
+    def test_s04_accepts_unconfirmed_records_but_others_do_not(self):
+        """S04 不等评价定稿；S05 这类要用评价的技能仍然必须等。"""
+        client = Mock()
+        client.complete_json.side_effect = lambda messages, validator: validator({"items": []})
+        runner = SkillRunner(PromptService(client, max_attempts=1))
+        records = [TextRecord(record_id="rec1", person_id="M", name="成员",
+            department_id="dep", role="基层学生", work_start=DAY, work_end=DAY,
+            confirmed=False, progress="完成检查")]
+        material = self.material().model_copy(update={"records": records}, deep=True)
+
+        self.assertEqual(runner.run("S04", material, user_id="D").status,
+                         SkillStatus.WAITING_CONFIRMATION)
+        self.assertEqual(runner.run("S05", material, user_id="D").status,
+                         SkillStatus.BLOCKED)
+
     def test_person_filter_restricts_groups(self):
         full = MaterialPreparer(self.daily).prepare(
             run_id="r1", start=DAY, end=DAY, department_ids=["dep"])

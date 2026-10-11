@@ -163,12 +163,16 @@ class Workflow2:
                  tables: Workflow2Tables, prompt_service: PromptService,
                  messages: MessageService, documents: CloudDocsService,
                  schedules: ScheduleConfig, archive_parent: str,
-                 notifications: NotificationPolicy | None = None):
+                 notifications: NotificationPolicy | None = None,
+                 retry_interval_minutes: int = 60, retry_limit: int = 3):
         self.store, self.preparer, self.organization = store, preparer, organization
         self.prompts, self.tables, self.prompt_service = prompts, tables, prompt_service
         self.messages, self.documents = messages, documents
         self.schedules, self.archive_parent = schedules, archive_parent
         self.notifications = notifications
+        # 阶段分析凌晨启动，失败就整点重来；初次之外最多再重试 retry_limit 次。
+        self.retry_interval_minutes = retry_interval_minutes
+        self.retry_limit = retry_limit
         self.lock = threading.RLock()
 
     def _schedule(self, kind: str):
@@ -222,13 +226,66 @@ class Workflow2:
             logger.info("workflow2_resume run_id=%s", run_id)
             return self._advance(run)
 
+    def _retry_due(self, run: CycleRun, now: datetime) -> bool:
+        """失败/被阻塞的任务按小时退避；等确认、等重跑的不受限制。"""
+        if run.status not in {"BLOCKED", "FAILED"}:
+            return True
+        if run.retry_count > self.retry_limit:
+            return False
+        return run.retry_after is None or run.retry_after <= now
+
+    def _schedule_retry(self, run: CycleRun) -> None:
+        run.retry_count += 1
+        if run.retry_count <= self.retry_limit:
+            run.retry_after = utc_now() + timedelta(minutes=self.retry_interval_minutes)
+            return
+        run.retry_after = None
+        logger.error("workflow2_retry_exhausted run_id=%s kind=%s attempts=%d error=%s",
+                     run.run_id, run.kind, run.retry_count, run.last_error or "-")
+
     def recover(self) -> list[CycleRun]:
-        activation = self.store.activate(utc_now().astimezone(SHANGHAI).date())
+        now = utc_now()
+        today = now.astimezone(SHANGHAI).date()
+        activation = self.store.activate(today)
+        # 该跑却没跑起来的补上：定时器错过计划时刻（服务不在、4 点整在忙）不会自己补响，
+        # 而"每 3 天"的判据让第二天也不会补 —— 不补就是那一轮彻底没了，还不报警。
+        for kind in CODES:
+            run_id = str(uuid5(NAMESPACE_URL, f"recordhub-workflow2:{kind}:{today}"))
+            if self.store.load(run_id) is not None:
+                continue
+            try:
+                self.scheduled(kind, today)
+            except Exception:
+                logger.exception("workflow2_catch_up_failed kind=%s date=%s", kind, today)
         results = [self.resume(run.run_id) for run in self.store.pending()
-                   if run.kind != "stage" or run.start_date > activation]
+                   if (run.kind != "stage" or run.start_date > activation)
+                   and self._retry_due(run, now)]
         # Recovery advances processing only; missed notifications require the admin API.
         logger.debug("workflow2_recover resumed=%d", len(results))
         return results
+
+    def retry_blocked(self, kind: str = "all") -> list[CycleRun]:
+        """管理员手动重试卡住的周期任务：无视自动重试预算，只补没完成的部分。
+
+        已出草稿的技能/部门会跳过，所以重跑不会重复调用模型；顺带把重试预算清零，
+        以后再卡住时自动重试能重新生效。
+        """
+        if kind != "all" and kind not in CODES:
+            raise ValueError(f"未知的周期类型：{kind}")
+        with self.lock:
+            retried: list[CycleRun] = []
+            for run in self.store.pending():
+                if kind != "all" and run.kind != kind:
+                    continue
+                if run.status not in {"BLOCKED", "FAILED"}:
+                    continue
+                run.retry_count = 0
+                run.retry_after = None
+                self.store.save(run)
+                logger.info("workflow2_manual_retry run_id=%s kind=%s date=%s error=%s",
+                            run.run_id, run.kind, run.scheduled_date, run.last_error or "-")
+                retried.append(self.resume(run.run_id))
+            return retried
 
     def scheduled(self, kind: str, today: date) -> CycleRun | None:
         schedule = self._schedule(kind)
@@ -260,6 +317,16 @@ class Workflow2:
         scheduled = datetime.combine(run.scheduled_date, time(hour, minute), SHANGHAI)
         return utc_now().astimezone(SHANGHAI) >= scheduled
 
+    def _report_due(self, run: CycleRun) -> bool:
+        """向负责人推报告的时刻：配了 report_notify_at 就用它，否则沿用 notify_at。"""
+        options = self._schedule(run.kind).options
+        value = options.get("report_notify_at") or options.get("notify_at")
+        if not value:
+            return True
+        hour, minute = map(int, str(value).split(":"))
+        scheduled = datetime.combine(run.scheduled_date, time(hour, minute), SHANGHAI)
+        return utc_now().astimezone(SHANGHAI) >= scheduled
+
     def notify_due(self, kind: str, scheduled_date: date) -> None:
         with self.lock:
             run_id = str(uuid5(NAMESPACE_URL,
@@ -269,14 +336,22 @@ class Workflow2:
                 return
             organization = self.organization.get()
             people = organization.person_map()
-            if kind == "monthly" and utc_now().astimezone(SHANGHAI) < self._cutoff(run):
+            # 阶段分析凌晨就跑完了，但报喜要等 notify_at（08:00）：
+            # _departments 里那次即时通知被 _notification_due 挡住，这里补发。
+            if kind in {"stage", "monthly"} and utc_now().astimezone(SHANGHAI) < self._cutoff(run):
                 for draft in run.departments.values():
                     minister = people.get(draft.minister_id)
                     if (draft.analysis_published and minister and minister.open_id and
                             not set(CODES[kind]) <= set(draft.final_text)):
                         self._notify_minister(run, draft.department_id, minister.open_id)
-            if (kind in {"monthly", "weekly"} and run.status == "COMPLETED" and
-                    set(CODES[kind]) <= set(run.document_urls)):
+            if (kind == "stage" and
+                    utc_now().astimezone(SHANGHAI) >= self._cutoff(run) and
+                    run.status != "COMPLETED"):
+                # 截止时间已过：先把 AI 草稿定稿、生成文档，再推给负责人；
+                # 不能干等那 15 分钟一轮的恢复，否则 22:00 这一刻可能还没定稿。
+                run = self.resume(run.run_id)
+            if (self._report_due(run) and run.status == "COMPLETED" and
+                    set(CODES[run.kind]) <= set(run.document_urls)):
                 leader = people.get(organization.team_leader_id or "")
                 if leader and leader.open_id:
                     self._notify_leader(run, leader.open_id)
@@ -318,11 +393,13 @@ class Workflow2:
             logger.info("workflow2_completed run_id=%s kind=%s", run.run_id, run.kind)
         except ValueError as exc:
             run.status, run.last_error = "BLOCKED", error_summary(exc)
+            self._schedule_retry(run)
             self.store.save(run)
             logger.exception("workflow2_blocked run_id=%s kind=%s date=%s error=%s",
                              run.run_id, run.kind, run.scheduled_date, error_summary(exc))
         except Exception as exc:
             run.status, run.last_error = "FAILED", error_summary(exc)
+            self._schedule_retry(run)
             self.store.save(run)
             logger.exception("workflow2_failed run_id=%s kind=%s", run.run_id, run.kind)
         return run
@@ -346,10 +423,13 @@ class Workflow2:
             if set(CODES[run.kind]) <= set(draft.final_text):
                 continue
             allow_rebuild = run.kind != "stage"
+            # 阶段分析（S04）只汇总日志原文，不等人工评价定稿；月报/周报要用定稿评价。
+            with_evaluations = run.kind != "stage"
             group_materials = [self.preparer.prepare(
                 run_id=run.run_id, start=run.start_date, end=run.end_date,
                 department_ids=[department.department_id], person_ids=group,
-                allow_rebuild=allow_rebuild, allow_partial=allow_rebuild)
+                allow_rebuild=allow_rebuild, allow_partial=allow_rebuild,
+                with_evaluations=with_evaluations)
                 for group in self._analysis_groups(run.kind, department, organization)]
             for group_material in group_materials:
                 if not group_material.input.scope.complete:
@@ -668,7 +748,8 @@ class Workflow2:
                  **{RESULT_COLUMNS[code]: self.tables.url_value(
                      "monthly_department_report", RESULT_COLUMNS[code], run.document_urls[code], NAMES[code])
                     for code in CODES["monthly"]}})
-        if self._notification_due(run):
+        # 负责人那份报告等 report_notify_at（22:00）再推；到点由 notify_due 负责发。
+        if self._report_due(run):
             self._notify_leader(run, leader.open_id)
 
     def _ensure_document(self, run: CycleRun, folder: str, key: str,

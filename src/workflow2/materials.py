@@ -8,6 +8,20 @@ from workflow2.models import MaterialStatistics, PreparedMaterial
 from workflow2.skills import AvailableResource, EvaluationText, MaterialScope, SkillInput, TextRecord
 
 
+def _without_placeholders(reviews: list[EvaluationText],
+                          fallback: str) -> list[EvaluationText]:
+    """降级/失败留下的占位文案是给填表人看的指路话，不是评价内容，不能进分析材料。
+
+    "unparsed"：模型确实产出了内容（原文留在肯定之处），只把那句"详情见肯定之处_AI"去掉。
+    "failed"：整条评价就是一句"请人工补评"，没有内容可给，按"这段没有评价"处理。
+    """
+    if fallback == "failed":
+        return []
+    if fallback == "unparsed":
+        return [review.model_copy(update={"improvement": ""}) for review in reviews]
+    return reviews
+
+
 class MaterialPreparer:
     def __init__(self, store: FileStateStore, rebuilder=None):
         self.store = store
@@ -18,7 +32,9 @@ class MaterialPreparer:
     def prepare(self, *, run_id: str, start: date, end: date,
                 department_ids: list[str], person_ids: list[str] | None = None,
                 allow_rebuild: bool = False,
-                allow_partial: bool = False) -> PreparedMaterial:
+                allow_partial: bool = False,
+                with_evaluations: bool = True) -> PreparedMaterial:
+        """with_evaluations=False 给只汇总日志原文的技能（S04）：材料不带评价，也不等评价定稿。"""
         if end < start:
             raise ValueError("分析起止日期倒置")
         department_ids = sorted(set(department_ids))
@@ -31,7 +47,7 @@ class MaterialPreparer:
                 path = self.store.checked_dir / f"{day}.json"
             stat = path.stat() if path.exists() else None
             signatures.append((day, stat.st_mtime_ns if stat else None, stat.st_size if stat else None))
-        cache_key = (start, end, allow_partial, tuple(department_ids),
+        cache_key = (start, end, allow_partial, with_evaluations, tuple(department_ids),
                      tuple(member_filter or ()), tuple(signatures))
         # Rebuilt material has no file signature; skip the prepared cache for it.
         if cache_key in self.cache and not allow_rebuild:
@@ -89,37 +105,43 @@ class MaterialPreparer:
                 submitted.add((day, person.person_id))
                 for log in logs:
                     state = snapshot.log_evaluations.get(log.log_id)
-                    if state is None or state.status != UnitStatus.CONFIRMED:
-                        missing.append(f"{day} 日志 {log.log_id} 尚未完成评价确认")
-                        continue
-                    if (state.person_id != person.person_id or state.log_id != log.log_id
-                            or state.evaluator_id != person.leader_id):
-                        missing.append(f"{day} 日志 {log.log_id} 的评价身份与当日组织关系不一致")
-                        continue
-                    if not state.positive_final or not state.improvement_final:
-                        missing.append(f"{day} 日志 {log.log_id} 缺少最终评价")
-                        continue
-                    evaluator = people.get(state.evaluator_id)
-                    if evaluator is None:
-                        missing.append(f"{day} 日志 {log.log_id} 评价人缺失")
-                        continue
-                    # Only the effective (finalized) evaluation reaches the Skills:
-                    # the human text when the evaluator edited it, otherwise the AI text.
-                    if state.source == "HUMAN":
-                        reviews = [EvaluationText(evaluator_id=evaluator.person_id,
-                            evaluator_role=evaluator.role,
-                            evaluated_at=state.confirmed_at or state.evaluated_at,
-                            positive=state.positive_final or "", improvement=state.improvement_final or "",
-                            source="HUMAN")]
-                    else:
-                        reviews = [EvaluationText(evaluator_id=evaluator.person_id,
-                            evaluator_role=evaluator.role,
-                            evaluated_at=state.ai_evaluated_at or state.evaluated_at,
-                            positive=state.positive_ai or state.positive_final or "",
-                            improvement=state.improvement_ai or state.improvement_final or "",
-                            source="AI")]
+                    confirmed = state is not None and state.status == UnitStatus.CONFIRMED
+                    reviews: list[EvaluationText] = []
+                    # 不带评价的材料（S04）只要求日志原文：日志当天归档，
+                    # 评价却要等到次日人工确认，等它会让阶段汇总无谓地推迟一天。
+                    if with_evaluations:
+                        if not confirmed:
+                            missing.append(f"{day} 日志 {log.log_id} 尚未完成评价确认")
+                            continue
+                        if (state.person_id != person.person_id or state.log_id != log.log_id
+                                or state.evaluator_id != person.leader_id):
+                            missing.append(f"{day} 日志 {log.log_id} 的评价身份与当日组织关系不一致")
+                            continue
+                        if not state.positive_final or not state.improvement_final:
+                            missing.append(f"{day} 日志 {log.log_id} 缺少最终评价")
+                            continue
+                        evaluator = people.get(state.evaluator_id)
+                        if evaluator is None:
+                            missing.append(f"{day} 日志 {log.log_id} 评价人缺失")
+                            continue
+                        # Only the effective (finalized) evaluation reaches the Skills:
+                        # the human text when the evaluator edited it, otherwise the AI text.
+                        if state.source == "HUMAN":
+                            reviews = [EvaluationText(evaluator_id=evaluator.person_id,
+                                evaluator_role=evaluator.role,
+                                evaluated_at=state.confirmed_at or state.evaluated_at,
+                                positive=state.positive_final or "", improvement=state.improvement_final or "",
+                                source="HUMAN")]
+                        else:
+                            reviews = [EvaluationText(evaluator_id=evaluator.person_id,
+                                evaluator_role=evaluator.role,
+                                evaluated_at=state.ai_evaluated_at or state.evaluated_at,
+                                positive=state.positive_ai or state.positive_final or "",
+                                improvement=state.improvement_ai or state.improvement_final or "",
+                                source="AI")]
+                        reviews = _without_placeholders(reviews, state.fallback)
                     record = TextRecord(record_id=log.source_record_id or log.log_id,
-                        confirmed=True, progress=log.progress, difficulties=log.difficulties,
+                        confirmed=confirmed, progress=log.progress, difficulties=log.difficulties,
                         reflection=log.reflection, other=log.other, full_log=log.full_log,
                         achievement_refs=log.achievement_refs, evaluations=reviews, **common)
                     existing = records.get(record.record_id)

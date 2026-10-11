@@ -54,7 +54,12 @@ class AppSettings:
     simulation_mode: bool = False
     llm_concurrency: int = 3
     llm_max_attempts: int = 3
-    snapshot_retention_days: int = 3
+    # 日志评价遇到接口/网络失败时的延后重试：间隔多少分钟、最多几次。
+    llm_retry_interval_minutes: int = 60
+    llm_retry_limit: int = 3
+    # 已完成日报快照的保留天数。必须大于 Workflow2 的材料窗口（阶段分析=3 天，
+    # 它是唯一不允许从飞书重建的周期），否则清理会把还要用的那天删掉。
+    snapshot_retention_days: int = 5
     scheduler_enabled: bool = True
     workflow2_enabled: bool = False
     event_stream_enabled: bool = True
@@ -98,8 +103,12 @@ class AppSettings:
             simulation_mode=_boolean("RECORDHUB_SIMULATION_MODE", False),
             llm_concurrency=_positive_int("RECORDHUB_LLM_CONCURRENCY", 3),
             llm_max_attempts=_positive_int("RECORDHUB_LLM_MAX_ATTEMPTS", 3),
+            llm_retry_interval_minutes=_positive_int(
+                "RECORDHUB_LLM_RETRY_INTERVAL_MINUTES", 60
+            ),
+            llm_retry_limit=_positive_int("RECORDHUB_LLM_RETRY_LIMIT", 3),
             snapshot_retention_days=_positive_int(
-                "RECORDHUB_SNAPSHOT_RETENTION_DAYS", 3
+                "RECORDHUB_SNAPSHOT_RETENTION_DAYS", 5
             ),
             scheduler_enabled=_boolean("RECORDHUB_SCHEDULER_ENABLED", True),
             workflow2_enabled=_boolean("RECORDHUB_WORKFLOW2_ENABLED", False),

@@ -67,6 +67,11 @@ class LogEvaluationState(StrictModel):
     prompt_record_id: str | None = None
     confirmed_at: datetime | None = None
     error: str | None = None
+    # 接口/网络失败的评价延后重试：已经试了几次、下次什么时候再试。
+    retry_count: int = 0
+    retry_after: datetime | None = None
+    # "" 正常；"unparsed" 模型输出解析不了，原文留在肯定之处；"failed" 重试耗尽待人工补评。
+    fallback: str = ""
 
 
 class EvaluatorProgress(StrictModel):

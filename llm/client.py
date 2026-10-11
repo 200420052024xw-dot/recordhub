@@ -40,20 +40,23 @@ class DeepSeekClient:
         )
         content = self._extract_content(payload)
         if not content.strip():
-            raise StructuredOutputError("DeepSeek returned empty structured output")
+            raise StructuredOutputError("DeepSeek returned empty structured output",
+                                        raw=content)
         try:
             result = json.loads(content)
         except json.JSONDecodeError as exc:
-            raise StructuredOutputError("DeepSeek returned invalid JSON") from exc
+            raise StructuredOutputError("DeepSeek returned invalid JSON",
+                                        raw=content) from exc
         if not isinstance(result, dict):
-            raise StructuredOutputError("Structured output root must be a JSON object")
+            raise StructuredOutputError("Structured output root must be a JSON object",
+                                        raw=content)
         if validator is None:
             return result
         try:
             return validator(result)
         except Exception as exc:
             raise StructuredOutputError(
-                f"Structured output validation failed: {exc}"
+                f"Structured output validation failed: {exc}", raw=content
             ) from exc
 
     def _complete(

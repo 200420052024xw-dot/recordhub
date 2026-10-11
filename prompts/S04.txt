@@ -5,10 +5,10 @@
 以部门为单位：每次输入一个部门全部骨干和基层学生过去三个完整自然日的记录。
 
 输入是一个 JSON 对象，核心字段：
-- records：数组，每条是一名学生的一条日志，含 person_id（人员编号）、name（姓名）、department_id（部门编号）、department_name（部门名称）、role（角色）、progress（工作进展）、difficulties（工作困难）、reflection（心得反思）、other（其他）、full_log（完整日志）、evaluations（定稿版评价数组，含 positive/improvement）。
+- records：数组，每条是一名学生的一条日志，含 person_id（人员编号）、name（姓名）、department_id（部门编号）、department_name（部门名称）、role（角色）、progress（工作进展）、difficulties（工作困难）、reflection（心得反思）、other（其他）、full_log（完整日志）。
 - scope：分析范围（start_date、end_date、department_ids）。
 
-同一学生可能有多条日志，每条分别保留对应评价。评价已由程序在传入前定稿（老师改过用老师版，否则用 AI 版），Skill 只分析、不重选版本。所有编号（person_id、department_id）必须原样取自输入，不得编造。
+同一学生可能有多条日志，每条分别处理。输入只有日志原文，不含评价内容，也不需要评价才能汇总。所有编号（person_id、department_id）必须原样取自输入，不得编造。
 
 ## 工作流：
 1. 按工作事项整理本部门日志，将不同学生参与的同一项工作合并。事项包括材料中实际出现的培训、工程、论文、专利、竞赛和毕业论文等。
@@ -37,5 +37,5 @@
 ## 约束：
 1. 不能捏造工作、参与者、进展或困难，不能把计划写成完成结果，也不能编造完成比例。
 2. 只分析本次输入部门的三天日志，不自行查询其他部门或重新筛选日期；同一项工作不能因多人记录而重复计算进展。
-3. 日志和评价有冲突时如实说明待核实，不以评价代替实际工作事实；只汇总工作，不安排任务或执行人员调整。
+3. 只依据日志原文，不得推测日志中没有写的内容；只汇总工作，不安排任务或执行人员调整。
 4. participant_ids 必须取自输入 records 的 person_id，不得使用姓名或编造编号。

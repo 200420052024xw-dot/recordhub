@@ -373,7 +373,8 @@ class TextSkill(Generic[OutputT]):
 class S04Skill(TextSkill[ProgressOutput]):
     code = SkillCode.S04
     output_model = ProgressOutput
-    requires_confirmed = True
+    # 只汇总日志原文，材料里不含评价，所以不等评价定稿（见 MaterialPreparer.with_evaluations）。
+    requires_confirmed = False
 
 # S05: evidence-backed personnel suggestions, never personnel mutations.
 class S05Skill(TextSkill[PersonnelOutput]):

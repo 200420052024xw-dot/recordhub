@@ -173,6 +173,9 @@ class DailyDocuments:
         if state.evaluated_at is not None:
             blocks.append(text_block(f"-评价时间：{self._datetime_line(state.evaluated_at)}"))
         blocks.append(text_block(f"-肯定之处：{state.positive_final or '无'}"))
+        if state.fallback == "unparsed":
+            # 「详情见肯定之处」是给填表人看的指路话，报告里只写内容本身，不写这句标记。
+            return blocks
         blocks.append(text_block(f"-改进之处：{state.improvement_final or '无'}"))
         return blocks
 

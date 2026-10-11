@@ -9,6 +9,7 @@ from typing import Any
 
 from llm.client import DeepSeekClient
 from config import DeepSeekSettings, FeishuSettings
+from tool.bitable_fields import scalar
 from tool.feishu import BitableService, ContactService, FeishuClient, FeishuTokenProvider, MessageService
 from tool.http import HttpResponse
 from config import load_schedule_config
@@ -187,6 +188,13 @@ class FoundationTests(unittest.TestCase):
         self.assertEqual(W1Settings.from_schedule(schedules).notify_at, "08:00")
         self.assertEqual(W1Settings.from_schedule(schedules).report_notify_at,
                          "22:00")
+        # 阶段分析（S04）只汇总日志原文、不等人工评价定稿，所以凌晨就开跑，
+        # 失败整点重试；08:00 才通知部长，当天 21:50 截止确认（过期按 AI 草稿定稿）。
+        stage = schedules.workflows["s04_progress"]
+        self.assertEqual(stage.time, "04:00")
+        self.assertEqual(stage.options["notify_at"], "08:00")
+        self.assertGreater(stage.options["notify_at"], stage.time)
+        self.assertEqual(stage.options["confirmation_days"], 0)
 
     def test_invalid_confirmation_deadline_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -214,6 +222,31 @@ class FoundationTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "invalid time"):
                 load_schedule_config(path)
+
+
+class ScalarFieldTests(unittest.TestCase):
+    """单选/人员/超链接字段同时带 id 和文字时，必须取到文字。"""
+
+    def test_option_id_is_not_preferred_over_text(self) -> None:
+        self.assertEqual(scalar([{"id": "optwbBg3XN", "text": "骨干学生"}]), "骨干学生")
+
+    def test_person_field_falls_back_to_name(self) -> None:
+        self.assertEqual(scalar([{"id": "ou_abc", "name": "江鑫鑫"}]), "江鑫鑫")
+
+    def test_hyperlink_keeps_the_url(self) -> None:
+        self.assertEqual(
+            scalar({"link": "https://example.com/doc", "text": "阶段报告"}),
+            "https://example.com/doc")
+
+    def test_identifier_is_used_when_no_text_exists(self) -> None:
+        self.assertEqual(scalar({"record_id": "rec_1"}), "rec_1")
+        self.assertEqual(scalar([{"id": "optwbBg3XN"}]), "optwbBg3XN")
+
+    def test_plain_values_are_unchanged(self) -> None:
+        self.assertEqual(scalar("骨干学生"), "骨干学生")
+        self.assertEqual(scalar(12), "12")
+        self.assertEqual(scalar(None), "")
+        self.assertEqual(scalar([]), "")
 
 
 if __name__ == "__main__":

@@ -162,6 +162,24 @@ class AlertTests(unittest.TestCase):
         self.assertIn("错误类型说明=飞书开放接口返回错误", content)
         self.assertNotIn("secret-ticket", content)
 
+    def test_repeated_identical_failure_alerts_the_admin_once(self):
+        """重试会反复抛同一条错误，只该打扰管理员一次；换了错误照样报。"""
+        messages = Mock()
+        messages.send_text.return_value = {"message_id": "alert"}
+        handler = self.attach(messages)
+        logger = logging.getLogger("workflow2.workflow")
+
+        for _ in range(5):
+            logger.error("workflow2_blocked run_id=%s error=%s",
+                         "run-1", "ValueError: 材料不完整")
+        handler.queue.join()
+        messages.send_text.assert_called_once()
+
+        logger.error("workflow2_blocked run_id=%s error=%s",
+                     "run-1", "ValueError: 组织关系异常")
+        handler.queue.join()
+        self.assertEqual(messages.send_text.call_count, 2)
+
     def test_alert_failure_is_logged_without_recursion(self):
         messages = Mock()
         def fail(*args, **kwargs):

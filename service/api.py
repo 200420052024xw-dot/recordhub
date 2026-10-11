@@ -26,10 +26,17 @@ from workflow1.models import (
     WorkBuddyIdentityRequest,
     WorkBuddySubmitRequest,
 )
+from workflow1.workflow import Workflow1
 from workflow1.workbuddy_inbox import LogSubmitService
 from tool.diagnostics import error_summary
 
 logger = logging.getLogger(__name__)
+
+# Skill 格式审核每夜扫几遍：首轮在配置时刻，之后每小时一遍，共 SKILL_REVIEW_SWEEPS 轮。
+# 只有接口/网络故障会留下未审核的记录，几轮之后仍重试不动就是真的有问题了。
+SKILL_REVIEW_SWEEPS = 4
+# 没跑完的当天逐小时重试的时刻（分）：留出一点余量，避免和整点起跑的当日流程抢。
+INCOMPLETE_RETRY_MINUTE = 20
 
 
 class NotificationSendRequest(BaseModel):
@@ -249,6 +256,24 @@ def _register_routes(app: FastAPI, runtime: Runtime, settings: AppSettings) -> N
             raise HTTPException(status_code=404, detail="Workflow2 run not found")
         return run.model_dump(mode="json")
 
+    @app.post("/admin/workflow2/retry", dependencies=[Depends(require_admin)])
+    def retry_workflow2(kind: str = "all") -> dict:
+        """手动重试卡住的周期任务：S04 阶段分析用 kind=stage，S05—S09 用 monthly/weekly。
+
+        缺省重试全部；无视自动重试预算，只补没完成的部分（已出草稿的部门/技能会跳过）。
+        """
+        if runtime.workflow2 is None:
+            raise HTTPException(status_code=503, detail="Workflow2 is unavailable")
+        try:
+            runs = runtime.workflow2.retry_blocked(kind)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.info("workflow2_manual_retry_finished kind=%s retried=%d", kind, len(runs))
+        return {"retried": [{"run_id": run.run_id, "kind": run.kind,
+                             "scheduled_date": run.scheduled_date.isoformat(),
+                             "status": run.status, "last_error": run.last_error}
+                            for run in runs]}
+
     # 对话入口(WorkBuddy)专用:独立 token,拿不到 admin 权限。
     def require_workbuddy(
         authorization: Annotated[str | None, Header()] = None
@@ -436,6 +461,50 @@ def _build_scheduler(
                 max_instances=1, coalesce=True,
             )
 
+        if isinstance(binding.workflow, Workflow1):
+            # 接口/网络失败的日志评价按 RECORDHUB_LLM_RETRY_INTERVAL_MINUTES 延后重试；
+            # 每 10 分钟看一眼有没有到点的，到了才重跑，避免整天没有评价。
+            def retry_failed_evaluations(one: WorkflowBinding = binding) -> None:
+                try:
+                    one.workflow.retry_failed_evaluations()
+                except Exception:
+                    logger.exception("failed_evaluation_retry_failed workflow=%s", one.name)
+
+            scheduler.add_job(
+                retry_failed_evaluations, "interval", minutes=10,
+                id=f"{name}_evaluation_retry", replace_existing=True,
+                max_instances=1, coalesce=True,
+            )
+
+            # 整天没跑完（快照没建、发布失败、进程被杀……）也要能自己好：
+            # 起跑后每小时重试一轮，最后一轮仍没完成就标"需人工补评"，之后不再自动折腾。
+            start_hour = int(str(schedule.time).split(":", 1)[0])
+            slots = [(start_hour + offset) % 24
+                     for offset in range(1, settings.llm_retry_limit + 1)]
+
+            def retry_incomplete(last: bool, one: WorkflowBinding = binding) -> None:
+                try:
+                    results = one.workflow.retry_incomplete(final=last)
+                    if results:
+                        logger.info("incomplete_day_retry workflow=%s final=%s results=%s",
+                                    one.name, last, results)
+                except Exception:
+                    logger.exception("incomplete_day_retry_failed workflow=%s", one.name)
+
+            if len(slots) > 1:
+                scheduler.add_job(
+                    retry_incomplete, "cron", args=[False],
+                    hour=",".join(str(hour) for hour in slots[:-1]), minute=INCOMPLETE_RETRY_MINUTE,
+                    id=f"{name}_incomplete_retry", replace_existing=True,
+                    max_instances=1, coalesce=True,
+                )
+            scheduler.add_job(
+                retry_incomplete, "cron", args=[True], hour=str(slots[-1]),
+                minute=INCOMPLETE_RETRY_MINUTE,
+                id=f"{name}_incomplete_retry_final", replace_existing=True,
+                max_instances=1, coalesce=True,
+            )
+
     def cleanup() -> None:
         today = datetime.now(ZoneInfo(schedules.timezone)).date()
         removed = sum(
@@ -470,10 +539,13 @@ def _build_scheduler(
             runtime.prompt_repository.review_pending(organization)
 
         # Use the freshly refreshed organization relations and finish before
-        # Workflow1 starts at 01:00.
+        # Workflow1 starts at 01:00. 之后每小时再扫一遍：接口故障导致的审核
+        # 只是留空（不写"未通过"、不通知本人），这几轮会把它们重审掉。
         review_hour, review_minute = map(int, skill_review.time.split(":"))
+        sweep_hours = ",".join(
+            str((review_hour + offset) % 24) for offset in range(SKILL_REVIEW_SWEEPS))
         scheduler.add_job(
-            review_skill_prompts, "cron", hour=review_hour, minute=review_minute,
+            review_skill_prompts, "cron", hour=sweep_hours, minute=review_minute,
             id="skill_prompt_review", replace_existing=True,
             max_instances=1, coalesce=True,
         )
@@ -499,8 +571,13 @@ def _build_scheduler(
             scheduler.add_job(run_workflow2, "cron", args=[kind], hour=hour,
                 minute=minute, **options, id=f"workflow2_{kind}",
                 replace_existing=True, max_instances=1, coalesce=True)
-            if notify_at := item.options.get("notify_at"):
-                notify_hour, notify_minute = map(int, str(notify_at).split(":"))
+            # notify_at 是催部长确认的时刻；report_notify_at 是给团队负责人推报告的时刻。
+            for option, suffix in (("notify_at", "notification"),
+                                   ("report_notify_at", "report_notification")):
+                moment = item.options.get(option)
+                if not moment:
+                    continue
+                notify_hour, notify_minute = map(int, str(moment).split(":"))
 
                 def notify_workflow2(cycle_kind: str) -> None:
                     today = datetime.now(ZoneInfo(schedules.timezone)).date()
@@ -508,7 +585,7 @@ def _build_scheduler(
 
                 scheduler.add_job(notify_workflow2, "cron", args=[kind],
                     hour=notify_hour, minute=notify_minute, **options,
-                    id=f"workflow2_{kind}_notification", replace_existing=True,
+                    id=f"workflow2_{kind}_{suffix}", replace_existing=True,
                     max_instances=1, coalesce=True)
         scheduler.add_job(runtime.workflow2.recover, "interval", minutes=15,
             id="workflow2_recovery", replace_existing=True, max_instances=1,

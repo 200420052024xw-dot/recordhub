@@ -41,6 +41,9 @@ class CycleRun(StrictModel):
     start_date: date
     end_date: date
     status: Literal["PENDING", "WAITING_CONFIRMATION", "BLOCKED", "FAILED", "COMPLETED"] = "PENDING"
+    # 失败（被阻塞）后按小时退避重试：已经重试几次、下次什么时候允许再试。
+    retry_count: int = 0
+    retry_after: datetime | None = None
     departments: dict[str, DepartmentResult] = Field(default_factory=dict)
     team_results: dict[str, dict[str, Any]] = Field(default_factory=dict)
     weekly_reference: dict[str, dict[str, Any]] = Field(default_factory=dict)

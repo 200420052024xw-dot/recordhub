@@ -141,6 +141,8 @@ def build_runtime(settings: AppSettings) -> Runtime:
                                  settings.archive_parent_folder_token),
         reports=WorkflowReportRepository(infrastructure.bitable, tables, store),
         llm_concurrency=settings.llm_concurrency,
+        llm_retry_interval_minutes=settings.llm_retry_interval_minutes,
+        llm_retry_limit=settings.llm_retry_limit,
         auto_advance_at=w1.auto_advance_at,
         notify_at=w1.notify_at,
         report_notify_at=w1.report_notify_at,
@@ -181,6 +183,8 @@ def build_runtime(settings: AppSettings) -> Runtime:
             schedules=schedules,
             archive_parent=settings.archive_parent_folder_token,
             notifications=notifications,
+            retry_interval_minutes=settings.llm_retry_interval_minutes,
+            retry_limit=settings.llm_retry_limit,
         )
     return Runtime(
         settings=settings,

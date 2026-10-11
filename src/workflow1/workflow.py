@@ -41,6 +41,31 @@ def greeting(person) -> str:
     return f"{person.name}{ROLE_TITLES.get(person.role, '')}，"
 
 
+# 评价输出解析不了时，把模型这次的原始文本原样放进「肯定之处_AI」，改进那栏指向它。
+# 内容其实已经生成，丢掉的话当天就完全没有评价，留下至少能人工核对。
+UNPARSED_IMPROVEMENT = "详情见「肯定之处_AI」"
+# 接口/网络失败没有文本可留：延后重试，最多三次；仍失败就写这句并报管理员。
+# 半夜这批 AI 评价不着急，间隔留足一小时，让上游抖动有时间自己恢复。
+# 实际取值由 RECORDHUB_LLM_RETRY_INTERVAL_MINUTES / _LIMIT 决定，这里是默认值。
+FAILED_EVALUATION_TEXT = "AI 评价失败，请人工补评"
+RETRY_LIMIT = 3
+RETRY_DELAY = timedelta(minutes=60)
+# 整天没跑完（快照没建、发布失败、进程被杀……）时，逐小时重试的回看窗口：
+# 只碰最近两天，别去翻陈年老账（重跑旧日期会补发过期的通知）。
+INCOMPLETE_RETRY_WINDOW_DAYS = 2
+# 已经标过"需人工补评"的日期不再自动折腾，等人来处理。
+MANUAL_REVIEW_KEY = "workflow1:manual-review"
+
+
+def _unparsed_output(exc: Exception) -> str:
+    """取回模型这次返回的原始文本；接口/网络错误没有文本，返回空串。"""
+    for item in (exc, exc.__cause__):
+        raw = getattr(item, "raw", None)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return ""
+
+
 class Workflow1:
     def __init__(self, *, store: FileStateStore,
                  organization_cache: OrganizationCache,
@@ -54,6 +79,8 @@ class Workflow1:
                  prompt_repository: PromptRepository | None = None,
                  workbuddy: LogSubmitService | None = None,
                  llm_concurrency: int = 3,
+                 llm_retry_interval_minutes: int = 60,
+                 llm_retry_limit: int = 3,
                  auto_advance_at: str = "12:00",
                  notify_at: str = "08:00",
                  report_notify_at: str = "22:00",
@@ -74,6 +101,8 @@ class Workflow1:
         self.documents = documents
         self.reports = reports
         self.llm_concurrency = llm_concurrency
+        self.llm_retry_delay = timedelta(minutes=llm_retry_interval_minutes)
+        self.llm_retry_limit = llm_retry_limit
         self.auto_advance_at = auto_advance_at
         self.notify_at = notify_at
         self.report_notify_at = report_notify_at
@@ -263,19 +292,133 @@ class Workflow1:
                         state.error = None
                     self.store.update_snapshot(target_date, save)
                 except Exception as exc:
-                    logger.exception("workflow1_log_failed date=%s log_id=%s", target_date, log_id)
                     failures.append(log_id)
-                    def fail(item: DailySnapshot) -> None:
-                        state = item.log_evaluations[log_id]
-                        state.status = UnitStatus.FAILED
-                        state.error = error_summary(exc)
-                    self.store.update_snapshot(target_date, fail)
-                    self._record_issue(
-                        target_date, f"log:{log_id}:ai-failed",
-                        f"日志 {log_id} AI 评价生成失败（重试已耗尽）：{error_summary(exc)}；"
-                        "已跳过，可调用重评接口补评")
+                    unparsed = _unparsed_output(exc)
+                    if unparsed:
+                        # 模型其实产出了内容，只是没法解析成两个字段：留着比丢掉强。
+                        # 这条是 warning 且不带 exc_info，不触发管理员告警。
+                        logger.warning("workflow1_log_unparsed date=%s log_id=%s error=%s",
+                                       target_date, log_id, error_summary(exc))
+                        def degrade(item: DailySnapshot) -> None:
+                            state = item.log_evaluations[log_id]
+                            state.positive_ai = state.positive_final = unparsed
+                            state.improvement_ai = state.improvement_final = UNPARSED_IMPROVEMENT
+                            state.status = (UnitStatus.WAITING_CONFIRMATION
+                                if state.evaluator_id else UnitStatus.CONFIRMED)
+                            state.evaluated_at = review_day_datetime(target_date)
+                            state.ai_evaluated_at = state.evaluated_at
+                            if state.status == UnitStatus.CONFIRMED:
+                                state.confirmed_at = state.evaluated_at
+                            state.error = error_summary(exc)
+                            state.fallback = "unparsed"
+                        self.store.update_snapshot(target_date, degrade)
+                        self._record_issue(
+                            target_date, f"log:{log_id}:ai-unparsed",
+                            f"日志 {log_id} 的 AI 评价无法解析成规定格式，已把模型原始输出"
+                            f"原样放进「肯定之处_AI」，改进栏指向它，请人工核对后确认："
+                            f"{error_summary(exc)}")
+                        continue
+                    self._defer_or_give_up(target_date, log_id, exc)
         logger.info("workflow1_logs_evaluated date=%s pending=%d failed=%d",
                     target_date, len(pending), len(failures))
+
+    def _defer_or_give_up(self, target_date: date, log_id: str, exc: Exception) -> None:
+        """接口/网络失败的日志评价：延后重试，最多 llm_retry_limit 次；仍失败才报管理员。"""
+        snapshot = self.store.load_snapshot(target_date)
+        current = snapshot.log_evaluations.get(log_id) if snapshot else None
+        attempt = (current.retry_count if current else 0) + 1
+        reason = error_summary(exc)
+        if attempt <= self.llm_retry_limit:
+            retry_after = utc_now() + self.llm_retry_delay
+            def defer(item: DailySnapshot) -> None:
+                state = item.log_evaluations[log_id]
+                state.status = UnitStatus.FAILED
+                state.retry_count = attempt
+                state.retry_after = retry_after
+                state.error = reason
+            self.store.update_snapshot(target_date, defer)
+            logger.warning("workflow1_log_evaluation_deferred date=%s log_id=%s "
+                           "attempt=%d/%d retry_after=%s error=%s",
+                           target_date, log_id, attempt, self.llm_retry_limit,
+                           retry_after, reason)
+            return
+        def give_up(item: DailySnapshot) -> None:
+            state = item.log_evaluations[log_id]
+            state.positive_ai = state.positive_final = FAILED_EVALUATION_TEXT
+            state.improvement_ai = state.improvement_final = FAILED_EVALUATION_TEXT
+            state.status = (UnitStatus.WAITING_CONFIRMATION
+                if state.evaluator_id else UnitStatus.CONFIRMED)
+            state.evaluated_at = review_day_datetime(target_date)
+            state.ai_evaluated_at = state.evaluated_at
+            if state.status == UnitStatus.CONFIRMED:
+                state.confirmed_at = state.evaluated_at
+            state.retry_after = None
+            state.error = reason
+            state.fallback = "failed"
+        self.store.update_snapshot(target_date, give_up)
+        self._record_issue(
+            target_date, f"log:{log_id}:ai-failed",
+            f"日志 {log_id} 的 AI 评价重试 {self.llm_retry_limit} 次仍失败，已标为"
+            f"「{FAILED_EVALUATION_TEXT}」并发布到评价表，请人工补评：{reason}")
+        # ERROR + 堆栈才会走管理员告警；这条是整轮重试之后才发的唯一一次。
+        logger.error("workflow1_log_evaluation_gave_up date=%s log_id=%s attempts=%d error=%s",
+                     target_date, log_id, self.llm_retry_limit, reason,
+                     exc_info=(type(exc), exc, exc.__traceback__))
+
+    def retry_incomplete(self, *, final: bool = False) -> list[dict]:
+        """重试没跑完的当天，只补没做完的部分。
+
+        final=True 是当天最后一轮：仍没完成就记一条"需人工补评"，之后不再自动重试。
+        """
+        today = utc_now().astimezone(ZoneInfo("Asia/Shanghai")).date()
+        results: list[dict] = []
+        for run in self.store.list_incomplete_workflows():
+            if run.target_date < today - timedelta(days=INCOMPLETE_RETRY_WINDOW_DAYS):
+                continue
+            snapshot = self.store.load_snapshot(run.target_date)
+            if snapshot is not None and MANUAL_REVIEW_KEY in snapshot.issues:
+                continue
+            result = self.start(run.target_date)
+            results.append({"target_date": run.target_date.isoformat(),
+                            "status": result.status, "last_error": result.last_error})
+            if not final or result.status == WorkflowStatus.COMPLETED:
+                continue
+            reason = (f"自动重试三次仍未完成（当前状态 {result.status}）："
+                      f"{result.last_error or '无错误信息'}；需人工补评")
+            if self.store.load_snapshot(run.target_date) is None:
+                # 连快照都没有，台账写不进去，至少让管理员收到一条。
+                logger.error("workflow1_needs_manual_review date=%s status=%s error=%s",
+                             run.target_date, result.status, result.last_error or "-")
+                continue
+            self._record_issue(run.target_date, MANUAL_REVIEW_KEY, reason)
+        return results
+
+    def retry_failed_evaluations(self) -> list[str]:
+        """到点重跑接口/网络失败的日志评价；被推迟的和次数用尽的不动。"""
+        retried: list[str] = []
+        now = utc_now()
+        for run in self.store.list_incomplete_workflows():
+            target_date = run.target_date
+            snapshot = self.store.load_snapshot(target_date)
+            if snapshot is None:
+                continue
+            due = {state.log_id for state in snapshot.log_evaluations.values()
+                   if state.status == UnitStatus.FAILED and state.retry_after
+                   and state.retry_after <= now}
+            if not due:
+                continue
+            def reopen(item: DailySnapshot) -> None:
+                for state in item.log_evaluations.values():
+                    if state.log_id in due:
+                        state.status = UnitStatus.PENDING
+                        state.retry_after = None
+                        state.error = None
+            self.store.update_snapshot(target_date, reopen)
+            logger.info("workflow1_evaluation_retry date=%s logs=%s",
+                        target_date, sorted(due))
+            self.start(target_date)
+            retried.append(target_date.isoformat())
+        return retried
 
     @workflow_diagnostics("workflow1")
     def _notify_once(self, target_date: date, key: str,

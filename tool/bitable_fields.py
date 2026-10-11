@@ -19,7 +19,15 @@ def record_fields(record: Mapping[str, Any]) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
+# 先取可读内容再取编号：单选、人员、超链接字段会同时带 id 和 text/name，
+# 取反了就会拿到 "opt…" 选项 ID 而不是"骨干学生"这样的字段值。
+# "link" 必须排在最前面：超链接字段的 link 是网址、text 是显示文字，报告表按网址做索引。
+TEXT_KEYS = ("link", "text", "texts", "name", "value")
+IDENTIFIER_KEYS = ("record_id", "id", "open_id", "user_id", "mobile")
+
+
 def scalar(value: Any) -> str:
+    """读取字段的可读值。"""
     if value is None:
         return ""
     if isinstance(value, str):
@@ -29,20 +37,13 @@ def scalar(value: Any) -> str:
     if isinstance(value, list):
         return scalar(value[0]) if value else ""
     if isinstance(value, Mapping):
-        for key in (
-            "record_id",
-            "id",
-            "open_id",
-            "user_id",
-            "link",
-            "text",
-            "texts",
-            "mobile",
-            "name",
-            "value",
-        ):
+        for key in TEXT_KEYS + IDENTIFIER_KEYS:
             if key in value:
-                return scalar(value[key])
+                text = scalar(value[key])
+                if text:
+                    return text
+        if any(key in value for key in TEXT_KEYS + IDENTIFIER_KEYS):
+            return ""
     return str(value)
 
 
