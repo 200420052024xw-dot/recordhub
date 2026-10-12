@@ -47,8 +47,8 @@ class DeepSeekClient:
         except json.JSONDecodeError as exc:
             raise StructuredOutputError("DeepSeek returned invalid JSON",
                                         raw=content) from exc
-        if not isinstance(result, dict):
-            raise StructuredOutputError("Structured output root must be a JSON object",
+        if not isinstance(result, (dict, list)):
+            raise StructuredOutputError("Structured output root must be a JSON object or array",
                                         raw=content)
         if validator is None:
             return result

@@ -180,10 +180,9 @@ class ProgressOutput(TextModel):
 
 
 class PersonnelItem(TextModel):
-    action: Literal["拟降级", "拟奖励", "拟退出", "拟提拔"]
-    person_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    result: Literal["拟降级", "拟奖励", "拟退出", "拟提拔"]
     reason: str = Field(min_length=1)
-    facts: list[str] = Field(min_length=1)
 
 
 class PersonnelOutput(TextModel):
@@ -192,7 +191,7 @@ class PersonnelOutput(TextModel):
 
 class IdeaItem(TextModel):
     idea: str = Field(min_length=1)
-    proposer_id: str = Field(min_length=1)
+    proposers: list[str] = Field(min_length=1)
 
 
 class IdeaOutput(TextModel):
@@ -200,9 +199,9 @@ class IdeaOutput(TextModel):
 
 
 class MeetingFocusItem(TextModel):
-    person_id: str = Field(min_length=1)
-    categories: list[Literal["思想或态度沟通", "持续困难", "兴趣", "好idea", "培养潜力"]] = Field(min_length=1)
-    evidence: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    focus: list[Literal["思想或态度沟通", "持续困难", "兴趣", "好idea", "培养潜力"]] = Field(min_length=1)
+    reason: str = Field(min_length=1)
 
 
 class MeetingFocusOutput(TextModel):
@@ -210,16 +209,14 @@ class MeetingFocusOutput(TextModel):
 
 
 class TechnologyItem(TextModel):
-    technology_name: str = Field(min_length=1)
-    category: Literal["工程", "科研"]
-    problem_solved: str = Field(min_length=1)
-    department_ids: list[str] = Field(min_length=1)
-    contributor_ids: list[str] = Field(min_length=1)
-    existing_achievements: str = ""
-    achievement_refs: list[str] = Field(default_factory=list)
-    suitable_scenarios: str = ""
-    repository_suggestion: str = Field(min_length=1)
-    pending_items: list[str] = Field(default_factory=list)
+    name: str = Field(min_length=1)
+    type: Literal["工程", "科研"] | None = None
+    problem: str = Field(min_length=1)
+    contributors: list[str] = Field(min_length=1)
+    achievements: list[str] = Field(default_factory=list)
+    usage: list[str] = Field(default_factory=list)
+    suggestion: str = Field(min_length=1)
+    todo: list[str] = Field(default_factory=list)
 
 
 class TechnologyOutput(TextModel):
@@ -228,14 +225,13 @@ class TechnologyOutput(TextModel):
 
 class TrainingItem(TextModel):
     topic: str = Field(min_length=1)
-    target_audience: str = Field(min_length=1)
-    target_person_ids: list[str] = Field(min_length=1)
-    common_need: str = Field(min_length=1)
-    evidence: str = Field(min_length=1)
-    expected_effect: str = Field(min_length=1)
-    available_resource_ids: list[str] = Field(default_factory=list)
-    approach: str = Field(min_length=1)
-    course_suggestion: str = Field(min_length=1)
+    audience: list[str] = Field(default_factory=list)
+    needs: list[str] = Field(default_factory=list)
+    reason: str = Field(min_length=1)
+    goals: list[str] = Field(default_factory=list)
+    resources: list[str] = Field(default_factory=list)
+    method: str = Field(min_length=1)
+    suggestion: str = Field(min_length=1)
 
 
 class TrainingOutput(TextModel):
@@ -269,36 +265,28 @@ class TextSkill(Generic[OutputT]):
     version = "1.0"
     output_model: type[OutputT]
     requires_confirmed = False
+    array_root = False  # S05-S09 输出顶层 JSON 数组；S04 输出 {"items":[...]}
 
     def validate_input(self, data: SkillInput) -> None:
         """Specialized Skills may add structural constraints, never filtering."""
 
     def prompt_payload(self, data: SkillInput) -> StrictModel | str:
-        """默认发材料 JSON；只汇总日志原文的 Skill（S04）改发纯文本。"""
+        """默认发材料 JSON；只汇总日志原文的 Skill 改发纯文本。"""
         return data
 
     def validate_output(self, output: OutputT, data: SkillInput) -> None:
-        """Anchor conclusions to the people and departments actually supplied."""
-        records = [record for record in data.records if record.submitted]
-        people = {record.person_id for record in records}
-        departments = {record.department_id for record in records}
+        """结论锚定在本次材料里真实出现的人名上（姓名化，不再用编号）。"""
+        names = {record.name for record in data.records if record.submitted}
         for item in getattr(output, "items", []):
-            for name in ("person_id", "proposer_id"):
-                person_id = getattr(item, name, None)
-                if person_id is not None and person_id not in people:
-                    raise ValueError(f"{name} 不在本次材料人员名单内")
-            for name in ("participant_ids", "contributor_ids", "target_person_ids"):
-                values = getattr(item, name, None)
+            for field in ("participant_names", "proposers", "contributors"):
+                values = getattr(item, field, None)
                 if values is not None:
-                    self._validate_ids(name, values, people)
-            values = getattr(item, "department_ids", None)
-            if values is not None:
-                self._validate_ids("department_ids", values, departments)
+                    self._validate_names(field, values, names)
 
     @staticmethod
-    def _validate_ids(name: str, values: list[str], allowed: set[str]) -> None:
+    def _validate_names(field: str, values: list[str], allowed: set[str]) -> None:
         if len(values) != len(set(values)) or not set(values) <= allowed:
-            raise ValueError(f"{name} 重复或不在本次材料范围内")
+            raise ValueError(f"{field} 重复或不在本次材料人员名单内")
 
     def run(self, service: PromptService, data: SkillInput, *, user_id: str,
             prompts: PromptRepository | None = None) -> SkillResult[OutputT]:
@@ -334,22 +322,10 @@ class TextSkill(Generic[OutputT]):
                 status=SkillStatus.BLOCKED, message="输入含未确认记录，请先完成确认")
         # Missing submissions never enter the prompt payload.
         payload = data.model_copy(update={"records": submitted}, deep=True)
-        people_ids = sorted({record.person_id for record in submitted})
-        department_ids = sorted({record.department_id for record in submitted})
-        achievement_ids = sorted({ref for record in submitted
-                                 for ref in record.achievement_refs})
-        resource_ids = sorted({resource.resource_id for resource in data.resources})
-        id_hint = (
-            "\n\n本次输入材料中可引用的编号（所有编号类字段只能从这里取，不得编造）：\n"
-            f"- 人员编号 person_id：{', '.join(people_ids) or '无'}\n"
-            f"- 部门编号 department_id：{', '.join(department_ids) or '无'}\n"
-            f"- 成果出处编号 achievement_refs：{', '.join(achievement_ids) or '无'}\n"
-            f"- 资源编号 resource_id：{', '.join(resource_ids) or '无'}"
-        )
         if self.code == SkillCode.S04:
-            id_hint = (
-                "\n\nparticipant_names 只能取输入中出现过的姓名，原样引用，不得编造。"
-            )
+            id_hint = "\n\nparticipant_names 只能取输入中出现过的姓名，原样引用，不得编造。"
+        else:
+            id_hint = ""
         payload = self.prompt_payload(payload)
         builtin_template = (Path('prompts') / f'{self.code.value}.txt').read_text(
             encoding='utf-8').strip()
@@ -359,6 +335,7 @@ class TextSkill(Generic[OutputT]):
                 prompt_code=self.code.value, template=template,
                 input_data=payload, output_model=self.output_model,
                 semantic_validator=lambda value: self.validate_output(value, data),
+                array_root=self.array_root,
             )
         except LLMError:
             if selected is None:
@@ -372,6 +349,7 @@ class TextSkill(Generic[OutputT]):
                 prompt_code=self.code.value, template=builtin_template + id_hint,
                 input_data=payload, output_model=self.output_model,
                 semantic_validator=lambda value: self.validate_output(value, data),
+                array_root=self.array_root,
             )
         return SkillResult[self.output_model](**metadata(),
             status=SkillStatus.WAITING_CONFIRMATION, content=output)
@@ -419,74 +397,127 @@ class S04Skill(TextSkill[ProgressOutput]):
             if not set(item.participant_names) <= names:
                 raise ValueError("participant_names 不在本次材料人员名单内")
 
+# S05-S09 的输入是一段纯文本（姓名 / 日志原文 / 定稿版评价），不再发编号 JSON。
+
+def _log_text(record: TextRecord) -> str:
+    if record.full_log.strip():
+        return record.full_log.strip()
+    sections = (("工作进展", record.progress), ("工作困难", record.difficulties),
+                ("心得反思", record.reflection), ("其他", record.other))
+    filled = [f"{label}:{text.strip()}" for label, text in sections if text.strip()]
+    return "\n".join(filled) or "未填写"
+
+
+def _evaluation_text(record: TextRecord) -> str:
+    reviews = record.evaluations
+    if not reviews:
+        return "无"
+    review = reviews[0]
+    parts = []
+    if review.positive.strip():
+        parts.append(f"肯定之处：{review.positive.strip()}")
+    if review.improvement.strip():
+        parts.append(f"改进之处：{review.improvement.strip()}")
+    return "\n".join(parts) or "无"
+
+
+def _periodic_material(data: SkillInput, *, with_backbone: bool) -> str:
+    records = [record for record in data.records if record.submitted]
+    blocks: list[str] = []
+    if with_backbone:
+        backbone = next((record for record in records if record.role == "骨干学生"), None)
+        if backbone is not None:
+            blocks.append(f"本次骨干：{backbone.name}")
+    ordered = sorted(records, key=lambda record: (record.work_start, record.name))
+    for record in ordered:
+        blocks.append("\n".join([
+            f"姓名：{record.name}",
+            "日志原文：",
+            _log_text(record),
+            "定稿版评价：",
+            _evaluation_text(record),
+        ]))
+    return "\n\n".join(blocks)
+
+
 # S05: evidence-backed personnel suggestions, never personnel mutations.
 class S05Skill(TextSkill[PersonnelOutput]):
     code = SkillCode.S05
     output_model = PersonnelOutput
     requires_confirmed = True
+    array_root = True
+
+    def prompt_payload(self, data: SkillInput) -> str:
+        return _periodic_material(data, with_backbone=True)
 
     def validate_output(self, output: PersonnelOutput, data: SkillInput) -> None:
         super().validate_output(output, data)
+        roles = {record.name: record.role for record in data.records if record.submitted}
         seen = set()
         for item in output.items:
-            key = (item.action, item.person_id)
-            if key in seen:
-                raise ValueError("S05 同一人员同一建议类型重复")
-            seen.add(key)
-            required = "骨干学生" if item.action in {"拟降级", "拟奖励"} else "基层学生"
-            roles = {record.role for record in data.records
-                     if record.submitted and record.person_id == item.person_id}
-            if roles != {required}:
+            if item.name not in roles:
+                raise ValueError("S05 的 name 不在本次材料人员名单内")
+            if item.name in seen:
+                raise ValueError("S05 同一人员重复")
+            seen.add(item.name)
+            required = "骨干学生" if item.result in {"拟降级", "拟奖励"} else "基层学生"
+            if roles[item.name] != required:
                 raise ValueError("S05 建议类型与该人员的角色不符")
+
 
 # S06: identify ideas actually proposed in the supplied records.
 class S06Skill(TextSkill[IdeaOutput]):
     code = SkillCode.S06
     output_model = IdeaOutput
     requires_confirmed = True
+    array_root = True
+
+    def prompt_payload(self, data: SkillInput) -> str:
+        return _periodic_material(data, with_backbone=True)
+
 
 # S07: prepare evidence-backed discussion topics for student meetings.
 class S07Skill(TextSkill[MeetingFocusOutput]):
     code = SkillCode.S07
     output_model = MeetingFocusOutput
     requires_confirmed = True
+    array_root = True
+
+    def prompt_payload(self, data: SkillInput) -> str:
+        return _periodic_material(data, with_backbone=True)
 
     def validate_output(self, output: MeetingFocusOutput, data: SkillInput) -> None:
         super().validate_output(output, data)
+        names = {record.name for record in data.records if record.submitted}
         seen = set()
         for item in output.items:
-            if item.person_id in seen or len(item.categories) != len(set(item.categories)):
+            if item.name not in names:
+                raise ValueError("S07 的 name 不在本次材料人员名单内")
+            if item.name in seen or len(item.focus) != len(set(item.focus)):
                 raise ValueError("S07 人员或关注类别重复")
-            seen.add(item.person_id)
-            if any(record.role not in {"基层学生", "骨干学生"} for record in data.records
-                   if record.submitted and record.person_id == item.person_id):
-                raise ValueError("S07 重点谈话对象必须是学生")
+            seen.add(item.name)
+
 
 # S08: suggest reusable technical knowledge from supplied evidence.
 class S08Skill(TextSkill[TechnologyOutput]):
     code = SkillCode.S08
     output_model = TechnologyOutput
     requires_confirmed = True
+    array_root = True
 
-    def validate_output(self, output: TechnologyOutput, data: SkillInput) -> None:
-        super().validate_output(output, data)
-        available = {ref for record in data.records if record.submitted
-                     for ref in record.achievement_refs}
-        for item in output.items:
-            self._validate_ids("achievement_refs", item.achievement_refs, available)
+    def prompt_payload(self, data: SkillInput) -> str:
+        return _periodic_material(data, with_backbone=False)
+
 
 # S09: suggest shared training using only supplied needs and resources.
 class S09Skill(TextSkill[TrainingOutput]):
     code = SkillCode.S09
     output_model = TrainingOutput
     requires_confirmed = True
+    array_root = True
 
-    def validate_output(self, output: TrainingOutput, data: SkillInput) -> None:
-        super().validate_output(output, data)
-        resources = {item.resource_id for item in data.resources}
-        for item in output.items:
-            self._validate_ids("available_resource_ids", item.available_resource_ids,
-                               resources)
+    def prompt_payload(self, data: SkillInput) -> str:
+        return _periodic_material(data, with_backbone=False)
 
 
 # --- Registry and dispatch ---

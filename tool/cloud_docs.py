@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from typing import Any
 from urllib.parse import quote
@@ -97,3 +98,78 @@ def text_block(text: str, *, link: str | None = None, heading: int = 0) -> dict[
 def divider_block() -> dict[str, Any]:
     """Feishu docx horizontal divider (block_type 22)."""
     return {"block_type": 22, "divider": {}}
+
+
+# --- 轻量 Markdown → 飞书文档块 ---
+
+def _inline_elements(text: str) -> list[dict[str, Any]]:
+    """把 **加粗** 段拆成多个 text_run；不配对的 ** 按原文处理。"""
+    parts = text.split("**")
+    elements: list[dict[str, Any]] = []
+    for index, part in enumerate(parts):
+        if not part:
+            continue
+        run: dict[str, Any] = {"text_run": {"content": part}}
+        if index % 2 == 1:
+            run["text_run"]["text_element_style"] = {"bold": True}
+        elements.append(run)
+    return elements
+
+
+def paragraph_block(text: str, *, heading: int = 0, bold: bool = False) -> dict[str, Any]:
+    """普通文本块；heading=1/2/3 时是标题块，bold=True 时整段加粗（做字段标签）。"""
+    if heading:
+        return {"block_type": heading + 2,
+                f"heading{heading}": {"elements": _inline_elements(text)}}
+    if bold:
+        return {"block_type": 2, "text": {"elements": [
+            {"text_run": {"content": text, "text_element_style": {"bold": True}}}]}}
+    return {"block_type": 2, "text": {"elements": _inline_elements(text)}}
+
+
+def label_value_block(label: str, content: str) -> dict[str, Any]:
+    """一行「加粗标签：正文」，用于把短列表/短值并进同一行。"""
+    return {"block_type": 2, "text": {"elements": [
+        {"text_run": {"content": label, "text_element_style": {"bold": True}}},
+        {"text_run": {"content": content}},
+    ]}}
+
+
+def bullet_block(text: str) -> dict[str, Any]:
+    """项目符号块（block_type 12）。"""
+    return {"block_type": 12, "bullet": {"elements": _inline_elements(text)}}
+
+
+def ordered_block(text: str) -> dict[str, Any]:
+    """有序列表块（block_type 13）。"""
+    return {"block_type": 13, "ordered": {"elements": _inline_elements(text)}}
+
+
+def markdown_blocks(text: str) -> list[dict[str, Any]]:
+    """宽松地把带轻量 Markdown 的文本转成飞书文档块。
+
+    支持 #/##/### 标题、- /* 项目符号、1. 有序列表、**加粗**；其余行按普通文本。
+    无法识别的行不会抛异常，只原样变成文本块。
+    """
+    blocks: list[dict[str, Any]] = []
+    for raw in (text or "").split("\n"):
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        content = line.strip()
+        if content.startswith("### "):
+            blocks.append({"block_type": 5,
+                           "heading3": {"elements": _inline_elements(content[4:].strip())}})
+        elif content.startswith("## "):
+            blocks.append({"block_type": 4,
+                           "heading2": {"elements": _inline_elements(content[3:].strip())}})
+        elif content.startswith("# "):
+            blocks.append({"block_type": 3,
+                           "heading1": {"elements": _inline_elements(content[2:].strip())}})
+        elif content.startswith("- ") or content.startswith("* "):
+            blocks.append(bullet_block(content[2:].strip()))
+        elif re.match(r"^\d+\.\s", content):
+            blocks.append(ordered_block(re.sub(r"^\d+\.\s", "", content, count=1).strip()))
+        else:
+            blocks.append(paragraph_block(line.strip()))
+    return blocks

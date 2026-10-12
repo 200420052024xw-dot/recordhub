@@ -55,11 +55,11 @@ def _failure_detail(exc: Exception) -> str:
     return str(exc).strip()[:200]
 
 
-def _repair_note(exc: Exception, output_model: type[BaseModel]) -> str:
-    fields = "、".join(output_model.model_fields)
+def _repair_note(exc: Exception, field_names: list[str]) -> str:
+    fields = "、".join(field_names)
     return (
         f"上一次输出未通过校验：{_failure_detail(exc)}。"
-        f"请重新输出一个合法的 JSON 对象，只允许出现这些字段：{fields}。"
+        f"请重新输出一个合法的 JSON，只允许出现这些字段：{fields}。"
         "不要新增未定义的字段，不要输出空字符串或数组；"
         "同一字段内的多条内容写在同一段文字里分点说明，不要拆成多个字段。"
     )
@@ -80,19 +80,32 @@ class PromptService:
         self, *, prompt_code: str, template: str,
         input_data: BaseModel | str, output_model: type[T],
         semantic_validator: Callable[[T], None] | None = None,
-        retry_feedback: bool = True,
+        retry_feedback: bool = True, array_root: bool = False,
     ) -> T:
-        """retry_feedback=False 时每次重试都原样重发，用于判定模板本身是否合格。"""
+        """retry_feedback=False 时每次重试都原样重发，用于判定模板本身是否合格。
+
+        array_root=True 时提示词输出顶层 JSON 数组，这里把它包成 output_model 的 items。
+        """
+        schema = output_model.model_json_schema()
+        if array_root:
+            schema = schema.get("properties", {}).get("items", schema)
+        root_kind = "数组" if array_root else "对象"
         base_messages = [
             {"role": "system", "content": (
-                f"你正在执行 {prompt_code}。只输出一个合法 JSON 对象，不要输出 "
+                f"你正在执行 {prompt_code}。只输出一个合法 JSON {root_kind}，不要输出 "
                 "Markdown 代码围栏或额外说明。\n\n"
                 f"{template}\n\n"
                 "输出必须符合以下 JSON Schema：\n"
-                + json.dumps(output_model.model_json_schema(), ensure_ascii=False)
+                + json.dumps(schema, ensure_ascii=False)
             )},
             {"role": "user", "content": _material_message(input_data)},
         ]
+
+        def _validator(raw):
+            if array_root and isinstance(raw, list):
+                raw = {"items": raw}
+            return output_model.model_validate(raw)
+
         last_error: Exception | None = None
         raw_output: str | None = None
         repair_note: str | None = None
@@ -104,8 +117,7 @@ class PromptService:
                 messages.append({"role": "user", "content": repair_note})
             parsed: T | None = None
             try:
-                parsed = self.client.complete_json(
-                    messages, validator=output_model.model_validate)
+                parsed = self.client.complete_json(messages, validator=_validator)
                 if semantic_validator:
                     semantic_validator(parsed)
                 if attempt > 1:
@@ -119,7 +131,7 @@ class PromptService:
                 if attempt == self.max_attempts:
                     break
                 raw_output, repair_note = self._retry_hint(
-                    exc, parsed, output_model, retry_feedback)
+                    exc, parsed, output_model, retry_feedback, array_root)
                 time.sleep(2 ** (attempt - 1))
         # Only reached when every attempt failed (the success path returns above).
         logger.error("llm_attempts_exhausted prompt_code=%s", prompt_code)
@@ -130,7 +142,7 @@ class PromptService:
     @staticmethod
     def _retry_hint(exc: Exception, parsed: BaseModel | None,
                     output_model: type[BaseModel],
-                    enabled: bool) -> tuple[str | None, str | None]:
+                    enabled: bool, array_root: bool = False) -> tuple[str | None, str | None]:
         """返回下一次请求要附带的（上一次原始输出, 纠正说明）。"""
         if not enabled or isinstance(exc, DeepSeekApiError):
             # 接口或网络错误与输出格式无关，原样重发才对。
@@ -138,4 +150,10 @@ class PromptService:
         raw = getattr(exc, "raw", None)
         if not raw and parsed is not None:
             raw = json.dumps(parsed.model_dump(mode="json"), ensure_ascii=False)
-        return raw, _repair_note(exc, output_model)
+        schema = output_model.model_json_schema()
+        if array_root:
+            item = schema.get("properties", {}).get("items", {})
+            fields = list(item.get("properties", {}).keys())
+        else:
+            fields = list(output_model.model_fields.keys())
+        return raw, _repair_note(exc, fields)

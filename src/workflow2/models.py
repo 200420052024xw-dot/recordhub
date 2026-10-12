@@ -60,7 +60,6 @@ class CycleRun(StrictModel):
 class DepartmentAnalysis(StrictModel):
     """One department's S08/S09 draft items, fed to the weekly summary call."""
 
-    department_id: str
     department_name: str
     items: list[dict[str, Any]] = Field(default_factory=list)
 

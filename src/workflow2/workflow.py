@@ -18,7 +18,8 @@ from llm import PromptRepository, PromptService
 from schema import Organization
 from workflow2.skills import SkillRunner, TechnologyOutput, TrainingOutput
 from tool.bitable_fields import field_datetime, record_fields, references, scalar
-from tool.cloud_docs import CloudDocsService, divider_block, text_block
+from tool.cloud_docs import (CloudDocsService, divider_block, label_value_block,
+                             markdown_blocks, paragraph_block, text_block)
 from tool.feishu import MessageService
 from tool.diagnostics import error_summary, workflow_diagnostics, diagnostic_context
 from tool.notifications import NotificationPolicy, manual_notifications, record_outcome
@@ -59,108 +60,157 @@ FIELD_LABELS = {
     "work_item": "工作事项",
     "current_progress": "当前进展",
     "main_difficulties": "主要困难",
-    "action": "建议类型",
+    "name": "姓名",
+    "result": "建议类型",
     "reason": "理由",
-    "facts": "事实依据",
     "idea": "想法",
-    "categories": "关注类别",
-    "evidence": "依据",
-    "technology_name": "技术名称",
-    "category": "类别",
-    "problem_solved": "解决的问题",
-    "existing_achievements": "已有成果",
-    "achievement_refs": "成果出处",
-    "suitable_scenarios": "适用场景",
-    "repository_suggestion": "入库建议",
-    "pending_items": "待完善事项",
-    "topic": "主题",
-    "target_audience": "面向人员",
-    "common_need": "共同需求",
-    "expected_effect": "预期效果",
-    "available_resource_ids": "可用资源",
-    "approach": "开展方式",
-    "course_suggestion": "课程建议",
+    "focus": "关注类别",
+    "type": "类别",
+    "problem": "解决的问题",
+    "contributors": "贡献者",
+    "achievements": "已有成果",
+    "usage": "适用场景",
+    "suggestion": "建议",
+    "todo": "待完善事项",
+    "topic": "培训主题",
+    "audience": "面向人员",
+    "needs": "共同需求",
+    "goals": "预期效果",
+    "resources": "可用资源",
+    "method": "开展方式",
 }
 
-# 已解析成姓名/部门名展示的编号字段，不再重复出现在“具体内容”里。
-# participant_names 本身就是姓名（S04 输入不含编号），直接进“涉及人员”。
-_ID_FIELDS = {
-    "person_id", "proposer_id", "participant_ids", "contributor_ids",
-    "target_person_ids", "department_ids", "participant_names",
-}
+# 已并进“涉及人员”展示的姓名列表字段，不再重复出现在“具体内容”里。
+_NAME_FIELDS = {"participant_names", "proposers", "contributors"}
 
 
-def _item_text(item: dict, code: str, organization: Organization,
-               department_ids: list[str] | None = None) -> str:
-    people = organization.person_map()
-    departments = organization.department_map()
-
-    subject = None
-    subject_field = None
-    for key in ("work_item", "topic", "technology_name", "idea"):
+def _subject(item: dict, code: str) -> str:
+    if code == "S05":
+        return f"{item.get('name', '')}｜{item.get('result', '')}"
+    if code == "S06":
+        idea = str(item.get("idea", "")).strip().split("\n")[0].strip()
+        return idea[:40] or "idea"
+    for key in ("work_item", "topic", "name"):
         if item.get(key):
-            subject = item[key]
-            subject_field = key
-            break
-    if subject is None and item.get("person_id"):
-        person = people.get(item["person_id"])
-        subject = person.name if person else str(item["person_id"])
-    subject = subject or NAMES[code]
+            return str(item[key])
+    return NAMES[code]
 
-    person_ids: list[str] = []
-    for key in ("participant_ids", "contributor_ids", "target_person_ids"):
-        person_ids.extend(item.get(key) or [])
-    for key in ("person_id", "proposer_id"):
-        value = item.get(key)
-        if value:
-            person_ids.append(value)
+
+def _subject_fields(code: str) -> set[str]:
+    if code == "S05":
+        return {"name", "result"}
+    if code == "S09":
+        return {"topic"}
+    if code in ("S08", "S10"):
+        return {"name"}
+    if code == "S04":
+        return {"work_item"}
+    return set()
+
+
+def _names_of(item: dict) -> list[str]:
     names: list[str] = []
-    seen: set[str] = set()
-    for pid in person_ids:
-        if pid in seen:
-            continue
-        seen.add(pid)
-        person = people.get(pid)
-        names.append(person.name if person else str(pid))
-    for name in item.get("participant_names") or []:
-        if name in seen:
-            continue
-        seen.add(name)
-        names.append(name)
+    for key in ("participant_names", "proposers", "contributors"):
+        for name in item.get(key) or []:
+            if name not in names:
+                names.append(name)
+    return names
 
-    dept_ids = list(department_ids or item.get("department_ids") or [])
-    dept_names: list[str] = []
-    seen_depts: set[str] = set()
-    for did in dept_ids:
-        if did in seen_depts:
-            continue
-        seen_depts.add(did)
-        department = departments.get(did)
-        dept_names.append(department.name if department else str(did))
 
-    excluded = set(_ID_FIELDS)
-    if subject_field:
-        excluded.add(subject_field)
-    detail_parts: list[str] = []
+def _item_plain(item: dict, code: str) -> str:
+    """多维表格里的一项纯文本；姓名已直接给出，无需解析编号。"""
+    lines = [f"-结果类别：{NAMES[code]}", f"-主题或对象：{_subject(item, code)}"]
+    skip = set(_NAME_FIELDS) | _subject_fields(code)
     for key, value in item.items():
-        if key in excluded or value in ("", [], None):
+        if key in skip or value in ("", [], None):
             continue
         rendered = "、".join(map(str, value)) if isinstance(value, list) else str(value)
-        detail_parts.append(f"{FIELD_LABELS.get(key, key)}：{rendered}")
-
-    return (f"-结果类别：{NAMES[code]}\n"
-            f"-主题或对象：{subject}\n"
-            f"-涉及人员及部门：{'、'.join(names) or '未指定'}；"
-            f"{'、'.join(dept_names) or '未指定'}\n"
-            f"-具体内容：{'；'.join(detail_parts) or '—'}")
+        lines.append(f"-{FIELD_LABELS.get(key, key)}：{rendered}")
+    names = _names_of(item)
+    if names:
+        lines.append(f"-涉及人员：{'、'.join(names)}")
+    return "\n".join(lines)
 
 
-def _result_text(result: dict, code: str, organization: Organization,
+def _result_text(result: dict, code: str, organization: Organization | None = None,
                  department_ids: list[str] | None = None) -> str:
     content = result.get("content") or {}
     items = content.get("items") or []
-    return "\n\n".join(_item_text(item, code, organization, department_ids)
-                       for item in items) or "本范围内暂无可确认的分析条目。"
+    return "\n\n".join(_item_plain(item, code) for item in items) \
+        or "本范围内暂无可确认的分析条目。"
+
+
+def _doc_field(blocks: list[dict], label: str, value):
+    """文档里渲染一个字段：短值/列表并成一行，长文字保留 Markdown 块。"""
+    if value in ("", [], None):
+        return
+    if isinstance(value, list):
+        blocks.append(label_value_block(f"{label}：", "、".join(str(entry) for entry in value)))
+        return
+    text = str(value)
+    if "\n" not in text and not text.startswith("- ") and "**" not in text:
+        blocks.append(label_value_block(f"{label}：", text))
+    else:
+        blocks.append(paragraph_block(label, bold=True))
+        blocks.extend(markdown_blocks(text))
+
+
+def _result_doc_blocks(result: dict, code: str) -> list[dict]:
+    """把 Skill 结果渲染成飞书文档块（标题 + 加粗标签 + Markdown 项目符号）。"""
+    content = result.get("content") or {}
+    items = content.get("items") or []
+    blocks: list[dict] = []
+    for index, item in enumerate(items, 1):
+        if code == "S04":
+            blocks.append(text_block(str(item.get("work_item", "工作事项")), heading=2))
+            names = "、".join(item.get("participant_names") or [])
+            if names:
+                blocks.append(label_value_block("参与人员：", names))
+            _doc_field(blocks, "当前进展", item.get("current_progress"))
+            _doc_field(blocks, "主要困难", item.get("main_difficulties"))
+        elif code == "S05":
+            blocks.append(text_block(f"{item.get('name', '')}｜{item.get('result', '')}",
+                                    heading=2))
+            _doc_field(blocks, "理由", item.get("reason"))
+        elif code == "S06":
+            blocks.append(text_block(f"idea {index}", heading=2))
+            names = "、".join(item.get("proposers") or [])
+            if names:
+                blocks.append(label_value_block("提出者：", names))
+            _doc_field(blocks, "内容", item.get("idea"))
+        elif code == "S07":
+            blocks.append(text_block(str(item.get("name", "")), heading=2))
+            focus = "、".join(item.get("focus") or [])
+            if focus:
+                blocks.append(label_value_block("关注类别：", focus))
+            _doc_field(blocks, "依据", item.get("reason"))
+        elif code in ("S08", "S10"):
+            blocks.append(text_block(str(item.get("name", "")), heading=2))
+            for key, label in (("type", "类别"), ("problem", "解决的问题"),
+                               ("contributors", "贡献者"), ("achievements", "已有成果"),
+                               ("usage", "适用场景"), ("suggestion", "入库建议"),
+                               ("todo", "待完善")):
+                _doc_field(blocks, label, item.get(key))
+        elif code == "S09":
+            blocks.append(text_block(str(item.get("topic", "")), heading=2))
+            for key, label in (("audience", "面向人员"), ("needs", "共同需求"),
+                               ("reason", "依据"), ("goals", "预期效果"),
+                               ("resources", "可用资源"), ("method", "开展方式"),
+                               ("suggestion", "课程建议")):
+                _doc_field(blocks, label, item.get(key))
+        blocks.append(divider_block())
+    return blocks
+
+
+def _final_blocks(draft, code: str, notice: str = "") -> list[dict]:
+    """AI 草稿渲染成结构化块；部长“需修改”的自由文本走宽松 Markdown。"""
+    if code in draft.drafts and draft.final_text.get(code) == draft.draft_text.get(code):
+        blocks: list[dict] = []
+        if notice:
+            blocks.append(text_block(notice))
+        blocks.extend(_result_doc_blocks(draft.drafts[code], code))
+        return blocks
+    return markdown_blocks(draft.final_text.get(code, ""))
 
 
 class Workflow2:
@@ -633,17 +683,12 @@ class Workflow2:
                     self.store.save(run)
 
         # ③ summary pass merging the reference and department drafts.
-        allowed_people = {record.person_id for record in team_material.input.records
-                          if record.submitted}
-        allowed_departments = {record.department_id for record in team_material.input.records
-                               if record.submitted}
-        allowed_resources = {resource.resource_id for resource in team_material.input.resources}
         names = organization.department_map()
         for code in CODES["weekly"]:
             if code in run.team_results:
                 continue
             sections = [DepartmentAnalysis(
-                department_id=department_id, department_name=names[department_id].name,
+                department_name=names[department_id].name,
                 items=((run.department_results[department_id].get(code) or {})
                        .get("content") or {}).get("items", []))
                 for department_id in department_ids]
@@ -651,28 +696,21 @@ class Workflow2:
                                .get("content") or {}).get("items", [])
             data = WeeklySummaryInput(skill_code=code, start_date=run.start_date,
                 end_date=run.end_date, reference_items=reference_items, departments=sections)
-            allowed_refs = {ref for section in [reference_items, *(s.items for s in sections)]
-                            for item in section for ref in item.get("achievement_refs", [])}
+            allowed_names = {name
+                             for section in [reference_items, *(s.items for s in sections)]
+                             for item in section
+                             for key in ("contributors", "proposers")
+                             for name in (item.get(key) or [])}
 
-            def validate(output, *, _people=allowed_people, _departments=allowed_departments,
-                         _resources=allowed_resources, _refs=allowed_refs) -> None:
+            def validate(output, *, _names=allowed_names) -> None:
                 for item in output.items:
-                    for name in ("participant_ids", "contributor_ids", "target_person_ids"):
-                        values = getattr(item, name, None)
-                        if values is not None and not set(values) <= _people:
-                            raise ValueError(f"总结的 {name} 超出本次周度材料人员")
-                    values = getattr(item, "department_ids", None)
-                    if values is not None and not set(values) <= _departments:
-                        raise ValueError("总结的部门编号超出本次周度材料")
-                    values = getattr(item, "available_resource_ids", None)
-                    if values is not None and not set(values) <= _resources:
-                        raise ValueError("总结引用的课程或技术超出本次资源清单")
-                    values = getattr(item, "achievement_refs", None)
-                    if values is not None and not set(values) <= _refs:
-                        raise ValueError("总结的成果出处超出参考版与各部门草稿")
+                    values = getattr(item, "contributors", None)
+                    if values is not None and not set(values) <= _names:
+                        raise ValueError("总结的 contributors 超出本次输入人员")
             output = self.prompt_service.execute(prompt_code=f"{code}10",
                 template=Path("prompts/S10.txt").read_text(encoding="utf-8").strip(),
-                input_data=data, output_model=SUMMARY_MODELS[code], semantic_validator=validate)
+                input_data=data, output_model=SUMMARY_MODELS[code],
+                semantic_validator=validate, array_root=True)
             run.team_results[code] = {"content": output.model_dump(mode="json")}
             self.store.save(run)
     def _documents(self, run: CycleRun, organization: Organization) -> None:
@@ -692,23 +730,17 @@ class Workflow2:
                 blocks.append(text_block(run.issues["materials:weekly"]))
             if run.kind == "weekly":
                 blocks.append(text_block("团队总结", heading=2))
-                summary = _result_text(run.team_results[code], code, organization)
-                blocks.extend(text_block(line) for line in summary.split("\n") if line)
+                blocks.extend(_result_doc_blocks(run.team_results[code], code))
                 names = organization.department_map()
                 for department_id, bucket in sorted(run.department_results.items()):
                     department = names[department_id]
                     minister = organization.person_map()[department.minister_id]
                     blocks.append(divider_block())
                     blocks.append(text_block(f"{minister.name}老师部门（{department.name}）", heading=2))
-                    department_text = _result_text(bucket.get(code) or {}, code,
-                                                   organization, [department_id])
-                    blocks.extend(text_block(line)
-                                  for line in department_text.split("\n") if line)
+                    blocks.extend(_result_doc_blocks(bucket.get(code) or {}, code))
                 blocks.append(divider_block())
                 blocks.append(text_block("团队参考版", heading=2))
-                reference_text = _result_text(run.weekly_reference.get(code) or {}, code,
-                                              organization)
-                blocks.extend(text_block(line) for line in reference_text.split("\n") if line)
+                blocks.extend(_result_doc_blocks(run.weekly_reference.get(code) or {}, code))
             for department_id, draft in sorted(run.departments.items()):
                 department = organization.department_map()[department_id]
                 minister = organization.person_map()[draft.minister_id]
@@ -716,7 +748,8 @@ class Workflow2:
                 blocks.append(text_block(f"{minister.name}老师部门（{department.name}）", heading=2))
                 if code in draft.unconfirmed:
                     blocks.append(text_block("-确认状态：人工未确认，采用 AI 草稿"))
-                blocks.extend(text_block(line) for line in draft.final_text[code].split("\n") if line)
+                notice = run.issues.get(f"materials:{department_id}", "")
+                blocks.extend(_final_blocks(draft, code, notice))
             self._ensure_document(run, folder, code, title, blocks)
         for department_id, draft in sorted(run.departments.items()):
             department = organization.department_map()[department_id]
@@ -729,9 +762,7 @@ class Workflow2:
                 if code in draft.unconfirmed:
                     blocks.append(text_block("-确认状态：人工未确认，采用 AI 草稿"))
                 notice = run.issues.get(f"materials:{department_id}", "")
-                if notice:
-                    blocks.append(text_block(notice))
-                blocks.extend(text_block(line) for line in draft.final_text[code].split("\n") if line)
+                blocks.extend(_final_blocks(draft, code, notice))
                 links[code] = self._ensure_document(
                     run, folder, f"{code}:{department_id}", title, blocks)
             common = {"minister_ref": [{"id": minister.open_id}],

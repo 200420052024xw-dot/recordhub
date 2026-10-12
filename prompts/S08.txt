@@ -4,11 +4,17 @@
 ## 输入：
 以部门为单位：每次输入一个部门全部骨干和基层学生过去一个完整自然周的记录。
 
-输入是一个 JSON 对象，核心字段：
-- records：数组，每条是一名学生的一条日志，含 person_id（人员编号）、name（姓名）、department_id（部门编号）、department_name（部门名称）、role（角色）、progress（工作进展）、difficulties（工作困难）、reflection（心得反思）、other（其他）、achievement_refs（成果出处编号）、evaluations（定稿版评价数组，含 positive/improvement）。
-- scope：分析范围。
+输入由程序整理为一个纯文本字符串（string）。每条日志固定使用以下模板，尖括号内容替换为该条记录的实际内容：
 
-同一学生可能有多条日志，每条分别保留对应评价。评价已由程序在传入前定稿（老师改过用老师版，否则用 AI 版），Skill 只分析、不重选版本。所有编号（person_id、department_id、achievement_refs）必须原样取自输入，不得编造。
+姓名：<学生姓名>
+日志原文：
+<该条日志原文>
+定稿版评价：
+<该条日志唯一的定稿版评价>
+
+全部记录按原有日期顺序拼接，记录之间固定留一个空行，原文内部的换行保持不变。同一学生有多条日志时，每条日志分别保留对应的评价。
+定稿版评价在传入前确定：老师改过，传老师修改后的评价；老师没改，传 AI 评价。每条日志只传这一条选定的评价。
+Skill 直接分析已经整理好的输入，不重新决定文本格式、改写日志或选择评价版本。
 
 ## 工作流：
 1. 从本部门一周的工作中找出具有复用价值的技术方法、工具或流程，判断属于工程技术还是科研技术，将相同技术线索合并。
@@ -16,34 +22,34 @@
 3. 根据已有内容提出入库或补充建议，说明还需要完善的资料、实现或验证工作，按下面的 JSON 格式输出本部门的公共技术建议清单。
 
 ## 输出：
-只输出一个合法 JSON 对象，不输出 Markdown、代码块或额外说明。字段名使用英文，内容用中文。
+只输出合法 JSON 数组，不输出代码块或额外说明。每项技术一条记录；没有有依据的技术建议时输出 []。字段名使用英文，内容用中文。
 
-{
-  "items": [
-    {
-      "technology_name": "技术名称",
-      "category": "工程",
-      "problem_solved": "解决的问题",
-      "department_ids": ["贡献部门编号"],
-      "contributor_ids": ["贡献者人员编号"],
-      "existing_achievements": "已有成果及日志提供的出处（文字描述）",
-      "achievement_refs": ["成果出处编号"],
-      "suitable_scenarios": "适用场景",
-      "repository_suggestion": "入库或补充建议",
-      "pending_items": ["待完善事项"]
-    }
-  ]
-}
+[
+  {
+    "name": "技术名称",
+    "type": "工程",
+    "problem": "解决的问题",
+    "contributors": [
+      "贡献者姓名"
+    ],
+    "achievements": [
+      "已有成果及日志提供的出处"
+    ],
+    "usage": [
+      "适用场景"
+    ],
+    "suggestion": "入库或补充建议",
+    "todo": [
+      "待完善事项"
+    ]
+  }
+]
 
-- items 为数组，每项技术一条；没有有依据的技术建议时输出 {"items": []}。
-- category 只能填“工程”或“科研”。
-- department_ids 只能填写输入 records 里实际出现的 department_id；contributor_ids 只能填写实际出现的 person_id。
-- achievement_refs 只能填写输入 records 里实际出现的 achievement_refs（成果出处编号）；输入没有成果出处时填 []。
-- existing_achievements 用文字描述已有成果；缺出处时在 pending_items 中说明，不编造补齐。
-- 输出只包含本 Skill 的分析结果，不重复输出日志原文和已有评价，不附加部门、编号或运行信息。
+type 填写“工程”或“科研”，无法判断时为 null。没有已有成果时 achievements 为 []；缺少出处或技术详情时在 todo 中说明，不编造补齐。
+problem / suggestion 内部可用 Markdown 列表：每点一行「- 内容」，重点词用「**加粗**」，不要用 # 标题；字符串内换行写 \n。
+输出只包含本 Skill 的分析结果，不重复输出日志原文和已有评价，不附加部门、编号或运行信息。
 
 ## 约束：
 1. 不能捏造技术实现、贡献者、成果出处或验证结果，不能把计划开发的工具写成已经完成的技术。
 2. 只分析本次输入部门的一周日志，不自行读取全团队材料或假定已经检索公共技术库。
 3. 只提出入库或补充建议，不直接写入技术库；由负责人确认后，再按技术库条目结构保存。
-4. department_ids、contributor_ids、achievement_refs 必须取自输入 records 里实际出现的编号，不得使用姓名或编造编号。
