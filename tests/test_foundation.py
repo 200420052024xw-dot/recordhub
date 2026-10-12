@@ -12,6 +12,7 @@ from config import DeepSeekSettings, FeishuSettings
 from tool.bitable_fields import scalar
 from tool.feishu import BitableService, ContactService, FeishuClient, FeishuTokenProvider, MessageService
 from tool.http import HttpResponse
+from tool.cloud_docs import CloudDocsService
 from config import load_schedule_config
 
 
@@ -133,6 +134,20 @@ class FoundationTests(unittest.TestCase):
         self.assertEqual(users[0]["user_id"], "ou_person")
         self.assertEqual(transport.calls[1]["query"], {"user_id_type": "open_id"})
         self.assertEqual(transport.calls[1]["json_body"]["mobiles"], ["13800000001"])
+
+    def test_document_creation_sends_folder_token_in_request_body(self) -> None:
+        transport = FakeTransport([
+            response({"code": 0, "tenant_access_token": "token", "expire": 7200}),
+            response({"code": 0, "data": {"document": {"document_id": "doc1"}}}),
+        ])
+        docs = CloudDocsService(FeishuClient(self.feishu_settings, transport))
+        self.assertEqual(docs.create_document("folder1", "小组日志"), "doc1")
+        request = transport.calls[1]
+        self.assertTrue(request["url"].endswith("/docx/v1/documents"))
+        self.assertEqual(request["method"], "POST")
+        self.assertEqual(request["json_body"],
+                         {"folder_token": "folder1", "title": "小组日志"})
+        self.assertIsNone(request["query"])
 
     def test_deepseek_json_output_is_parsed_and_validated(self) -> None:
         transport = FakeTransport(

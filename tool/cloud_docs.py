@@ -52,8 +52,7 @@ class CloudDocsService:
     def create_document(self, parent: str, title: str) -> str:
         data = self.client.request(
             "POST", "docx/v1/documents",
-            query={"folder_token": parent},
-            json_body={"title": title},
+            json_body={"folder_token": parent, "title": title},
         ).get("data", {}).get("document", {})
         token = data.get("document_id")
         if not token:
