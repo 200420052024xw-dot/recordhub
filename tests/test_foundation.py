@@ -196,6 +196,35 @@ class FoundationTests(unittest.TestCase):
         self.assertGreater(stage.options["notify_at"], stage.time)
         self.assertEqual(stage.options["confirmation_days"], 0)
 
+    def test_schedule_file_accepts_utf8_with_and_without_bom(self) -> None:
+        source = Path("config/schedules.toml").read_text(encoding="utf-8-sig")
+        expected = load_schedule_config("config/schedules.toml")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "schedules.toml"
+            for encoding in ("utf-8", "utf-8-sig"):
+                with self.subTest(encoding=encoding):
+                    path.write_text(source, encoding=encoding)
+                    self.assertEqual(load_schedule_config(path), expected)
+
+    def test_invalid_schedule_syntax_includes_file_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid.toml"
+            path.write_text("!invalid", encoding="utf-8")
+            with self.assertRaises(ValueError) as caught:
+                load_schedule_config(path)
+            self.assertIn(str(path), str(caught.exception))
+            self.assertIn("line 1, column 1", str(caught.exception))
+            self.assertIsNotNone(caught.exception.__cause__)
+
+    def test_schedule_file_rejects_invalid_utf8_with_file_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid.toml"
+            path.write_bytes(b"\xff\xfeinvalid")
+            with self.assertRaises(ValueError) as caught:
+                load_schedule_config(path)
+            self.assertIn(str(path), str(caught.exception))
+            self.assertIsInstance(caught.exception.__cause__, UnicodeDecodeError)
+
     def test_invalid_confirmation_deadline_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "bad.toml"

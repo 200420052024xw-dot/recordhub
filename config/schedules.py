@@ -37,8 +37,14 @@ def load_schedule_config(
     config_path = Path(path)
     if not config_path.exists():
         raise ValueError(f"Schedule configuration does not exist: {config_path}")
-    with config_path.open("rb") as stream:
-        raw = tomllib.load(stream)
+    # Editors on Windows may prepend a UTF-8 BOM, which tomllib rejects.
+    # utf-8-sig accepts UTF-8 with or without that leading signature.
+    try:
+        raw = tomllib.loads(config_path.read_text(encoding="utf-8-sig"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f"Invalid schedule configuration {config_path}: {exc}"
+        ) from exc
     timezone = str(raw.get("timezone", ""))
     # Windows may not ship an IANA timezone database. RecordHub's required
     # timezone is therefore accepted explicitly; other zones still use the
