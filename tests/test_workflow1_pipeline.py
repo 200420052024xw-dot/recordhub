@@ -565,8 +565,57 @@ class Workflow1PipelineTests(unittest.TestCase):
             self.assertTrue(all("失败" not in text for text in teacher_msgs),
                             teacher_msgs)
 
+    def test_final_retry_does_not_alert_for_normal_manual_confirmation_wait(self):
+        """人工审核尚未截止，AI 已完成且已发布时不应在凌晨报警。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workflow, store, messages, alerts = self._api_failure_workflow(
+                directory, fail_times=0)
+            clock = datetime(2026, 10, 3, 20, 20, tzinfo=UTC)  # 北京次日 04:20
+            with patch("workflow1.workflow.utc_now", return_value=clock):
+                workflow.start(DAY)
+                calls = workflow.prompt_service.execute.call_count
+                retried = workflow.retry_incomplete(final=True)
+                self.assertEqual(retried[0]["status"], WorkflowStatus.WAITING_EVALUATIONS)
+                stored = store.load_snapshot(DAY)
+                self.assertTrue(stored.evaluations_published)
+                self.assertNotIn("workflow1:manual-review", stored.issues)
+                self.assertEqual(workflow.prompt_service.execute.call_count, calls)
+                # 后续自动补跑仍可执行，没有被误写的人工排查台账阻止。
+                self.assertEqual(len(workflow.retry_incomplete(final=True)), 1)
+            alerts.queue.join()
+            self.assertEqual([call for call in messages.send_text.call_args_list
+                              if call.args and call.args[0] == "ou_admin"], [])
+
+    def test_final_retry_still_alerts_for_abnormal_waiting_states(self):
+        for case in ("unpublished", "failed", "fallback", "error",
+                     "confirmed_without_report", "overdue"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                workflow, store, _, alerts = self._api_failure_workflow(directory, fail_times=0)
+                clock = datetime(2026, 10, 3, 20, 20, tzinfo=UTC)
+                with patch("workflow1.workflow.utc_now", return_value=clock):
+                    workflow.start(DAY)
+                    def mutate(snapshot):
+                        if case == "unpublished":
+                            snapshot.evaluations_published = False
+                        elif case == "failed":
+                            snapshot.log_evaluations["L2"].status = UnitStatus.FAILED
+                        elif case == "fallback":
+                            snapshot.log_evaluations["L2"].fallback = "failed"
+                        elif case == "error":
+                            snapshot.log_evaluations["L2"].error = "评价处理失败"
+                        elif case == "confirmed_without_report":
+                            for state in snapshot.log_evaluations.values():
+                                state.status = UnitStatus.CONFIRMED
+                    store.update_snapshot(DAY, mutate)
+                    # 保留异常状态以检查最后一轮的告警判据。
+                    with patch.object(workflow, "start", return_value=store.load_workflow(DAY)), \
+                            patch.object(workflow, "_deadline_passed", return_value=case == "overdue"):
+                        workflow.retry_incomplete(final=True)
+                    self.assertIn("workflow1:manual-review", store.load_snapshot(DAY).issues)
+                alerts.queue.join()
+
     def test_incomplete_day_is_retried_then_flagged_for_manual_review(self):
-        """跑挂的当天逐小时重试；最后一轮仍没完成就标“需人工补评”，之后不再自动折腾。"""
+        """自动处理失败的当天逐小时重试；最后一轮仍异常则标记人工排查。"""
         with tempfile.TemporaryDirectory() as directory:
             workflow, store, messages, alerts = self._api_failure_workflow(
                 directory, fail_times=RETRY_LIMIT + 1)

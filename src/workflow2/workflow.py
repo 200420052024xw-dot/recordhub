@@ -299,6 +299,10 @@ class Workflow2:
         logger.error("workflow2_retry_exhausted run_id=%s kind=%s attempts=%d error=%s",
                      run.run_id, run.kind, run.retry_count, run.last_error or "-")
 
+    def _start_due(self, kind: str, day: date, now: datetime) -> bool:
+        hour, minute = map(int, self._schedule(kind).time.split(":"))
+        return now >= datetime.combine(day, time(hour, minute), SHANGHAI)
+
     def recover(self) -> list[CycleRun]:
         now = utc_now()
         today = now.astimezone(SHANGHAI).date()
@@ -306,6 +310,9 @@ class Workflow2:
         # 该跑却没跑起来的补上：定时器错过计划时刻（服务不在、4 点整在忙）不会自己补响，
         # 而"每 3 天"的判据让第二天也不会补 —— 不补就是那一轮彻底没了，还不报警。
         for kind in CODES:
+            # 恢复只补已经错过的计划，不在午夜提前启动当天的周期。
+            if not self._start_due(kind, today, now):
+                continue
             run_id = str(uuid5(NAMESPACE_URL, f"recordhub-workflow2:{kind}:{today}"))
             if self.store.load(run_id) is not None:
                 continue
@@ -315,6 +322,7 @@ class Workflow2:
                 logger.exception("workflow2_catch_up_failed kind=%s date=%s", kind, today)
         results = [self.resume(run.run_id) for run in self.store.pending()
                    if (run.kind != "stage" or run.start_date > activation)
+                   and self._start_due(run.kind, run.scheduled_date, now)
                    and self._retry_due(run, now)]
         # Recovery advances processing only; missed notifications require the admin API.
         logger.debug("workflow2_recover resumed=%d", len(results))

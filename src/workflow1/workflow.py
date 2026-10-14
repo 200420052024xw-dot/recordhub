@@ -414,7 +414,8 @@ class Workflow1:
     def retry_incomplete(self, *, final: bool = False) -> list[dict]:
         """重试没跑完的当天，只补没做完的部分。
 
-        final=True 是当天最后一轮：仍没完成就记一条"需人工补评"，之后不再自动重试。
+        final=True 是当天最后一轮：自动处理仍未完成则记人工排查台账。
+        已完成自动处理、尚未到截止时间的人工审核等待不属于失败。
         """
         today = utc_now().astimezone(ZoneInfo("Asia/Shanghai")).date()
         results: list[dict] = []
@@ -429,9 +430,21 @@ class Workflow1:
                             "status": result.status, "last_error": result.last_error})
             if not final or result.status == WorkflowStatus.COMPLETED:
                 continue
-            reason = (f"自动重试三次仍未完成（当前状态 {result.status}）："
-                      f"{result.last_error or '无错误信息'}；需人工补评")
-            if self.store.load_snapshot(run.target_date) is None:
+            snapshot = self.store.load_snapshot(run.target_date)
+            if (result.status == WorkflowStatus.WAITING_EVALUATIONS
+                    and not result.last_error
+                    and snapshot is not None and snapshot.evaluations_published
+                    and any(state.status == UnitStatus.WAITING_CONFIRMATION
+                            for state in snapshot.log_evaluations.values())
+                    and all(state.status in {UnitStatus.WAITING_CONFIRMATION, UnitStatus.CONFIRMED}
+                            and not state.error and state.fallback != "failed"
+                            for state in snapshot.log_evaluations.values())
+                    and not self._deadline_passed(run.target_date)):
+                logger.info("workflow1_waiting_manual_confirmation date=%s", run.target_date)
+                continue
+            reason = (f"本轮自动补跑结束，仍有处理未完成（当前状态 {result.status}）："
+                      f"{result.last_error or '请检查评价处理、写回及报告生成状态'}；需人工排查")
+            if snapshot is None:
                 # 连快照都没有，台账写不进去，至少让管理员收到一条。
                 logger.error("workflow1_needs_manual_review date=%s status=%s error=%s",
                              run.target_date, result.status, result.last_error or "-")

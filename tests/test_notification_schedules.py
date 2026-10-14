@@ -294,6 +294,7 @@ class NotificationScheduleTests(unittest.TestCase):
         due = _cycle_run("monthly", date(2026, 10, 5), status="BLOCKED",
                          retry_count=1, retry_after=utc_now() - timedelta(minutes=1))
         workflow = Workflow2.__new__(Workflow2)
+        workflow.schedules = load_schedule_config("config/schedules.toml")
         workflow.retry_interval_minutes = 60
         workflow.retry_limit = 3
         workflow.lock = threading.RLock()
@@ -307,9 +308,10 @@ class NotificationScheduleTests(unittest.TestCase):
 
     def test_recover_starts_the_cycle_that_never_started(self):
         """错过计划时刻的那一轮要补建；今天已经有记录的周期不重复。"""
-        today = utc_now().astimezone(ZoneInfo("Asia/Shanghai")).date()
+        today = date(2026, 10, 14)
         existing = _cycle_run("monthly", today)
         workflow = Workflow2.__new__(Workflow2)
+        workflow.schedules = load_schedule_config("config/schedules.toml")
         workflow.retry_interval_minutes = 60
         workflow.retry_limit = 3
         workflow.lock = threading.RLock()
@@ -321,10 +323,57 @@ class NotificationScheduleTests(unittest.TestCase):
         workflow.resume = Mock(return_value=existing)
         workflow.scheduled = Mock(return_value=None)
 
-        self.assertEqual(workflow.recover(), [existing])
+        with patch("workflow2.workflow.utc_now",
+                   return_value=datetime(2026, 10, 14, 12, tzinfo=ZoneInfo("Asia/Shanghai"))):
+            self.assertEqual(workflow.recover(), [existing])
         # 月报今天已经跑过，不该被重复补建；stage / weekly 今天没记录，补上。
         self.assertEqual([call.args[0] for call in workflow.scheduled.call_args_list],
                          ["stage", "weekly"])
+
+    def test_recover_respects_each_cycles_start_time(self):
+        """恢复采用各周期自己的计划时刻，时刻之前不启动，到点及之后补跑。"""
+        workflow = Workflow2.__new__(Workflow2)
+        workflow.schedules = SimpleNamespace(workflows={
+            "s04_progress": SimpleNamespace(time="04:00"),
+            "s05_people_suggestions": SimpleNamespace(time="05:00"),
+            "s08_public_technology": SimpleNamespace(time="06:00"),
+        })
+        workflow.store = SimpleNamespace(
+            activate=lambda day: date(2026, 1, 1),
+            pending=lambda: [], load=lambda run_id: None)
+        workflow.scheduled = Mock(return_value=None)
+        workflow.resume = Mock()
+        for hour, minute, expected in (
+                (0, 9, []), (3, 59, []), (4, 0, ["stage"]),
+                (5, 0, ["stage", "monthly"]),
+                (6, 15, ["stage", "monthly", "weekly"])):
+            with self.subTest(hour=hour, minute=minute):
+                workflow.scheduled.reset_mock()
+                now = datetime(2026, 10, 14, hour, minute,
+                               tzinfo=ZoneInfo("Asia/Shanghai"))
+                with patch("workflow2.workflow.utc_now", return_value=now):
+                    self.assertEqual(workflow.recover(), [])
+                self.assertEqual(
+                    [call.args[0] for call in workflow.scheduled.call_args_list], expected)
+        workflow.resume.assert_not_called()
+
+    def test_recover_does_not_resume_todays_premature_run_before_start_time(self):
+        today = date(2026, 10, 14)
+        premature = _cycle_run("stage", today, status="BLOCKED")
+        previous = _cycle_run("stage", today - timedelta(days=3),
+                              status="WAITING_CONFIRMATION")
+        workflow = Workflow2.__new__(Workflow2)
+        workflow.schedules = load_schedule_config("config/schedules.toml")
+        workflow.store = SimpleNamespace(
+            activate=lambda day: date(2026, 1, 1),
+            pending=lambda: [premature, previous], load=lambda run_id: None)
+        workflow.resume = Mock(side_effect=lambda run_id: run_id)
+        workflow.scheduled = Mock()
+        now = datetime(2026, 10, 14, 0, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
+        with patch("workflow2.workflow.utc_now", return_value=now):
+            self.assertEqual(workflow.recover(), [previous.run_id])
+        workflow.resume.assert_called_once_with(previous.run_id)
+        workflow.scheduled.assert_not_called()
 
 
 if __name__ == "__main__":
