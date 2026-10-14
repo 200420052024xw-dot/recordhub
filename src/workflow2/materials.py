@@ -110,36 +110,34 @@ class MaterialPreparer:
                     # 不带评价的材料（S04）只要求日志原文：日志当天归档，
                     # 评价却要等到次日人工确认，等它会让阶段汇总无谓地推迟一天。
                     if with_evaluations:
-                        if not confirmed:
-                            missing.append(f"{day} 日志 {log.log_id} 尚未完成评价确认")
-                            continue
-                        if (state.person_id != person.person_id or state.log_id != log.log_id
+                        if state is None or state.status not in {UnitStatus.WAITING_CONFIRMATION, UnitStatus.CONFIRMED}:
+                            missing.append(f"{day} 日志 {log.log_id} 生成错误：无可用评价")
+                            state = None
+                        elif (state.person_id != person.person_id or state.log_id != log.log_id
                                 or state.evaluator_id != person.leader_id):
                             missing.append(f"{day} 日志 {log.log_id} 的评价身份与当日组织关系不一致")
-                            continue
-                        if not state.positive_final or not state.improvement_final:
+                            state = None
+                        if state and not (state.positive_final or state.positive_ai):
                             missing.append(f"{day} 日志 {log.log_id} 缺少最终评价")
-                            continue
-                        evaluator = people.get(state.evaluator_id)
-                        if evaluator is None:
+                        evaluator = people.get(state.evaluator_id) if state else None
+                        if state and evaluator is None:
                             missing.append(f"{day} 日志 {log.log_id} 评价人缺失")
-                            continue
                         # Only the effective (finalized) evaluation reaches the Skills:
                         # the human text when the evaluator edited it, otherwise the AI text.
-                        if state.source == "HUMAN":
+                        if state and evaluator and state.source == "HUMAN":
                             reviews = [EvaluationText(evaluator_id=evaluator.person_id,
                                 evaluator_role=evaluator.role,
                                 evaluated_at=state.confirmed_at or state.evaluated_at,
                                 positive=state.positive_final or "", improvement=state.improvement_final or "",
                                 source="HUMAN")]
-                        else:
+                        elif state and evaluator and state.positive_ai and state.improvement_ai:
                             reviews = [EvaluationText(evaluator_id=evaluator.person_id,
                                 evaluator_role=evaluator.role,
                                 evaluated_at=state.ai_evaluated_at or state.evaluated_at,
                                 positive=state.positive_ai or state.positive_final or "",
                                 improvement=state.improvement_ai or state.improvement_final or "",
                                 source="AI")]
-                        reviews = _without_placeholders(reviews, state.fallback)
+                        reviews = _without_placeholders(reviews, state.fallback if state else "")
                     record = TextRecord(record_id=log.source_record_id or log.log_id,
                         confirmed=confirmed, progress=log.progress, difficulties=log.difficulties,
                         reflection=log.reflection, other=log.other, full_log=log.full_log,

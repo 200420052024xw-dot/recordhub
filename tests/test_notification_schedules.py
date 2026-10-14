@@ -172,6 +172,9 @@ class NotificationScheduleTests(unittest.TestCase):
             runs["monthly"].document_urls = {
                 code: f"https://example.com/{code}" for code in ("S05", "S06", "S07")}
             workflow.notify_due("monthly", day)
+            self.assertEqual(workflow.messages.send_text.call_count, 1)
+            now.return_value = datetime(2026, 10, 6, 4, 30, tzinfo=timezone.utc)
+            workflow.notify_due("monthly", day)
             workflow.notify_due("monthly", day)
             self.assertEqual(workflow.messages.send_text.call_count, 2)
             now.return_value = datetime(2026, 10, 5, 0, 59, tzinfo=timezone.utc)

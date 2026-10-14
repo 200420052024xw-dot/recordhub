@@ -388,7 +388,8 @@ class Workflow2:
         if not value:
             return True
         hour, minute = map(int, str(value).split(":"))
-        scheduled = datetime.combine(run.scheduled_date, time(hour, minute), SHANGHAI)
+        scheduled = datetime.combine(run.scheduled_date + timedelta(
+            days=int(options.get("report_notify_days", 0))), time(hour, minute), SHANGHAI)
         return utc_now().astimezone(SHANGHAI) >= scheduled
 
     def notify_due(self, kind: str, scheduled_date: date) -> None:
@@ -443,9 +444,10 @@ class Workflow2:
             if run.kind == "weekly":
                 self._weekly(run, organization)
             else:
-                self._departments(run, organization)
-                if not all(set(CODES[run.kind]) <= set(item.final_text)
-                           for item in run.departments.values()):
+                if utc_now() >= self._cutoff(run):
+                    self._freeze(run, organization)
+                else:
+                    self._departments(run, organization)
                     run.status = "WAITING_CONFIRMATION"
                     self.store.save(run)
                     logger.info("workflow2_waiting_confirmation run_id=%s kind=%s",
@@ -453,6 +455,7 @@ class Workflow2:
                     return run
             self._documents(run, organization)
             run.status, run.last_error = "COMPLETED", None
+            run.completed_at = utc_now()
             self.store.save(run)
             logger.info("workflow2_completed run_id=%s kind=%s", run.run_id, run.kind)
         except ValueError as exc:
@@ -467,6 +470,25 @@ class Workflow2:
             self.store.save(run)
             logger.exception("workflow2_failed run_id=%s kind=%s", run.run_id, run.kind)
         return run
+
+    def _freeze(self, run, organization):
+        """Close each department independently; absence is report content."""
+        if run.frozen_at is not None:
+            return
+        for department in organization.departments:
+            if not department.active or not department.minister_id:
+                continue
+            draft = run.departments.setdefault(department.department_id, DepartmentResult(
+                department_id=department.department_id, minister_id=department.minister_id))
+            try:
+                self._confirmation(run, draft, organization)
+            except Exception as exc:
+                run.issues[f"confirmation:{department.department_id}"] = error_summary(exc)
+            for code in CODES[run.kind]:
+                draft.final_text.setdefault(code, draft.draft_text.get(code) or
+                    f"生成错误：{NAMES[code]} 在截止前未生成；{run.last_error or '无可用结果'}")
+        run.frozen_at = utc_now()
+        self.store.save(run)
 
     def _departments(self, run: CycleRun, organization: Organization) -> None:
         people = organization.person_map()
@@ -486,13 +508,13 @@ class Workflow2:
                 self.store.save(run)
             if set(CODES[run.kind]) <= set(draft.final_text):
                 continue
-            allow_rebuild = run.kind != "stage"
+            allow_rebuild = True
             # 阶段分析（S04）只汇总日志原文，不等人工评价定稿；月报/周报要用定稿评价。
             with_evaluations = run.kind != "stage"
             group_materials = [self.preparer.prepare(
                 run_id=run.run_id, start=run.start_date, end=run.end_date,
                 department_ids=[department.department_id], person_ids=group,
-                allow_rebuild=allow_rebuild, allow_partial=allow_rebuild,
+                allow_rebuild=allow_rebuild, allow_partial=True,
                 with_evaluations=with_evaluations)
                 for group in self._analysis_groups(run.kind, department, organization)]
             for group_material in group_materials:
@@ -569,7 +591,7 @@ class Workflow2:
     def _confirmation(self, run: CycleRun, draft: DepartmentResult,
                       organization: Organization) -> None:
         codes = CODES[run.kind]
-        if set(codes) <= set(draft.final_text):
+        if run.frozen_at is not None:
             return
         table_name = "stage_confirmation" if run.kind == "stage" else "monthly_department_confirmation"
         table = self.tables.table(table_name)
@@ -624,13 +646,11 @@ class Workflow2:
                                                   {f["task_id"]: task_id})
             draft.confirmation_record_id = str(row["record_id"])
             for code in codes:
-                if code in draft.final_text:
-                    continue
                 decision_key, edited_key = (("decision", "edited") if run.kind == "stage"
                                             else CONFIRM_COLUMNS[code])
                 decision = scalar(values.get(f[decision_key])).strip()
                 if decision == "确认无误":
-                    draft.final_text[code] = draft.draft_text[code]
+                    draft.final_text[code] = draft.draft_text.get(code) or "生成错误：AI 内容缺失"
                 elif decision == "需修改":
                     edited = scalar(values.get(f[edited_key])).strip()
                     if not edited:
@@ -641,7 +661,7 @@ class Workflow2:
         if late:
             for code in codes:
                 if code not in draft.final_text:
-                    draft.final_text[code] = draft.draft_text[code]
+                    draft.final_text[code] = draft.draft_text.get(code) or "生成错误：AI 内容缺失"
                     if code not in draft.unconfirmed:
                         draft.unconfirmed.append(code)
         self.store.save(run)
@@ -908,9 +928,17 @@ class Workflow2:
                     "messages": list({item["key"]: item for item in results}.values())}
 
     def handle_confirmation(self, record_id: str) -> dict:
-        # The event merely wakes recovery. Reconciliation checks row identity and cutoff.
-        updated = [self.resume(run.run_id).run_id for run in self.store.pending()
-                   if run.kind in {"stage", "monthly"}]
+        # Record confirmation only. Model generation and documents have their
+        # own appointments; an edited form must never restart either of them.
+        updated = []
+        with self.lock:
+            organization = self.organization.get()
+            for run in self.store.pending():
+                if run.kind not in {"stage", "monthly"} or run.frozen_at or utc_now() >= self._cutoff(run):
+                    continue
+                for draft in run.departments.values():
+                    self._confirmation(run, draft, organization)
+                updated.append(run.run_id)
         logger.info("workflow2_confirmation_event record_id=%s checked=%d",
                     record_id, len(updated))
         return {"record_id": record_id, "checked_runs": updated}

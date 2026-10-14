@@ -31,6 +31,7 @@ EVENT_EXPLANATIONS = {
     "feishu_event_stream_loop_exited": "飞书事件长连接已意外退出，重启服务前无法实时接收确认事件。",
     "feishu_event_stream_started": "飞书事件监听服务已启动。",
     "feishu_event_worker_failed": "飞书事件后台处理失败。",
+    "feishu_folder_locked_retry": "同一文件夹的上一次创建还占着锁，程序稍等后自动重发。",
     "feishu_request_completed": "飞书开放接口请求成功。",
     "feishu_request_failed": "飞书开放接口请求失败，请查看接口路径、错误码和请求编号。",
     "http_request_failed": "HTTP 接口处理发生未预期错误。",

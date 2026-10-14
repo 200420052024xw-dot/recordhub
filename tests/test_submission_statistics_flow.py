@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import Mock
+from unittest.mock import patch
 
 from test_workflow1_pipeline import DAY, sample_snapshot
 from data import FileStateStore
@@ -44,6 +47,7 @@ class IndependentStatisticsTests(unittest.TestCase):
         self.store.get_or_create_workflow(DAY)
         self.store.save_snapshot(self.snapshot)
         self.store.set_status(DAY, WorkflowStatus.COMPLETED)
+        self.workflow.refresh_submission_statistics(DAY)
         result = self.workflow.start(DAY)
         self.statistics.publish.assert_called_once()
         self.assertEqual(result.status, WorkflowStatus.COMPLETED)
@@ -96,6 +100,66 @@ class IndependentStatisticsTests(unittest.TestCase):
         self.assertTrue(path.exists())
         workbuddy.flush.assert_not_called()
         self.assertIsNone(self.store.load_workflow(DAY))
+
+
+class ScheduledStatisticsTests(unittest.TestCase):
+    def setUp(self):
+        from config.schedules import load_schedule_config
+        from service.orchestration import Orchestrator
+        self.fixture = IndependentStatisticsTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.workflow = self.fixture.workflow
+        self.prompt = self.workflow.prompt_service
+        binding = SimpleNamespace(workflow=self.workflow, auto_advance_at="21:50")
+        runtime = SimpleNamespace(workflows={"workflow1_daily": binding}, workflow2=None,
+                                  prompt_repository=None)
+        settings = SimpleNamespace(state_dir=self.fixture.store.root, llm_concurrency=3,
+            llm_retry_interval_minutes=60, llm_retry_limit=3, workflow2_enabled=False)
+        self.orchestration = Orchestrator(runtime, load_schedule_config(), Mock(), settings)
+        self.addCleanup(self.orchestration.tasks.close)
+        self.orchestration.plan_day(DAY + timedelta(days=1))
+        self.task = next(t for t in self.orchestration.tasks.journal.all()
+                         if t["action"] == "daily_statistics")
+
+    def test_statistics_retries_after_daily_report_has_completed(self):
+        self.fixture.store.get_or_create_workflow(DAY)
+        self.fixture.store.save_snapshot(self.fixture.snapshot)
+        self.fixture.store.set_status(DAY, WorkflowStatus.COMPLETED)
+        self.fixture.statistics.publish.side_effect = [RuntimeError("temporary outage"),
+            {"status": "complete", "expected": 3, "written": 3, "issues": {}}]
+        now = datetime.fromisoformat(self.task["due"]).astimezone(timezone.utc)
+        tasks = self.orchestration.tasks
+        with patch("service.execution.utc_now") as clock:
+            clock.return_value = now
+            tasks.execute(self.task["key"])
+            retry = tasks.journal.get(self.task["key"] + "#retry:1")
+            self.assertEqual(datetime.fromisoformat(retry["due"]), now + timedelta(hours=1))
+            clock.return_value = now + timedelta(hours=1)
+            tasks.execute(retry["key"])
+        self.assertEqual(self.fixture.statistics.publish.call_count, 2)
+        self.assertEqual(tasks.journal.get(retry["key"])["status"], "done")
+        self.assertEqual(self.fixture.store.load_workflow(DAY).status, WorkflowStatus.COMPLETED)
+        self.prompt.execute.assert_not_called()
+        self.workflow.documents.advance.assert_not_called()
+        self.workflow.reports.publish.assert_not_called()
+        self.workflow.messages.send_text.assert_not_called()
+
+    def test_incomplete_write_retries_but_source_warning_does_not(self):
+        task = self.task
+        self.workflow.refresh_submission_statistics = Mock(return_value={
+            "status": "partial", "expected": 3, "written": 2, "issues": {"one": "write failed"}})
+        with self.assertRaises(RuntimeError):
+            self.orchestration.handle(task)
+        self.workflow.refresh_submission_statistics.return_value = {
+            "status": "partial", "expected": 3, "written": 3, "issues": {"one": "source warning"}}
+        self.orchestration.handle(task)
+
+    def test_daily_generation_does_not_repeat_independently_scheduled_statistics(self):
+        self.workflow._process_logs = Mock(side_effect=RuntimeError("stop after snapshot"))
+        self.workflow.start(DAY)
+        self.fixture.statistics.publish.assert_not_called()
+        self.workflow._process_logs.assert_called_once_with(DAY)
 
 
 if __name__ == "__main__":

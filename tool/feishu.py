@@ -17,6 +17,17 @@ from tool.diagnostics import error_summary
 
 logger = logging.getLogger(__name__)
 
+# 同一文件夹下建文件夹/建文档时，上一个请求刚落地的那一刻文件夹还会短暂锁住，
+# 飞书返回 1770036「folder locked」——串行调用也躲不开。这类拒绝没有创建任何东西，
+# 所以等一下重发是安全的。退避 1s、2s、4s。
+LOCKED_FOLDER_CODE = 1770036
+LOCKED_FOLDER_ATTEMPTS = 4
+LOCKED_FOLDER_RETRY_SECONDS = 1.0
+
+
+def _is_folder_locked(exc: Exception) -> bool:
+    return isinstance(exc, FeishuApiError) and exc.code == LOCKED_FOLDER_CODE
+
 
 class FeishuTokenProvider:
     def __init__(self, settings: FeishuSettings, transport: HttpTransport) -> None:
@@ -69,29 +80,46 @@ class FeishuClient:
         *,
         query: Mapping[str, Any] | None = None,
         json_body: Mapping[str, Any] | None = None,
+        retry_locked_folder: bool = False,
     ) -> dict[str, Any]:
-        started = time.monotonic()
-        try:
-            response = self.transport.request(
-                method,
-                f"{self.settings.base_url}/{path.lstrip('/')}",
-                headers={"Authorization": f"Bearer {self.token_provider.get_token()}"},
-                query=query,
-                json_body=json_body,
-            )
-            result = _require_success(response)
-        except Exception as exc:
-            exc.method, exc.path = method, path
-            if 'response' in locals():
-                exc.request_id = next((v for k, v in response.headers.items()
-                                       if k.lower() in {"x-tt-logid", "x-request-id"}), None)
-            logger.exception("feishu_request_failed method=%s path=%s elapsed_ms=%d error=%s",
-                             method, path, (time.monotonic() - started) * 1000,
-                             error_summary(exc))
-            raise
-        logger.info("feishu_request_completed method=%s path=%s status=%s elapsed_ms=%d",
-                    method, path, response.status_code, (time.monotonic() - started) * 1000)
-        return result
+        """retry_locked_folder 只给「建文件夹/建文档」这类创建接口用。
+
+        重试放在这里而不是调用方，是为了赶在下面的 ERROR 日志和它触发的管理员
+        告警之前把抖动消化掉；其他接口保持一击即退的原有行为。
+        """
+        attempts = LOCKED_FOLDER_ATTEMPTS if retry_locked_folder else 1
+        for attempt in range(1, attempts + 1):
+            started = time.monotonic()
+            response: HttpResponse | None = None
+            try:
+                response = self.transport.request(
+                    method,
+                    f"{self.settings.base_url}/{path.lstrip('/')}",
+                    headers={"Authorization": f"Bearer {self.token_provider.get_token()}"},
+                    query=query,
+                    json_body=json_body,
+                )
+                result = _require_success(response)
+            except Exception as exc:
+                exc.method, exc.path = method, path
+                if response is not None:
+                    exc.request_id = next((v for k, v in response.headers.items()
+                                           if k.lower() in {"x-tt-logid", "x-request-id"}), None)
+                if attempt < attempts and _is_folder_locked(exc):
+                    logger.warning(
+                        "feishu_folder_locked_retry method=%s path=%s attempt=%d/%d",
+                        method, path, attempt, attempts)
+                    time.sleep(LOCKED_FOLDER_RETRY_SECONDS * 2 ** (attempt - 1))
+                    continue
+                logger.exception("feishu_request_failed method=%s path=%s elapsed_ms=%d error=%s",
+                                 method, path, (time.monotonic() - started) * 1000,
+                                 error_summary(exc))
+                raise
+            logger.info("feishu_request_completed method=%s path=%s status=%s elapsed_ms=%d",
+                        method, path, response.status_code, (time.monotonic() - started) * 1000)
+            return result
+        # 循环每次都会 return 或 raise，只有 attempts 为 0 才可能走到这里。
+        raise FeishuApiError(f"重试次数配置无效：{attempts}")
 
 
 @dataclass(frozen=True, slots=True)

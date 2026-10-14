@@ -329,6 +329,7 @@ class LogRepository:
         self.bitable = bitable
         self.table = config.tables["logs"]
         self.organization_cache = organization_cache
+        self.submission_hours: tuple[str, str] | None = None
 
     def backfill_full_logs(self, logs: list[WorkLog]) -> int:
         """Write the composed text to the source table when it differs."""
@@ -436,6 +437,13 @@ class LogRepository:
             for row, submitted_at in zip(rows, resolved):
                 if not start <= submitted_at < end:
                     continue
+                if self.submission_hours:
+                    clock = submitted_at.astimezone(SHANGHAI).strftime("%H:%M")
+                    if not self.submission_hours[0] <= clock < self.submission_hours[1]:
+                        day = submitted_at.astimezone(SHANGHAI).date()
+                        per_day[day][1][f"log:{row['log_id']}:outside-window"] = (
+                            "日志提交时间不在开放窗口内，本条未纳入处理")
+                        continue
                 values = row["values"]
                 named = scalar(values.get(f.get("submitter_name", ""))).strip()
                 referenced = resolve_reference(values.get(f["submitter_ref"]), person_aliases)

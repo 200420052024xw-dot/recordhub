@@ -2,7 +2,7 @@
 # 所有定时任务使用的时区。
 timezone = "Asia/Shanghai"
 
-# Workflow1 只在次日启动一次；后续阶段由确认事件推进。
+# Workflow1 在次日生成评价；确认事件只保存评价，到截止时统一定稿。
 [workflows.workflow1_daily]
 # 是否启用此任务。
 enabled = true
@@ -34,7 +34,7 @@ time = "00:55"
 # anchor_date 仅保留为 interval_days 配置格式的兼容字段。
 # 每次在计划日 04:00 启动：S04 只汇总日志原文、材料不带评价，不必等人工评价定稿，
 # 材料最后一天（计划日的前一天）的日志当天凌晨就归档入库了，半夜跑最省事。
-# 失败就整点重来，初次之外最多再重试 3 次（04/05/06/07）；07:00 那次仍失败就报警，
+# 失败后一小时重试，初次之外最多再重试 3 次；到点的新任务优先于重试任务。
 # 当天不再自动重试。08:00 才通知部长（半夜不吵人），当天 21:50 截止确认，
 # 过期未确认则按 AI 草稿定稿，随报告推送给团队负责人。
 [workflows.s04_progress]
@@ -75,7 +75,9 @@ enabled = true
 # 执行周期：daily、weekly、monthly 或 interval_days。
 schedule_type = "monthly"
 # 计划运行的本地时间，格式为 HH:MM。
-time = "04:00"
+time = "08:00"
+report_notify_at = "12:30"
+report_notify_days = 1
 # 当日向各部长发送确认通知的本地时间；任务晚完成则完成后补发。
 notify_at = "12:00"
 # 月度任务在每月几日触发。
@@ -96,7 +98,7 @@ enabled = true
 # 执行周期：daily、weekly、monthly 或 interval_days。
 schedule_type = "monthly"
 # 计划运行的本地时间，格式为 HH:MM。
-time = "04:00"
+time = "08:00"
 # 月度任务在每月几日触发。
 day = 1
 # 分析材料所覆盖的周期。
@@ -108,7 +110,7 @@ enabled = true
 # 执行周期：daily、weekly、monthly 或 interval_days。
 schedule_type = "monthly"
 # 计划运行的本地时间，格式为 HH:MM。
-time = "04:00"
+time = "08:00"
 # 月度任务在每月几日触发。
 day = 1
 # 分析材料所覆盖的周期。
@@ -141,10 +143,10 @@ weekday = "mon"
 # 分析材料所覆盖的周期。
 material_period = "previous_week"
 
-# 提醒流程和业务流程分开配置，方便只调整提醒时刻。
+# 提醒已关闭；保留这一节配置提交窗口和兜底表单。
 [workflows.daily_log_reminder]
 # 是否启用此任务。
-enabled = true
+enabled = false
 # 执行周期：daily、weekly、monthly 或 interval_days。
 schedule_type = "daily"
 # 计划运行的本地时间，格式为 HH:MM。
@@ -158,8 +160,18 @@ submit_closes_at = "23:50"
 
 [workflows.pending_confirmation_reminder]
 # 是否启用此任务。
-enabled = true
+enabled = false
 # 执行周期：daily、weekly、monthly 或 interval_days。
 schedule_type = "daily"
 # 计划运行的本地时间，格式为 HH:MM。
 time = "16:00"
+
+# 提醒已关闭；保留这一节配置对话入口批改的接口截止时间。
+[workflows.workbuddy_review]
+# 是否启用此任务（本节点只提供配置，不参与调度）。
+enabled = false
+# 执行周期：daily、weekly、monthly 或 interval_days。
+schedule_type = "daily"
+# 批改接口的截止时间：过了这个点不再接收批改提交（返回 CLOSED）。
+# 之后 10 分钟与飞书表单合并，21:50 随工作流统一定稿。
+time = "21:40"

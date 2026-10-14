@@ -23,6 +23,8 @@ packages = [
     "schema",
     "workflow1",
     "service",
+    "service.workbuddy_query",
+    "service.workbuddy_review",
     "tool",
     "llm",
     "workflow2",

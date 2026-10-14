@@ -53,6 +53,8 @@ class CycleRun(StrictModel):
     notification_ids: dict[str, str] = Field(default_factory=dict)
     issues: dict[str, str] = Field(default_factory=dict)
     last_error: str | None = None
+    frozen_at: datetime | None = None
+    completed_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 

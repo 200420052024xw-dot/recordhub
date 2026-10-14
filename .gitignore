@@ -10,6 +10,10 @@ config/feishu_tables.toml
 .tmp-wheel/
 .tmp-workbook-analysis/
 *.sqlite
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
 *.db
 
 # IDE / venv / logs
@@ -23,3 +27,4 @@ logs/
 
 # 交付给 WorkBuddy 的入口文档:含接口 token,不进版本库。
 docs/skill-template/
+docs/skill-query/SKILL.md

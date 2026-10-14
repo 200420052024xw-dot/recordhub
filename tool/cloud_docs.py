@@ -44,6 +44,7 @@ class CloudDocsService:
         data = self.client.request(
             "POST", "drive/v1/files/create_folder",
             json_body={"name": name, "folder_token": parent},
+            retry_locked_folder=True,
         ).get("data", {})
         token = data.get("token")
         if not token:
@@ -54,6 +55,7 @@ class CloudDocsService:
         data = self.client.request(
             "POST", "docx/v1/documents",
             json_body={"folder_token": parent, "title": title},
+            retry_locked_folder=True,
         ).get("data", {}).get("document", {})
         token = data.get("document_id")
         if not token:

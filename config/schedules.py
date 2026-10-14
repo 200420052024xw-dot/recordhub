@@ -99,6 +99,12 @@ def load_schedule_config(
 
 
 def _validate_type_options(name: str, schedule_type: str, values: dict[str, Any]) -> None:
+    if "report_notify_at" in values and not _TIME_PATTERN.fullmatch(str(values["report_notify_at"])):
+        raise ValueError(f"Workflow schedule {name} has invalid report_notify_at")
+    if "report_notify_days" in values:
+        days = values["report_notify_days"]
+        if not isinstance(days, int) or isinstance(days, bool) or days < 0:
+            raise ValueError(f"Workflow schedule {name} needs nonnegative report_notify_days")
     if "analysis_date_offset_days" in values:
         offset = values["analysis_date_offset_days"]
         if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:

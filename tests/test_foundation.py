@@ -12,6 +12,7 @@ from config import DeepSeekSettings, FeishuSettings
 from tool.bitable_fields import scalar
 from tool.feishu import BitableService, ContactService, FeishuClient, FeishuTokenProvider, MessageService
 from tool.http import HttpResponse
+from tool.errors import FeishuApiError
 from tool.cloud_docs import CloudDocsService
 from config import load_schedule_config
 
@@ -148,6 +149,31 @@ class FoundationTests(unittest.TestCase):
         self.assertEqual(request["json_body"],
                          {"folder_token": "folder1", "title": "小组日志"})
         self.assertIsNone(request["query"])
+
+    def test_folder_locked_creation_is_retried(self) -> None:
+        transport = FakeTransport([
+            response({"code": 0, "tenant_access_token": "token", "expire": 7200}),
+            response({"code": 1770036, "msg": "folder locked"}, status=400),
+            response({"code": 0, "data": {"document": {"document_id": "doc1"}}}),
+        ])
+        docs = CloudDocsService(FeishuClient(self.feishu_settings, transport))
+        with patch("tool.feishu.time.sleep") as sleep:
+            self.assertEqual(docs.create_document("folder1", "小组日志"), "doc1")
+        sleep.assert_called_once()
+        self.assertEqual(len(transport.calls), 3)
+        self.assertTrue(transport.calls[2]["url"].endswith("/docx/v1/documents"))
+
+    def test_unexpected_creation_error_is_not_retried(self) -> None:
+        transport = FakeTransport([
+            response({"code": 0, "tenant_access_token": "token", "expire": 7200}),
+            response({"code": 1061002, "msg": "params error"}, status=400),
+        ])
+        docs = CloudDocsService(FeishuClient(self.feishu_settings, transport))
+        with patch("tool.feishu.time.sleep") as sleep:
+            with self.assertRaises(FeishuApiError):
+                docs.create_document("folder1", "小组日志")
+        sleep.assert_not_called()
+        self.assertEqual(len(transport.calls), 2)
 
     def test_deepseek_json_output_is_parsed_and_validated(self) -> None:
         transport = FakeTransport(

@@ -73,6 +73,9 @@ class Runtime:
     workflow2: Workflow2 | None = None
     prompt_repository: PromptRepository | None = None
     workbuddy: LogSubmitService | None = None
+    query: WorkBuddyQueryService | None = None
+    review: ReviewService | None = None
+    orchestrator: Any | None = None
 
 
 @dataclass(slots=True)
@@ -108,7 +111,7 @@ def build_runtime(settings: AppSettings) -> Runtime:
         organization_cache
     )
     prompt_service = PromptService(
-        infrastructure.llm, max_attempts=settings.llm_max_attempts
+        infrastructure.llm, max_attempts=1
     )
     prompt_repository = PromptRepository(
         bitable=infrastructure.bitable, tables=tables, store=store,
@@ -120,6 +123,8 @@ def build_runtime(settings: AppSettings) -> Runtime:
     human_evaluations = HumanEvaluationRepository(
         infrastructure.bitable, tables, cutoff_at=w1.auto_advance_at)
     log_repository = LogRepository(infrastructure.bitable, tables, organization_cache)
+    submission = LogSubmitSettings.from_schedule(schedules)
+    log_repository.submission_hours = (submission.submit_opens_at, submission.submit_closes_at)
     workbuddy = LogSubmitService(
         inbox=WorkBuddyInbox(settings.state_dir),
         organization_cache=organization_cache,
@@ -127,6 +132,37 @@ def build_runtime(settings: AppSettings) -> Runtime:
         table_config=tables,
         workflow_store=store,
         settings=LogSubmitSettings.from_schedule(schedules),
+    )
+    # 对话入口的查询口径：独立于 workbuddy 的只读服务，Workflow2 关闭时也可用。
+    from service.workbuddy_query.service import WorkBuddyQueryService
+    from workflow2.feishu_material import SnapshotRebuilder
+
+    query = WorkBuddyQueryService(
+        organization_cache=organization_cache,
+        log_repository=log_repository,
+        bitable=infrastructure.bitable,
+        tables=tables,
+        inbox=WorkBuddyInbox(settings.state_dir),
+        snapshot_store=store,
+        rebuilder=SnapshotRebuilder(
+            infrastructure.bitable, tables, organization_cache, log_repository,
+            auto_advance_at=w1.auto_advance_at,
+        ),
+        cursor_secret=settings.query_token,
+    )
+    # 对话入口的批改口径：只读快照 + 本地暂存，收下老师的批改结果。
+    from service.workbuddy_review.service import ReviewService
+    from service.workbuddy_review.settings import ReviewSettings
+    from service.workbuddy_review.store import ReviewInbox
+
+    review = ReviewService(
+        organization_cache=organization_cache,
+        snapshot_store=store,
+        inbox=ReviewInbox(settings.state_dir),
+        settings=ReviewSettings.from_schedule(schedules),
+        cursor_secret=settings.review_token,
+        bitable=infrastructure.bitable,
+        tables=tables,
     )
     workflow = Workflow1(
         store=store,
@@ -196,6 +232,8 @@ def build_runtime(settings: AppSettings) -> Runtime:
         workflow2=workflow2,
         prompt_repository=prompt_repository,
         workbuddy=workbuddy,
+        query=query,
+        review=review,
     )
 
 

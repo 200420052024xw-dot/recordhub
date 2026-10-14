@@ -57,16 +57,19 @@ class AppSettings:
     # 日志评价遇到接口/网络失败时的延后重试：间隔多少分钟、最多几次。
     llm_retry_interval_minutes: int = 60
     llm_retry_limit: int = 3
-    # 已完成日报快照的保留天数。必须大于 Workflow2 的材料窗口（阶段分析=3 天，
-    # 它是唯一不允许从飞书重建的周期），否则清理会把还要用的那天删掉。
-    snapshot_retention_days: int = 5
+    # 已完成快照保留天数；周期分析可以从飞书重建材料。
+    snapshot_retention_days: int = 2
     scheduler_enabled: bool = True
     workflow2_enabled: bool = False
     event_stream_enabled: bool = True
     archive_parent_folder_token: str = ""
     log_dir: str = "logs"
-    log_retention_days: int = 3
+    log_retention_days: int = 2
     log_level: str = "INFO"
+    # 日志查询（WorkBuddy 查询口径）专用 token；留空时查询接口 503 不可用。
+    query_token: str = ""
+    # 批改（WorkBuddy 批改口径）专用 token；留空时批改接口 503 不可用。
+    review_token: str = ""
 
     @classmethod
     def from_env(cls) -> "AppSettings":
@@ -108,7 +111,7 @@ class AppSettings:
             ),
             llm_retry_limit=_positive_int("RECORDHUB_LLM_RETRY_LIMIT", 3),
             snapshot_retention_days=_positive_int(
-                "RECORDHUB_SNAPSHOT_RETENTION_DAYS", 5
+                "RECORDHUB_SNAPSHOT_RETENTION_DAYS", 2
             ),
             scheduler_enabled=_boolean("RECORDHUB_SCHEDULER_ENABLED", True),
             workflow2_enabled=_boolean("RECORDHUB_WORKFLOW2_ENABLED", False),
@@ -117,9 +120,11 @@ class AppSettings:
                 "RECORDHUB_ARCHIVE_PARENT_FOLDER_TOKEN", "").strip(),
             log_dir=os.getenv("RECORDHUB_LOG_DIR", "logs").strip() or "logs",
             log_retention_days=_positive_int(
-                "RECORDHUB_LOG_RETENTION_DAYS", 3
+                "RECORDHUB_LOG_RETENTION_DAYS", 2
             ),
             log_level=_log_level("RECORDHUB_LOG_LEVEL", "INFO"),
+            query_token=os.getenv("RECORDHUB_QUERY_TOKEN", "").strip(),
+            review_token=os.getenv("RECORDHUB_REVIEW_TOKEN", "").strip(),
         )
 
     def missing_variables(self) -> list[str]:

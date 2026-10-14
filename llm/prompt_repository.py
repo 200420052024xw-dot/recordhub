@@ -407,6 +407,7 @@ class PromptRepository:
             parsed: dict[str, PromptEntry] = {}
             statuses: dict[str, str] = {}
             result = {"reviewed": 0, "passed": 0, "failed": 0}
+            self.deferred_count = 0
             for record in records:
                 record_id = str(record.get("record_id") or "")
                 statuses[record_id] = self._field_choice(
@@ -487,6 +488,7 @@ class PromptRepository:
                                    entry.record_id, reason, exc_info=True)
                     continue
                 except LLMError as exc:
+                    self.deferred_count += 1
                     # 接口/网络故障不是模板的错：不写"未通过"、不通知本人，
                     # 留空让后面几轮审核重来（不能把系统的故障算到提交人头上）。
                     logger.warning("skill_review_deferred record_id=%s user_id=%s error=%s",

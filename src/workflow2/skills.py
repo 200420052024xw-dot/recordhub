@@ -317,7 +317,8 @@ class TextSkill(Generic[OutputT]):
         if not submitted:
             return SkillResult[self.output_model](**metadata(),
                 status=SkillStatus.NO_MATERIAL, message="本范围内暂无可分析材料")
-        if self.requires_confirmed and any(not record.confirmed for record in data.records):
+        if (self.requires_confirmed and not data.scope.omitted_sources
+                and any(not record.confirmed and not record.evaluations for record in data.records)):
             return SkillResult[self.output_model](**metadata(),
                 status=SkillStatus.BLOCKED, message="输入含未确认记录，请先完成确认")
         # Missing submissions never enter the prompt payload.

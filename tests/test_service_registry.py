@@ -4,6 +4,8 @@ import asyncio
 import logging
 import sys
 import unittest
+import tempfile
+from datetime import date, datetime, timezone
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
@@ -33,7 +35,10 @@ def binding(name: str, table_id: str, *, auto_advance_at: str = "") -> WorkflowB
 
 class ServiceRegistryTests(unittest.TestCase):
     def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
         self.settings = AppSettings(
+            state_dir=temporary.name,
             feishu=FeishuSettings("app", "secret", "base"),
             deepseek=DeepSeekSettings("key"),
             admin_token="admin-token",
@@ -104,12 +109,13 @@ class ServiceRegistryTests(unittest.TestCase):
                        for name in runtime.workflows},
         )
         scheduler = _build_scheduler(schedules, runtime, self.settings)
-        self.assertEqual(
-            {job.id for job in scheduler.get_jobs()},
-            {"workflow1_daily", "workflow2_daily",
-             "workflow1_daily_confirmation_auto_advance",
-             "snapshot_cleanup", "organization_refresh"},
-        )
+        self.addCleanup(runtime.orchestrator.tasks.close)
+        self.assertEqual({job.id for job in scheduler.get_jobs()},
+                         {"appointment_planner", "appointment_repair", "snapshot_cleanup", "organization_refresh"})
+        runtime.orchestrator.plan_day(date(2026, 10, 14))
+        tasks = runtime.orchestrator.tasks.journal.all()
+        self.assertEqual({t["payload"]["binding"] for t in tasks}, set(runtime.workflows))
+        self.assertEqual(sum(t["action"] == "daily_close" for t in tasks), 1)
 
     def test_failed_evaluation_retry_job_is_registered_for_workflow1(self) -> None:
         """接口失败的日志评价要有人定期去看有没有到点该重跑。"""
@@ -133,16 +139,13 @@ class ServiceRegistryTests(unittest.TestCase):
 
         scheduler = _build_scheduler(schedules, runtime, self.settings)
 
+        self.addCleanup(runtime.orchestrator.tasks.close)
         jobs = {job.id: job for job in scheduler.get_jobs()}
-        self.assertIn("workflow1_daily_evaluation_retry", jobs)
-        self.assertIn("workflow1_daily_statistics_retry", jobs)
-        self.assertIn("hour='2,3,4'", str(jobs["workflow1_daily_statistics_retry"].trigger))
-        jobs["workflow1_daily_statistics_retry"].func()
-        workflow.refresh_submission_statistics.assert_called_once()
+        self.assertNotIn("workflow1_daily_evaluation_retry", jobs)
+        self.assertNotIn("workflow1_daily_incomplete_retry", jobs)
+        jobs["appointment_repair"].func()
+        workflow.retry_failed_evaluations.assert_not_called()
         daily.store.list_incomplete_workflows.assert_not_called()
-        # 01:00 起跑 → 02:20 / 03:20 重试没跑完的当天，04:20 是最后一轮（标人工补评）
-        self.assertIn("hour='2,3'", str(jobs["workflow1_daily_incomplete_retry"].trigger))
-        self.assertIn("hour='4'", str(jobs["workflow1_daily_incomplete_retry_final"].trigger))
 
     def test_configured_notification_jobs_are_registered(self) -> None:
         settings = replace(self.settings, workflow2_enabled=True)
@@ -155,23 +158,25 @@ class ServiceRegistryTests(unittest.TestCase):
         )
         scheduler = _build_scheduler(
             load_schedule_config("config/schedules.toml"), runtime, settings)
-        jobs = {job.id: str(job.trigger) for job in scheduler.get_jobs()}
-        self.assertIn("hour='1'", jobs["workflow1_daily"])
-        self.assertIn("hour='8'", jobs["workflow1_daily_evaluator_notification"])
-        self.assertIn("hour='22'", jobs["workflow1_daily_report_notification"])
-        self.assertNotIn("workflow1_daily_evaluator_notification_recovery", jobs)
-        self.assertIn("hour='19'", jobs["workflow1_daily_confirmation_auto_advance"])
-        # 阶段分析不等人工评价定稿（材料只带日志原文），所以凌晨就开跑；
-        # 部长那边等 08:00 的通知。
-        self.assertIn("hour='4'", jobs["workflow2_stage"])
-        self.assertIn("hour='8'", jobs["workflow2_stage_notification"])
-        # 22:00 才把定稿报告推给团队负责人
-        self.assertIn("hour='22'", jobs["workflow2_stage_report_notification"])
-        self.assertIn("hour='4'", jobs["workflow2_monthly"])
-        self.assertIn("hour='12'", jobs["workflow2_monthly_notification"])
-        self.assertIn("hour='6'", jobs["workflow2_weekly"])
-        self.assertIn("hour='9'", jobs["workflow2_weekly_notification"])
-        self.assertIn("minute='55'", jobs["skill_prompt_review"])
+        self.addCleanup(runtime.orchestrator.tasks.close)
+        orchestration = runtime.orchestrator
+        runtime.workflow2.store.activate.return_value = date(2026, 10, 1)
+        orchestration.plan_day(date(2026, 10, 14))
+        orchestration.plan_cycle("stage", date(2026, 11, 1))
+        orchestration.plan_cycle("monthly", date(2026, 11, 1))
+        orchestration.plan_cycle("weekly", date(2026, 11, 2))
+        tasks = orchestration.tasks.journal.all()
+        def find(action, kind=""):
+            return next(t for t in tasks if t["action"] == action and t["payload"].get("kind", "") == kind)
+        self.assertTrue(find("daily_generate")["due"].endswith("01:00:00+08:00"))
+        self.assertTrue(find("daily_review")["due"].endswith("08:00:00+08:00"))
+        self.assertTrue(find("daily_close")["due"].endswith("19:00:00+08:00"))
+        self.assertTrue(find("cycle_generate", "stage")["due"].endswith("04:00:00+08:00"))
+        self.assertEqual(find("cycle_generate", "monthly")["due"], "2026-11-01T08:00:00+08:00")
+        self.assertEqual(find("cycle_send", "monthly")["due"], "2026-11-02T12:30:00+08:00")
+        self.assertEqual(find("cycle_close", "monthly")["due"], "2026-11-02T12:00:00+08:00")
+        self.assertTrue(find("cycle_send", "weekly")["due"].endswith("09:00:00+08:00"))
+        self.assertFalse(any(t["action"] == "cycle_review" and t["payload"]["kind"] == "weekly" for t in tasks))
 
     def test_organization_refresh_failure_notifies_admin_and_continues(self) -> None:
         settings = replace(self.settings, admin_open_id="ou_admin")

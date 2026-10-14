@@ -1,4 +1,4 @@
-"""Durable one-attempt business delivery and date-scoped admin sending."""
+"""Durable business delivery, bounded definite-failure retries and admin sending."""
 
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -60,7 +60,8 @@ class NotificationPolicy:
     """Persist activation and every attempt before doing remote work.
 
     Existing runs are frozen on first installation. Restarts retain that
-    boundary; automatic recovery never retries a failed/uncertain delivery.
+    boundary. Definite report failures can retry on their send day; uncertain
+    deliveries always need explicit human review.
     """
     def __init__(self, root: str | Path):
         self.path = Path(root) / "notification_delivery.json"
@@ -90,7 +91,11 @@ class NotificationPolicy:
             if previous and previous["status"] == "sent":
                 record_outcome(key, "already_sent", message_id=previous["message_id"])
                 return {"message_id": previous["message_id"]}
-            if _capture.get() or (not manual and (previous or created_at <= self.activated_at or
+            retry_ready = (previous and previous["status"] == "failed" and
+                           previous.get("message_type") == "report" and previous.get("attempts", 0) < 4 and
+                           previous.get("retry_at") and utc_now() >= datetime.fromisoformat(previous["retry_at"]) and
+                           send_date == utc_now().astimezone(SHANGHAI).date())
+            if _capture.get() or (not manual and ((previous and not retry_ready) or created_at <= self.activated_at or
                                                   send_date < utc_now().astimezone(SHANGHAI).date())):
                 if previous is None:
                     state["messages"][key] = {
@@ -108,6 +113,8 @@ class NotificationPolicy:
                 if elapsed >= timedelta(hours=1) and not confirmed_unsent(target_date):
                     raise ValueError(f"通知 {key} 发送结果未知且去重窗口已过，请先人工核对")
             item = {
+                "key": key, "send_date": send_date.isoformat(),
+                "created_at": created_at.isoformat(),
                 "target_date": target_date.isoformat(), "receive_id": receive_id,
                 "message": message, "workflow": workflow,
                 "message_type": message_type, "kind": kind,
@@ -125,11 +132,15 @@ class NotificationPolicy:
                     raise ValueError("飞书通知未返回 message_id，发送结果未知")
             except Exception as exc:
                 # Preserve uncertainty for transport failures/crashes. Definite
-                # API rejections may be retried explicitly by an administrator.
+                # Report API rejections may retry on the scheduled send day.
                 from tool.errors import FeishuApiError
                 item.update(status="failed" if isinstance(exc, FeishuApiError) else "attempting",
                             error=error_summary(exc))
+                if item["status"] == "failed" and message_type == "report" and not manual and item["attempts"] < 4:
+                    item["retry_at"] = (utc_now() + timedelta(minutes=10)).isoformat()
                 FileStateStore._atomic_write(self.path, state)
+                if item.get("retry_at") and (callback := getattr(self, "retry_callback", None)):
+                    callback(item)
                 record_outcome(key, "failed", error=item["error"])
                 logger.exception("notification_failed date=%s key=%s to=%s manual=%s",
                                  target_date, key, receive_id, manual)
@@ -141,6 +152,25 @@ class NotificationPolicy:
             logger.info("notification_delivered date=%s key=%s message_id=%s manual=%s",
                         target_date, key, message_id, manual)
             return result
+
+    def retry_report(self, key, messages):
+        with self.lock:
+            item = self._read()["messages"].get(key)
+            if not item or item["status"] != "failed" or item.get("message_type") != "report":
+                return
+            if item.get("attempts", 0) >= 4 or item.get("send_date") != utc_now().astimezone(SHANGHAI).date().isoformat():
+                return
+            try:
+                return self.deliver(key=key, target_date=date.fromisoformat(item["target_date"]),
+                    created_at=datetime.fromisoformat(item["created_at"]),
+                    send_date=date.fromisoformat(item["send_date"]), receive_id=item["receive_id"],
+                    message=item["message"], workflow=item["workflow"],
+                    message_type="report", kind=item.get("kind", "all"),
+                    send=lambda: messages.send_text(item["receive_id"], item["message"], idempotency_key=key))
+            except Exception:
+                # deliver() has persisted the outcome and booked the next
+                # definite failure. Unknown outcomes must never auto-retry.
+                return None
 
     def replay(self, target_date: date, messages, *, workflow: str,
                message_type: str = "all", kind: str = "all", confirm_unsent: bool = False) -> dict | None:

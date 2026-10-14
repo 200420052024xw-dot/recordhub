@@ -3,7 +3,7 @@
 import os
 import tempfile
 import tomllib
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from uuid import UUID
 
@@ -59,3 +59,12 @@ class Workflow2Store:
 
     def pending(self) -> list[CycleRun]:
         return [run for run in self.all_runs() if run.status != "COMPLETED"]
+
+    def cleanup_completed(self, retention_days=2, *, now=None) -> int:
+        cutoff = (now or utc_now()) - timedelta(days=retention_days)
+        removed = 0
+        for run in self.all_runs():
+            if run.status == "COMPLETED" and (run.completed_at or run.updated_at) <= cutoff:
+                self.path(run.run_id).unlink()
+                removed += 1
+        return removed

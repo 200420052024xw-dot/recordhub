@@ -302,20 +302,23 @@ class FileStateStore:
                 return None
             return self._read_json(path).get("payload")
 
-    def cleanup_completed(self, retention_days: int, *, today: date | None = None) -> int:
+    def cleanup_completed(self, retention_days: int, *, today: date | None = None,
+                          now: datetime | None = None) -> int:
         """Really delete completed daily states once past retention.
 
         Snapshots are processing caches; the Feishu tables are the source of
         truth, so no checked copy is kept. Incomplete days are never touched.
         """
-        cutoff = (today or date.today()) - timedelta(days=retention_days)
+        current = now or (datetime.combine(today, datetime.min.time(), UTC) if today else utc_now())
+        cutoff = current - timedelta(days=retention_days)
         removed = 0
         with self._lock:
             if self.runs_dir.exists():
                 for path in self.runs_dir.glob("*.json"):
                     document = self._read_json(path)
                     run = WorkflowRun.model_validate(document["run"])
-                    if run.status == "COMPLETED" and run.target_date < cutoff:
+                    ended = run.completed_at or run.updated_at
+                    if run.status == "COMPLETED" and ended <= cutoff:
                         path.unlink()
                         archived = self.checked_dir / path.name
                         if archived.exists():
@@ -327,7 +330,7 @@ class FileStateStore:
                         day = date.fromisoformat(path.stem)
                     except ValueError:
                         continue
-                    if day < cutoff:
+                    if day < cutoff.date():
                         path.unlink()
                         removed += 1
         return removed

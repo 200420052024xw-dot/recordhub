@@ -17,27 +17,21 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from config import AppSettings, load_env_file, load_schedule_config
-from config.schedules import ScheduleConfig, WorkflowSchedule
+from config.schedules import ScheduleConfig
 from schema import Organization, PersonCreateRequest, PersonUpdateRequest
 from service.bitable_events import BitableEventStream
-from service.runtime import Runtime, WorkflowBinding, build_runtime, capture_notification_backlog
+from service.runtime import Runtime, build_runtime, capture_notification_backlog
+from service.workbuddy_query.models import IdentityRequest, QueryRequest
+from service.workbuddy_review.models import PendingRequest, ReviewSubmitRequest
 from workflow1.models import (
     ConfirmationRequest,
     WorkBuddyIdentityRequest,
     WorkBuddySubmitRequest,
 )
-from workflow1.workflow import Workflow1
 from workflow1.workbuddy_inbox import LogSubmitService
 from tool.diagnostics import error_summary
 
 logger = logging.getLogger(__name__)
-
-# Skill 格式审核每夜扫几遍：首轮在配置时刻，之后每小时一遍，共 SKILL_REVIEW_SWEEPS 轮。
-# 只有接口/网络故障会留下未审核的记录，几轮之后仍重试不动就是真的有问题了。
-SKILL_REVIEW_SWEEPS = 4
-# 没跑完的当天逐小时重试的时刻（分）：留出一点余量，避免和整点起跑的当日流程抢。
-INCOMPLETE_RETRY_MINUTE = 20
-
 
 class NotificationSendRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -124,6 +118,13 @@ def _register_routes(app: FastAPI, runtime: Runtime, settings: AppSettings) -> N
     @app.post("/admin/submission-statistics/{target_date}", dependencies=[Depends(require_admin)])
     def refresh_submission_statistics(target_date: date) -> dict:
         return workflow1.workflow.refresh_submission_statistics(target_date)
+
+    @app.post("/admin/reviews/merge/{target_date}", dependencies=[Depends(require_admin)])
+    def merge_reviews(target_date: date) -> dict:
+        """手动把对话入口收下的批改结果合并进飞书表（正常由 21:40 定时触发）。"""
+        if runtime.review is None:
+            raise HTTPException(status_code=503, detail="Review endpoint is not configured")
+        return runtime.review.merge(target_date)
 
     @app.post(
         "/admin/workflows/{target_date}/resume", dependencies=[Depends(require_admin)]
@@ -300,6 +301,50 @@ def _register_routes(app: FastAPI, runtime: Runtime, settings: AppSettings) -> N
     def workbuddy_submit(request: WorkBuddySubmitRequest) -> dict:
         return workbuddy_service().submit(request)
 
+    # 对话入口的查询口径:又一把独立 token,拿不到 /admin,也读不了提交接口。
+    def require_query(
+        authorization: Annotated[str | None, Header()] = None
+    ) -> None:
+        _require_token(settings.query_token, authorization)
+
+    def query_service():
+        if runtime.query is None:
+            raise HTTPException(
+                status_code=503, detail="Query endpoint is not configured")
+        return runtime.query
+
+    @app.post("/workbuddy/v1/queries/identity",
+              dependencies=[Depends(require_query)])
+    def workbuddy_query_identity(request: IdentityRequest) -> dict:
+        return query_service().identity(request.name)
+
+    @app.post("/workbuddy/v1/queries",
+              dependencies=[Depends(require_query)])
+    def workbuddy_query(request: QueryRequest) -> dict:
+        return query_service().query(request)
+
+    # 批改口径:又一把独立 token,拿不到 /admin,也读不了查询 / 提交接口。
+    def require_review(
+        authorization: Annotated[str | None, Header()] = None
+    ) -> None:
+        _require_token(settings.review_token, authorization)
+
+    def review_service():
+        if runtime.review is None:
+            raise HTTPException(
+                status_code=503, detail="Review endpoint is not configured")
+        return runtime.review
+
+    @app.post("/workbuddy/v1/reviews/pending",
+              dependencies=[Depends(require_review)])
+    def workbuddy_reviews_pending(request: PendingRequest) -> dict:
+        return review_service().pending(request)
+
+    @app.post("/workbuddy/v1/reviews",
+              dependencies=[Depends(require_review)])
+    def workbuddy_review_submit(request: ReviewSubmitRequest) -> dict:
+        return review_service().submit(request)
+
 
 def _organization_payload(organization: Organization) -> dict:
     return {
@@ -367,6 +412,7 @@ def _make_lifespan(runtime: Runtime, settings: AppSettings, schedules: ScheduleC
             stream.start()
         if settings.scheduler_enabled:
             scheduler = _build_scheduler(schedules, runtime, settings)
+            runtime.orchestrator.restore()
             scheduler.start()
         logger.info(
             "service_started scheduler_enabled=%s event_stream_enabled=%s "
@@ -382,162 +428,44 @@ def _make_lifespan(runtime: Runtime, settings: AppSettings, schedules: ScheduleC
             if stream:
                 stream.stop()
             if scheduler:
-                scheduler.shutdown(wait=False)
+                scheduler.pause()
+                runtime.orchestrator.tasks.close()
+                scheduler.shutdown(wait=True)
             logger.info("service_stopped")
 
     return lifespan
 
 
-def _schedule_daily(
-    scheduler: BackgroundScheduler,
-    schedules: ScheduleConfig,
-    schedule: WorkflowSchedule,
-    binding: WorkflowBinding,
-) -> None:
-    if schedule.schedule_type != "daily":
-        raise ValueError(f"Registered workflow {binding.name} must have a daily schedule")
-    hour, minute = (int(value) for value in schedule.time.split(":", 1))
-
-    def run_daily() -> None:
-        days_ago = int(schedule.options.get("material_days_ago", 1))
-        today = datetime.now(ZoneInfo(schedules.timezone)).date()
-        target = today - timedelta(days=days_ago)
-        logger.info("scheduled_workflow1_run date=%s", target)
-        binding.workflow.start(target)
-
-    scheduler.add_job(
-        run_daily, "cron", hour=hour, minute=minute, id=binding.name,
-        replace_existing=True, max_instances=1, coalesce=True,
-    )
-
-
 def _build_scheduler(
     schedules: ScheduleConfig, runtime: Runtime, settings: AppSettings
 ) -> BackgroundScheduler:
+    from service.orchestration import Orchestrator
+
     scheduler = BackgroundScheduler(timezone=schedules.timezone)
-    for name, binding in runtime.workflows.items():
-        schedule = schedules.workflows.get(name)
-        if schedule is None:
+    for name in runtime.workflows:
+        if name not in schedules.workflows:
             raise ValueError(f"Missing schedule for registered workflow {name}")
-        if schedule.enabled:
-            _schedule_daily(scheduler, schedules, schedule, binding)
-            if notify_at := schedule.options.get("notify_at"):
-                hour, minute = map(int, str(notify_at).split(":"))
+    orchestration = Orchestrator(runtime, schedules, scheduler, settings)
+    runtime.orchestrator = orchestration
 
-                def notify_evaluators(one: WorkflowBinding = binding,
-                                      daily: WorkflowSchedule = schedule) -> None:
-                    today = datetime.now(ZoneInfo(schedules.timezone)).date()
-                    days_ago = int(daily.options.get("material_days_ago", 1))
-                    one.workflow.notify_evaluators_if_due(today - timedelta(days=days_ago))
-
-                scheduler.add_job(
-                    notify_evaluators, "cron", hour=hour, minute=minute,
-                    id=f"{name}_evaluator_notification", replace_existing=True,
-                    max_instances=1, coalesce=True,
-                )
-            if report_notify_at := schedule.options.get("report_notify_at"):
-                hour, minute = map(int, str(report_notify_at).split(":"))
-
-                def notify_reports(one: WorkflowBinding = binding,
-                                   daily: WorkflowSchedule = schedule) -> None:
-                    today = datetime.now(ZoneInfo(schedules.timezone)).date()
-                    days_ago = int(daily.options.get("material_days_ago", 1))
-                    one.workflow.notify_documents_if_due(today - timedelta(days=days_ago))
-
-                scheduler.add_job(
-                    notify_reports, "cron", hour=hour, minute=minute,
-                    id=f"{name}_report_notification", replace_existing=True,
-                    max_instances=1, coalesce=True,
-                )
-
-        if binding.auto_advance_at:
-            hour, minute = (int(value) for value in binding.auto_advance_at.split(":", 1))
-
-            def auto_advance(one: WorkflowBinding = binding) -> None:
-                for run in one.store.list_incomplete_workflows():
-                    result = one.workflow.finalize_pending_confirmations(run.target_date)
-                    logger.info("auto_advance_result date=%s result=%s",
-                                run.target_date, result)
-
-            scheduler.add_job(
-                auto_advance, "cron", hour=hour, minute=minute,
-                id=f"{name}_confirmation_auto_advance", replace_existing=True,
-                max_instances=1, coalesce=True,
-            )
-
-        if isinstance(binding.workflow, Workflow1):
-            # Independently repair counts even if the daily report completed or
-            # failed. Never use incomplete-workflow status as the eligibility gate.
-            if schedule.enabled:
-                def refresh_statistics(one: WorkflowBinding = binding,
-                                       daily: WorkflowSchedule = schedule) -> None:
-                    today = datetime.now(ZoneInfo(schedules.timezone)).date()
-                    days_ago = int(daily.options.get("material_days_ago", 1))
-                    one.workflow.refresh_submission_statistics(today - timedelta(days=days_ago))
-
-                start_hour = int(schedule.time.split(":", 1)[0])
-                scheduler.add_job(
-                    refresh_statistics, "cron", hour=",".join(str((start_hour + n) % 24)
-                                                             for n in (1, 2, 3)), minute=25,
-                    id=f"{name}_statistics_retry", replace_existing=True,
-                    max_instances=1, coalesce=True,
-                )
-            # 接口/网络失败的日志评价按 RECORDHUB_LLM_RETRY_INTERVAL_MINUTES 延后重试；
-            # 每 10 分钟看一眼有没有到点的，到了才重跑，避免整天没有评价。
-            def retry_failed_evaluations(one: WorkflowBinding = binding) -> None:
-                try:
-                    one.workflow.retry_failed_evaluations()
-                except Exception:
-                    logger.exception("failed_evaluation_retry_failed workflow=%s", one.name)
-
-            scheduler.add_job(
-                retry_failed_evaluations, "interval", minutes=10,
-                id=f"{name}_evaluation_retry", replace_existing=True,
-                max_instances=1, coalesce=True,
-            )
-
-            # 整天没跑完（快照没建、发布失败、进程被杀……）也要能自己好：
-            # 起跑后每小时重试一轮，最后一轮仍没完成就标"需人工补评"，之后不再自动折腾。
-            start_hour = int(str(schedule.time).split(":", 1)[0])
-            slots = [(start_hour + offset) % 24
-                     for offset in range(1, settings.llm_retry_limit + 1)]
-
-            def retry_incomplete(last: bool, one: WorkflowBinding = binding) -> None:
-                try:
-                    results = one.workflow.retry_incomplete(final=last)
-                    if results:
-                        logger.info("incomplete_day_retry workflow=%s final=%s results=%s",
-                                    one.name, last, results)
-                except Exception:
-                    logger.exception("incomplete_day_retry_failed workflow=%s", one.name)
-
-            if len(slots) > 1:
-                scheduler.add_job(
-                    retry_incomplete, "cron", args=[False],
-                    hour=",".join(str(hour) for hour in slots[:-1]), minute=INCOMPLETE_RETRY_MINUTE,
-                    id=f"{name}_incomplete_retry", replace_existing=True,
-                    max_instances=1, coalesce=True,
-                )
-            scheduler.add_job(
-                retry_incomplete, "cron", args=[True], hour=str(slots[-1]),
-                minute=INCOMPLETE_RETRY_MINUTE,
-                id=f"{name}_incomplete_retry_final", replace_existing=True,
-                max_instances=1, coalesce=True,
-            )
+    scheduler.add_job(orchestration.plan_day, "cron", hour=0, minute=0,
+                      id="appointment_planner", replace_existing=True, coalesce=True,
+                      max_instances=1, misfire_grace_time=None)
+    # Repair derived timers only; never restart business workflows by scanning.
+    scheduler.add_job(orchestration.tasks.restore, "interval", hours=1,
+                      id="appointment_repair", replace_existing=True, coalesce=True,
+                      max_instances=1)
 
     def cleanup() -> None:
-        today = datetime.now(ZoneInfo(schedules.timezone)).date()
-        removed = sum(
-            binding.store.cleanup_completed(settings.snapshot_retention_days, today=today)
-            for binding in runtime.workflows.values()
-        )
-        logger.info("snapshot_cleanup_removed removed=%d retention_days=%d",
-                    removed, settings.snapshot_retention_days)
+        removed = sum(binding.store.cleanup_completed(settings.snapshot_retention_days)
+                      for binding in runtime.workflows.values())
+        if runtime.workflow2 is not None:
+            removed += runtime.workflow2.store.cleanup_completed(settings.snapshot_retention_days)
+        removed += orchestration.tasks.journal.cleanup(2)
+        logger.info("state_cleanup_removed removed=%d", removed)
 
-    scheduler.add_job(
-        cleanup, "cron", hour=3, minute=30, id="snapshot_cleanup",
-        replace_existing=True, max_instances=1, coalesce=True,
-    )
+    scheduler.add_job(cleanup, "cron", hour=3, minute=30, id="snapshot_cleanup",
+                      replace_existing=True, max_instances=1, coalesce=True)
 
     def refresh_organization() -> None:
         try:
@@ -545,69 +473,7 @@ def _build_scheduler(
         except Exception:
             logger.exception("organization_refresh_failed")
 
-    # 组织缓存每日刷新：需早于 workflow1_daily（默认 01:00），保证当天日报
-    # 使用最新的人员名单；刷新失败仅通知管理员，不影响后续任务继续执行。
-    scheduler.add_job(
-        refresh_organization, "cron", hour=0, minute=50, id="organization_refresh",
-        replace_existing=True, max_instances=1, coalesce=True,
-    )
-    skill_review = schedules.workflows.get("skill_prompt_review")
-    if (runtime.prompt_repository is not None and skill_review is not None
-            and skill_review.enabled):
-        def review_skill_prompts() -> None:
-            organization = runtime.organization_cache.get()
-            runtime.prompt_repository.review_pending(organization)
-
-        # Use the freshly refreshed organization relations and finish before
-        # Workflow1 starts at 01:00. 之后每小时再扫一遍：接口故障导致的审核
-        # 只是留空（不写"未通过"、不通知本人），这几轮会把它们重审掉。
-        review_hour, review_minute = map(int, skill_review.time.split(":"))
-        sweep_hours = ",".join(
-            str((review_hour + offset) % 24) for offset in range(SKILL_REVIEW_SWEEPS))
-        scheduler.add_job(
-            review_skill_prompts, "cron", hour=sweep_hours, minute=review_minute,
-            id="skill_prompt_review", replace_existing=True,
-            max_instances=1, coalesce=True,
-        )
-    if settings.workflow2_enabled and runtime.workflow2 is not None:
-        def run_workflow2(kind: str) -> None:
-            today = datetime.now(ZoneInfo(schedules.timezone)).date()
-            run = runtime.workflow2.scheduled(kind, today)
-            if run is None:
-                logger.info("workflow2_not_due kind=%s date=%s", kind, today)
-
-        for kind, schedule_name in (("stage", "s04_progress"),
-                                    ("monthly", "s05_people_suggestions"),
-                                    ("weekly", "s08_public_technology")):
-            item = schedules.workflows[schedule_name]
-            if not item.enabled:
-                continue
-            hour, minute = map(int, item.time.split(":"))
-            options = {}
-            if item.schedule_type == "weekly":
-                options["day_of_week"] = item.options["weekday"]
-            elif item.schedule_type == "monthly":
-                options["day"] = item.options["day"]
-            scheduler.add_job(run_workflow2, "cron", args=[kind], hour=hour,
-                minute=minute, **options, id=f"workflow2_{kind}",
-                replace_existing=True, max_instances=1, coalesce=True)
-            # notify_at 是催部长确认的时刻；report_notify_at 是给团队负责人推报告的时刻。
-            for option, suffix in (("notify_at", "notification"),
-                                   ("report_notify_at", "report_notification")):
-                moment = item.options.get(option)
-                if not moment:
-                    continue
-                notify_hour, notify_minute = map(int, str(moment).split(":"))
-
-                def notify_workflow2(cycle_kind: str) -> None:
-                    today = datetime.now(ZoneInfo(schedules.timezone)).date()
-                    runtime.workflow2.notify_due(cycle_kind, today)
-
-                scheduler.add_job(notify_workflow2, "cron", args=[kind],
-                    hour=notify_hour, minute=notify_minute, **options,
-                    id=f"workflow2_{kind}_{suffix}", replace_existing=True,
-                    max_instances=1, coalesce=True)
-        scheduler.add_job(runtime.workflow2.recover, "interval", minutes=15,
-            id="workflow2_recovery", replace_existing=True, max_instances=1,
-            coalesce=True)
+    scheduler.add_job(refresh_organization, "cron", hour=0, minute=50,
+                      id="organization_refresh", replace_existing=True,
+                      max_instances=1, coalesce=True)
     return scheduler

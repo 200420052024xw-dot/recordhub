@@ -153,7 +153,7 @@ class ReportDetailsTests(unittest.TestCase):
     def test_statistics_identity_survives_daily_snapshot_cleanup(self):
         self.publish()
         self.store.set_status(DAY, "COMPLETED")
-        self.store.cleanup_completed(1, today=DAY + timedelta(days=4))
+        self.store.cleanup_completed(1, today=self.store.load_workflow(DAY).completed_at.date() + timedelta(days=4))
         self.assertIsNone(self.store.load_workflow(DAY))
         self.publish()
         self.assertEqual(len(self.rows), 3)

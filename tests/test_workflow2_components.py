@@ -167,7 +167,7 @@ class Workflow2ComponentTests(unittest.TestCase):
             with_evaluations=False)
 
         self.assertFalse(strict.input.scope.complete)
-        self.assertTrue(any("尚未完成评价确认" in item
+        self.assertTrue(any("生成错误：无可用评价" in item
                             for item in strict.input.scope.missing_sources))
         self.assertTrue(stage.input.scope.complete)
         submitted = [record for record in stage.input.records if record.submitted]
@@ -227,7 +227,7 @@ class Workflow2ComponentTests(unittest.TestCase):
 
     def test_completed_daily_snapshot_deleted_after_retention(self):
         self.daily.set_status(DAY, "COMPLETED")
-        self.daily.cleanup_completed(2, today=date(2026, 10, 10))
+        self.daily.cleanup_completed(2, today=self.daily.load_workflow(DAY).completed_at.date() + timedelta(days=3))
         self.assertFalse((self.daily.runs_dir / f"{DAY}.json").exists())
         self.assertFalse((self.daily.checked_dir / f"{DAY}.json").exists())
         prepared = MaterialPreparer(self.daily).prepare(

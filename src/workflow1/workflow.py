@@ -189,8 +189,16 @@ class Workflow1:
     @workflow_diagnostics("workflow1")
     def start(self, target_date: date) -> WorkflowRun:
         with self._lock:
+            run = self.store.get_or_create_workflow(target_date)
+            if run.status == WorkflowStatus.COMPLETED:
+                return run
+            if self._deadline_passed(target_date) and self.store.load_snapshot(target_date):
+                self.finalize_pending_confirmations(target_date)
+                return self.store.load_workflow(target_date)
             # Statistics neither wait for nor change evaluation/report status.
-            self.refresh_submission_statistics(target_date)
+            if (not getattr(self, "statistics_scheduled", False)
+                    and self.store.load_snapshot(target_date) is None):
+                self.refresh_submission_statistics(target_date)
             run = self.store.get_or_create_workflow(target_date)
             if run.status == WorkflowStatus.COMPLETED:
                 logger.debug("workflow1_already_completed date=%s", target_date)
@@ -276,6 +284,8 @@ class Workflow1:
         # FAILED 单元只能由 resume 接口显式重置，自动路径永不重评。
         pending = [state for state in snapshot.log_evaluations.values()
                    if state.status in {UnitStatus.PENDING, UnitStatus.RUNNING}]
+        if limit := getattr(self, "batch_limit", None):
+            pending = pending[:limit]
         if not pending:
             return
         self.store.set_status(target_date, WorkflowStatus.LOGS_RUNNING)
@@ -315,7 +325,8 @@ class Workflow1:
 
         failures = []
         with ThreadPoolExecutor(max_workers=self.llm_concurrency) as pool:
-            futures = {pool.submit(process, state.log_id): state.log_id
+            from contextvars import copy_context
+            futures = {pool.submit(copy_context().run, process, state.log_id): state.log_id
                        for state in pending}
             for future in as_completed(futures):
                 log_id = futures[future]
@@ -579,7 +590,9 @@ class Workflow1:
             parsed_records[key] = evaluation
         for evaluation in parsed_records.values():
             log_id = evaluation.log_id
-            if snapshot.log_evaluations[log_id].source == "HUMAN":
+            state = snapshot.log_evaluations[log_id]
+            if (state.source == "HUMAN" and state.positive_final == evaluation.positive
+                    and state.improvement_final == evaluation.improvement):
                 continue
             progress = snapshot.evaluators[evaluation.evaluator_id]
             if progress.closed:
@@ -595,12 +608,6 @@ class Workflow1:
             self.store.update_snapshot(target_date, save)
             snapshot.log_evaluations[log_id].source = "HUMAN"
             accepted += 1
-        def close(item: DailySnapshot) -> None:
-            for progress in item.evaluators.values():
-                if all(item.log_evaluations[log_id].source == "HUMAN"
-                       for log_id in progress.log_ids):
-                    progress.closed = True
-        self.store.update_snapshot(target_date, close)
         return accepted
 
     def _deadline_passed(self, target_date: date) -> bool:
@@ -643,15 +650,30 @@ class Workflow1:
             stage = "check_snapshot"
             try:
                 snapshot = self.store.load_snapshot(target_date)
-                if snapshot is None or not snapshot.evaluations_published:
+                if snapshot is None:
                     reason = "missing_snapshot" if snapshot is None else "evaluations_not_ready"
                     run = self.store.load_workflow(target_date)
                     logger.error("workflow1_finalize_not_ready date=%s reason=%s previous_error=%s",
                                  target_date, reason, run.last_error if run else None)
                     return {"target_date": target_date.isoformat(), "human_confirmed": 0,
                             "auto_confirmed": 0, "errors": [{"error": reason}], "status": "not_ready"}
-                stage = "reconcile_human"
-                human = self._reconcile_human(target_date)
+                if self.auto_advance_at and not self._deadline_passed(target_date):
+                    return {"target_date": str(target_date), "human_confirmed": 0,
+                            "auto_confirmed": 0, "errors": [], "status": "waiting"}
+                # Snapshot is frozen by the first successful close. Late human
+                # events and late model responses cannot change the report.
+                if not all(progress.closed for progress in snapshot.evaluators.values()):
+                    human = self._reconcile_human(target_date)
+                def fill_errors(item):
+                    for state in item.log_evaluations.values():
+                        if state.status in {UnitStatus.PENDING, UnitStatus.RUNNING, UnitStatus.FAILED}:
+                            state.status = UnitStatus.WAITING_CONFIRMATION
+                            state.positive_ai = state.positive_final = "生成错误：" + (state.error or "截止前未生成评价")
+                            state.improvement_ai = state.improvement_final = "生成错误：评价缺失"
+                            state.fallback = "failed"
+                            state.retry_after = None
+                    item.evaluations_published = True
+                self.store.update_snapshot(target_date, fill_errors)
                 stage = "close_remaining"
                 auto = self._close_remaining(target_date)
                 stage = "advance_documents_reports_notifications"
@@ -698,7 +720,6 @@ class Workflow1:
                 if expected_key and parsed[0] != expected_key:
                     raise ValueError("问卷事件与评价编号不一致")
                 accepted = self._reconcile_human(one_date)
-                self.advance(one_date)
                 return {"status": "confirmed" if accepted else "duplicate",
                         "business_key": parsed[0]}
             return {"status": "pending", "record_id": record_id}
@@ -706,6 +727,9 @@ class Workflow1:
     def advance(self, target_date: date) -> None:
         snapshot = self.store.load_snapshot(target_date)
         if snapshot is None or not snapshot.evaluations_published:
+            return
+        if self.auto_advance_at and not self._deadline_passed(target_date):
+            self.store.set_status(target_date, WorkflowStatus.WAITING_EVALUATIONS)
             return
         objects = self.documents.advance(
             target_date,

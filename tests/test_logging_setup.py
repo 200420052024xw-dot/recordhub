@@ -62,7 +62,7 @@ class LoggingSetupTests(unittest.TestCase):
         self.assertIs(console[0].stream, sys.stderr)
         handler = rotating[0]
         # 3 days = today's file + 2 midnight-rotated backups.
-        self.assertEqual(handler.backupCount, 2)
+        self.assertEqual(handler.backupCount, 1)
         self.assertEqual(handler.when.upper(), "MIDNIGHT")
         self.assertEqual(handler.encoding, "utf-8")
         self.assertEqual(self.root.level, logging.INFO)
