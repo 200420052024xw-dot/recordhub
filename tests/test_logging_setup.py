@@ -29,6 +29,9 @@ class LoggingSetupTests(unittest.TestCase):
         self.root = logging.getLogger()
         self.saved_handlers = self.root.handlers[:]
         self.saved_level = self.root.level
+        # setup_logging mutates this third-party logger's level globally.
+        self.apscheduler = logging.getLogger("apscheduler")
+        self.saved_apscheduler_level = self.apscheduler.level
 
     def tearDown(self) -> None:
         # Close handlers before restoring so Windows releases the log file.
@@ -38,6 +41,7 @@ class LoggingSetupTests(unittest.TestCase):
         for handler in self.saved_handlers:
             self.root.addHandler(handler)
         self.root.setLevel(self.saved_level)
+        self.apscheduler.setLevel(self.saved_apscheduler_level)
         self._directory.cleanup()
 
     def _log_file(self) -> Path:
@@ -100,6 +104,43 @@ class LoggingSetupTests(unittest.TestCase):
         with patch.dict(os.environ, {"RECORDHUB_LOG_LEVEL": "verbose"}):
             with self.assertRaises(ValueError):
                 AppSettings.from_env()
+
+    def test_apscheduler_info_is_silenced_but_warnings_survive(self) -> None:
+        setup_logging(settings_for(str(self.log_dir)))
+        scheduler = logging.getLogger("apscheduler.scheduler")
+        scheduler.info("Adding job tentatively")
+        scheduler.warning("Job store is unreachable")
+        text = self._read_log()
+        # The per-job chatter is what flooded a 1984-restart day; real faults
+        # still have to reach the administrator.
+        self.assertNotIn("Adding job tentatively", text)
+        self.assertIn("Job store is unreachable", text)
+
+    def test_apscheduler_detail_survives_debug_level(self) -> None:
+        setup_logging(settings_for(str(self.log_dir), log_level="DEBUG"))
+        logging.getLogger("apscheduler.scheduler").info("Adding job tentatively")
+        self.assertIn("Adding job tentatively", self._read_log())
+
+    def test_stale_incomplete_thresholds_come_from_env(self) -> None:
+        with patch.dict(os.environ, {
+                "RECORDHUB_STALE_INCOMPLETE_ALERT_DAYS": "4",
+                "RECORDHUB_STALE_INCOMPLETE_PURGE_DAYS": "9"}):
+            settings = AppSettings.from_env()
+        self.assertEqual(settings.stale_incomplete_alert_days, 4)
+        self.assertEqual(settings.stale_incomplete_purge_days, 9)
+
+    def test_stale_incomplete_thresholds_default_and_must_be_positive(self) -> None:
+        self.assertEqual(AppSettings.from_env().stale_incomplete_alert_days, 3)
+        with patch.dict(os.environ, {"RECORDHUB_STALE_INCOMPLETE_PURGE_DAYS": "0"}):
+            with self.assertRaises(ValueError):
+                AppSettings.from_env()
+
+    def test_state_must_not_be_deleted_before_it_is_reported(self) -> None:
+        settings = settings_for(str(self.log_dir),
+                                stale_incomplete_alert_days=7,
+                                stale_incomplete_purge_days=7)
+        with self.assertRaises(ValueError):
+            settings.validate()
 
     def test_lark_handler_detached(self) -> None:
         import lark_oapi  # noqa: F401  (installs its own stdout handler on "Lark")

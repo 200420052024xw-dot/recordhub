@@ -54,3 +54,10 @@ def setup_logging(settings: AppSettings) -> None:
     file_handler.setLevel(level)
     logging.basicConfig(level=level, handlers=[console, file_handler], force=True)
     silence_third_party_console_handlers()
+    # APScheduler narrates every job it registers ("Adding job tentatively",
+    # "Added job", "Scheduler started"), which is ~30 INFO lines per start and
+    # drowned everything else during the 2026-10-15 restart loop. Real
+    # scheduler faults still reach the admin at WARNING and above. DEBUG keeps
+    # the detail, as RECORDHUB_LOG_LEVEL promises.
+    if level > logging.DEBUG:
+        logging.getLogger("apscheduler").setLevel(logging.WARNING)

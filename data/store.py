@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from data.errors import WorkflowStateError
 from schema import WorkflowRun
+from tool.bitable_fields import SHANGHAI
 
 T = TypeVar("T")
 
@@ -145,6 +146,26 @@ class FileStateStore:
                     runs.append(run)
             return runs
 
+    def list_stale_incomplete(self, stale_days: int, *, today: date | None = None,
+                              now: datetime | None = None) -> list[WorkflowRun]:
+        """Incomplete days that fell outside the staleness window.
+
+        ``cleanup_completed`` never touches an incomplete day, so one bad run
+        keeps its state file forever. Listing them lets the caller warn before
+        ``purge_stale_incomplete`` removes them for good.
+        """
+        cutoff = self._stale_cutoff(stale_days, today, now)
+        with self._lock:
+            if not self.runs_dir.exists():
+                return []
+            stale: list[WorkflowRun] = []
+            for path in sorted(self.runs_dir.glob("*.json")):
+                document = self._read_json(path)
+                run = WorkflowRun.model_validate(document["run"])
+                if run.status != "COMPLETED" and run.target_date < cutoff:
+                    stale.append(run)
+            return stale
+
     def set_status(
         self,
         target_date: date,
@@ -158,9 +179,14 @@ class FileStateStore:
             run.status = str(status)
             run.current_stage = str(status)
             run.updated_at = now
-            run.last_error = error
-            if error:
-                run.retry_count += 1
+            # Only overwrite when a reason is actually supplied: most callers
+            # change status alone, and must not erase the failure recorded by
+            # the one call that did have something to say. The retry budget
+            # still moves only for a real reason, never for an empty string.
+            if error is not None:
+                run.last_error = error
+                if error:
+                    run.retry_count += 1
             if status == "COMPLETED":
                 run.completed_at = now
             document["run"] = run.model_dump(mode="json")
@@ -334,6 +360,50 @@ class FileStateStore:
                         path.unlink()
                         removed += 1
         return removed
+
+    def purge_stale_incomplete(self, stale_days: int, *, today: date | None = None,
+                               now: datetime | None = None) -> list[dict[str, Any]]:
+        """Delete incomplete days past the staleness window, reporting each one.
+
+        This is the only path that removes a day cleanup_completed refuses to
+        touch, so it must not delete silently: dropping a state file also drops
+        the business-key mapping that stops a later re-run from writing
+        duplicate rows into the Feishu tables, so the counts travel with it.
+        """
+        cutoff = self._stale_cutoff(stale_days, today, now)
+        purged: list[dict[str, Any]] = []
+        with self._lock:
+            if not self.runs_dir.exists():
+                return purged
+            for path in sorted(self.runs_dir.glob("*.json")):
+                document = self._read_json(path)
+                run = WorkflowRun.model_validate(document["run"])
+                if run.status == "COMPLETED" or run.target_date >= cutoff:
+                    continue
+                purged.append({
+                    "target_date": run.target_date,
+                    "status": run.status,
+                    "last_error": run.last_error,
+                    "external_records": len(document.get("external_records") or {}),
+                    "notifications": len(document.get("notifications") or {}),
+                })
+                path.unlink()
+                archived = self.checked_dir / path.name
+                if archived.exists():
+                    archived.unlink()
+        return purged
+
+    @staticmethod
+    def _stale_cutoff(stale_days: int, today: date | None, now: datetime | None) -> date:
+        """Business-date cutoff for days that never completed.
+
+        Age is measured on ``target_date``, never on ``updated_at``: a stuck day
+        that any code path touches again gets a fresh ``updated_at`` and would
+        never age out. The current day is taken in Shanghai time, because the
+        cleanup job runs at 03:30 local — well past midnight UTC.
+        """
+        current = today or (now or utc_now()).astimezone(SHANGHAI).date()
+        return current - timedelta(days=stale_days)
 
     def _mutate_document(
         self, target_date: date, mutator: Callable[[dict[str, Any]], T]

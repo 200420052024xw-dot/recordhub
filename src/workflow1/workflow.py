@@ -155,7 +155,7 @@ class Workflow1:
         with self._lock:
             if self.statistics is None:
                 return {"target_date": str(target_date), "status": "disabled",
-                        "expected": 0, "written": 0, "issues": {}}
+                        "expected": 0, "written": 0, "issues": {}, "notices": {}}
             try:
                 snapshot = self.store.load_check_snapshot(target_date)
                 organization = snapshot.organization if snapshot else self.organization_cache.get()
@@ -170,21 +170,31 @@ class Workflow1:
                         reflection=item.reflection, other=item.other)
                         for item in self.workbuddy.inbox.pending(target_date).values()]
                 result = self.statistics.publish(target_date, organization, logs)
-                # Superseded submissions are expected under the last-one-wins rule.
+                # Two read-side outcomes are expected rather than faulty:
+                # superseded submissions lose to the last-one-wins rule, and
+                # out-of-window ones are refused by design. Neither may turn a
+                # complete write into a partial one or wake the administrator,
+                # so they are reported as notices at INFO instead.
                 result["issues"].update({key: reason for key, reason in read_issues.items()
-                                         if not key.endswith(":superseded")})
+                                         if not key.endswith((":superseded", ":outside-window"))})
+                result["notices"] = {key: reason for key, reason in read_issues.items()
+                                     if key.endswith(":outside-window")}
                 if result["issues"]:
                     result["status"] = "partial"
                 for key, reason in result["issues"].items():
                     logger.error("submission_statistics_issue date=%s key=%s reason=%s",
                                  target_date, key, reason)
+                for key, reason in result["notices"].items():
+                    logger.info("submission_statistics_notice date=%s key=%s reason=%s",
+                                target_date, key, reason)
                 logger.info("submission_statistics_finished date=%s expected=%s written=%s status=%s",
                             target_date, result["expected"], result["written"], result["status"])
                 return result
             except Exception as exc:
                 logger.exception("submission_statistics_failed date=%s", target_date)
                 return {"target_date": str(target_date), "status": "failed",
-                        "expected": 0, "written": 0, "issues": {"statistics:failed": error_summary(exc)}}
+                        "expected": 0, "written": 0, "notices": {},
+                        "issues": {"statistics:failed": error_summary(exc)}}
 
     @workflow_diagnostics("workflow1")
     def start(self, target_date: date) -> WorkflowRun:

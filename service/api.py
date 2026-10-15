@@ -463,6 +463,26 @@ def _build_scheduler(
             removed += runtime.workflow2.store.cleanup_completed(settings.snapshot_retention_days)
         removed += orchestration.tasks.journal.cleanup(2)
         logger.info("state_cleanup_removed removed=%d", removed)
+        # cleanup_completed never touches an unfinished day, so without this a
+        # day that failed once keeps its state file forever and nobody is told.
+        # Purge the oldest first: whatever survives is exactly what still
+        # deserves a warning, and each stale day yields one message either way.
+        for binding in runtime.workflows.values():
+            for purged in binding.store.purge_stale_incomplete(
+                    settings.stale_incomplete_purge_days):
+                linked = purged["external_records"] or purged["notifications"]
+                logger.log(
+                    logging.ERROR if linked else logging.INFO,
+                    "stale_incomplete_purged workflow=%s date=%s status=%s "
+                    "external_records=%d notifications=%d last_error=%s",
+                    binding.name, purged["target_date"], purged["status"],
+                    purged["external_records"], purged["notifications"],
+                    purged["last_error"] or "-")
+            for run in binding.store.list_stale_incomplete(
+                    settings.stale_incomplete_alert_days):
+                logger.error(
+                    "stale_incomplete_workflow workflow=%s date=%s status=%s last_error=%s",
+                    binding.name, run.target_date, run.status, run.last_error or "-")
 
     scheduler.add_job(cleanup, "cron", hour=3, minute=30, id="snapshot_cleanup",
                       replace_existing=True, max_instances=1, coalesce=True)

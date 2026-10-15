@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -64,6 +65,39 @@ class IndependentStatisticsTests(unittest.TestCase):
         run = self.workflow.start(DAY)
         self.assertEqual(run.status, WorkflowStatus.FAILED)
         self.statistics.publish.assert_called_once()
+
+    def test_outside_window_submission_is_a_notice_not_an_issue(self):
+        self.logs.get_logs_by_date.return_value = (
+            self.snapshot.logs,
+            {"log:L9:outside-window": "日志提交时间不在开放窗口内，本条未纳入处理"})
+        result = self.workflow.refresh_submission_statistics(DAY)
+        # Refused by design, so it must not turn a complete write into a
+        # partial one.
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["written"], 3)
+        self.assertEqual(result["issues"], {})
+        self.assertIn("log:L9:outside-window", result["notices"])
+
+    def test_outside_window_is_logged_as_info_so_it_never_alerts(self):
+        self.logs.get_logs_by_date.return_value = (
+            self.snapshot.logs,
+            {"log:L9:outside-window": "日志提交时间不在开放窗口内，本条未纳入处理"})
+        with self.assertLogs("workflow1.workflow", level="INFO") as captured:
+            self.workflow.refresh_submission_statistics(DAY)
+        # ERROR records are what the administrator gets paged for.
+        self.assertEqual(
+            [record for record in captured.records if record.levelno >= logging.ERROR], [])
+        self.assertTrue(any("submission_statistics_notice" in record.getMessage()
+                            for record in captured.records))
+
+    def test_other_read_issues_still_make_the_run_partial(self):
+        self.logs.get_logs_by_date.return_value = (
+            self.snapshot.logs, {"log:L9:unknown-submitter": "无法唯一匹配有效人员"})
+        result = self.workflow.refresh_submission_statistics(DAY)
+        # Guessed or skipped rows are real problems and keep alerting.
+        self.assertEqual(result["status"], "partial")
+        self.assertIn("log:L9:unknown-submitter", result["issues"])
+        self.assertEqual(result["notices"], {})
 
     def test_source_read_failure_is_not_treated_as_everyone_missing(self):
         self.logs.get_logs_by_date.side_effect = RuntimeError("日志表读取失败")

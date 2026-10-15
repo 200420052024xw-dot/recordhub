@@ -96,6 +96,35 @@ class WorkflowStateTests(unittest.TestCase):
             )
             self.assertTrue(store.load_snapshot(self.target_date).evaluators["C1"].closed)
 
+    def test_status_change_without_reason_keeps_last_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = FileStateStore(directory)
+            store.get_or_create_workflow(self.target_date)
+            store.set_status(self.target_date, "FAILED", error="FeishuApiError: timeout")
+            # Most callers only move the status along; none of them may erase
+            # the one failure reason that was actually recorded.
+            run = store.set_status(self.target_date, "WAITING_EVALUATIONS")
+            self.assertEqual(run.status, "WAITING_EVALUATIONS")
+            self.assertEqual(run.last_error, "FeishuApiError: timeout")
+            self.assertEqual(run.retry_count, 1)
+
+    def test_reason_updates_error_and_spends_retry_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = FileStateStore(directory)
+            store.get_or_create_workflow(self.target_date)
+            store.set_status(self.target_date, "FAILED", error="first")
+            run = store.set_status(self.target_date, "FAILED", error="second")
+            self.assertEqual(run.last_error, "second")
+            self.assertEqual(run.retry_count, 2)
+
+    def test_status_change_alone_does_not_spend_retry_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = FileStateStore(directory)
+            fresh = store.get_or_create_workflow(self.target_date)
+            run = store.set_status(self.target_date, "LOGS_RUNNING")
+            self.assertIsNone(run.last_error)
+            self.assertEqual(run.retry_count, fresh.retry_count)
+
     def test_multiple_days_use_independent_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = FileStateStore(directory)

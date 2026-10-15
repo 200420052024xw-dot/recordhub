@@ -59,6 +59,10 @@ class AppSettings:
     llm_retry_limit: int = 3
     # 已完成快照保留天数；周期分析可以从飞书重建材料。
     snapshot_retention_days: int = 2
+    # 未完成的日期：超过多少天发管理员告警、超过多少天连状态文件一起清理。
+    # 已完成的状态按 snapshot_retention_days 回收，未完成的只能靠这两档兜底。
+    stale_incomplete_alert_days: int = 3
+    stale_incomplete_purge_days: int = 7
     scheduler_enabled: bool = True
     workflow2_enabled: bool = False
     event_stream_enabled: bool = True
@@ -113,6 +117,12 @@ class AppSettings:
             snapshot_retention_days=_positive_int(
                 "RECORDHUB_SNAPSHOT_RETENTION_DAYS", 2
             ),
+            stale_incomplete_alert_days=_positive_int(
+                "RECORDHUB_STALE_INCOMPLETE_ALERT_DAYS", 3
+            ),
+            stale_incomplete_purge_days=_positive_int(
+                "RECORDHUB_STALE_INCOMPLETE_PURGE_DAYS", 7
+            ),
             scheduler_enabled=_boolean("RECORDHUB_SCHEDULER_ENABLED", True),
             workflow2_enabled=_boolean("RECORDHUB_WORKFLOW2_ENABLED", False),
             event_stream_enabled=_boolean("RECORDHUB_EVENT_STREAM_ENABLED", True),
@@ -141,6 +151,11 @@ class AppSettings:
     def validate(self) -> None:
         if self.simulation_mode and not self.message_override_open_id.strip():
             raise ValueError("RECORDHUB_SIMULATION_MODE requires RECORDHUB_MESSAGE_OVERRIDE_OPEN_ID")
+        if self.stale_incomplete_purge_days <= self.stale_incomplete_alert_days:
+            raise ValueError(
+                "RECORDHUB_STALE_INCOMPLETE_PURGE_DAYS 必须大于 "
+                "RECORDHUB_STALE_INCOMPLETE_ALERT_DAYS，否则状态文件会在"
+                "管理员收到告警之前就被删除")
         missing = self.missing_variables()
         if missing:
             raise ValueError(f"Missing environment variables: {', '.join(missing)}")

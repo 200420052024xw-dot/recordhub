@@ -147,6 +147,83 @@ class ServiceRegistryTests(unittest.TestCase):
         workflow.retry_failed_evaluations.assert_not_called()
         daily.store.list_incomplete_workflows.assert_not_called()
 
+    def test_cleanup_job_purges_then_warns_about_stale_incomplete_days(self) -> None:
+        """未完成的日期永远不会被保留策略回收，只能靠这条巡检兜底。"""
+        from workflow1.workflow import Workflow1
+
+        workflow = Workflow1.__new__(Workflow1)
+        workflow.retry_failed_evaluations = Mock()
+        workflow.refresh_submission_statistics = Mock()
+        store = Mock()
+        store.cleanup_completed.return_value = 0
+        store.purge_stale_incomplete.return_value = []
+        store.list_stale_incomplete.return_value = []
+        daily = WorkflowBinding(
+            name="workflow1_daily", workflow=workflow, store=store,
+            auto_advance_at="", confirmation_webhook_token="token",
+            record_handlers={},
+        )
+        runtime = Runtime(settings=self.settings, infrastructure=Mock(),
+                          organization_cache=Mock(),
+                          workflows={daily.name: daily})
+        schedules = ScheduleConfig(
+            timezone="Asia/Shanghai",
+            workflows={daily.name: WorkflowSchedule(daily.name, True, "daily", "01:00")},
+        )
+        scheduler = _build_scheduler(schedules, runtime, self.settings)
+        self.addCleanup(runtime.orchestrator.tasks.close)
+
+        {job.id: job for job in scheduler.get_jobs()}["snapshot_cleanup"].func()
+
+        store.purge_stale_incomplete.assert_called_once_with(
+            self.settings.stale_incomplete_purge_days)
+        store.list_stale_incomplete.assert_called_once_with(
+            self.settings.stale_incomplete_alert_days)
+
+    def test_cleanup_job_alerts_loudly_only_when_it_severs_feishu_links(self) -> None:
+        from workflow1.workflow import Workflow1
+
+        workflow = Workflow1.__new__(Workflow1)
+        workflow.retry_failed_evaluations = Mock()
+        workflow.refresh_submission_statistics = Mock()
+        store = Mock()
+        store.cleanup_completed.return_value = 0
+        store.list_stale_incomplete.return_value = []
+        store.purge_stale_incomplete.return_value = [
+            {"target_date": date(2026, 10, 6), "status": "FAILED", "last_error": None,
+             "external_records": 0, "notifications": 0},
+            {"target_date": date(2026, 10, 7), "status": "FAILED", "last_error": "boom",
+             "external_records": 4, "notifications": 2},
+        ]
+        daily = WorkflowBinding(
+            name="workflow1_daily", workflow=workflow, store=store,
+            auto_advance_at="", confirmation_webhook_token="token",
+            record_handlers={},
+        )
+        runtime = Runtime(settings=self.settings, infrastructure=Mock(),
+                          organization_cache=Mock(),
+                          workflows={daily.name: daily})
+        schedules = ScheduleConfig(
+            timezone="Asia/Shanghai",
+            workflows={daily.name: WorkflowSchedule(daily.name, True, "daily", "01:00")},
+        )
+        scheduler = _build_scheduler(schedules, runtime, self.settings)
+        self.addCleanup(runtime.orchestrator.tasks.close)
+
+        with self.assertLogs("service.api", level="INFO") as captured:
+            {job.id: job for job in scheduler.get_jobs()}["snapshot_cleanup"].func()
+
+        purged = [(record.levelno, record.getMessage()) for record in captured.records
+                  if "stale_incomplete_purged" in record.getMessage()]
+        self.assertEqual(len(purged), 2)
+        unlinked, linked = purged
+        # Deleting an unlinked day is housekeeping; deleting one that still maps
+        # to Feishu rows is what can produce duplicates on a later re-run.
+        self.assertEqual(unlinked[0], logging.INFO)
+        self.assertIn("date=2026-10-06", unlinked[1])
+        self.assertEqual(linked[0], logging.ERROR)
+        self.assertIn("external_records=4 notifications=2", linked[1])
+
     def test_configured_notification_jobs_are_registered(self) -> None:
         settings = replace(self.settings, workflow2_enabled=True)
         runtime = Runtime(
