@@ -47,6 +47,8 @@ Copy-Item config/tables.example.toml config/tables.toml
 .\.venv\Scripts\python.exe main.py serve --host 0.0.0.0 --port 8000
 ```
 
+生产服务器由 systemd 托管，**只能有一个进程**：重启一律用 `systemctl restart recordhub.service`，不要手工运行 `main.py serve`。unit、退避配置、端口预检和部署步骤见 [服务器部署](docs/部署.md)。
+
 运行日志同时输出到终端（stderr，不污染 CLI 的 JSON stdout）和 `logs/recordhub.log`，每天 0 点轮转，按 `RECORDHUB_LOG_RETENTION_DAYS` 保留天数（默认 3 天，含当天），级别可用 `RECORDHUB_LOG_LEVEL` 调整；HTTP 访问日志一并写入文件。
 
 错误日志包含调用堆栈、处理阶段、业务日期与接口错误详情，并通过 `RECORDHUB_ADMIN_OPEN_ID` 即时通知管理员。历史漏发和发送失败的业务消息不再自动补发；管理员可通过 `POST /admin/notifications/send` 选择日期发送未成功的消息。规则、参数和调用示例见 [消息发送与错误告警](docs/消息发送与错误告警.md)。

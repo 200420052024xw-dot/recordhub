@@ -15,6 +15,7 @@ EVENT_EXPLANATIONS = {
     "admin_alert_delivery_failed": "管理员错误告警发送失败，请检查飞书连接、应用权限和管理员 OpenID。",
     "admin_alert_queued": "错误告警已进入发送队列。",
     "admin_alert_sent": "错误告警已成功发送给管理员。",
+    "admin_alert_suppressed": "同类错误在抑制窗口内已告警过，本次不再重复发送，避免把真正的新问题淹没。",
     "admin_alerts_disabled": "管理员错误告警未启用，因为没有配置管理员 OpenID。",
     "admin_alerts_enabled": "管理员错误告警已经启用。",
     "admin_notification_send_failed": "管理员按日期发送消息时发生错误。",

@@ -1,5 +1,6 @@
 """Delivery regressions: historical suppression, manual API, and real error routing."""
 
+import json
 import logging
 import sys
 import tempfile
@@ -14,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from fastapi.testclient import TestClient
 from config import AppSettings, DeepSeekSettings, FeishuSettings
 from data import FileStateStore, utc_now
-from service.alerts import AdminAlertHandler, install_admin_alerts
+from service.alerts import AdminAlertHandler, configure_admin_alerts, install_admin_alerts
 from service.api import create_app
 from service.runtime import Runtime, WorkflowBinding
 from tool.bitable_fields import SHANGHAI
@@ -219,6 +220,87 @@ class AlertTests(unittest.TestCase):
         logging.getLogger("test.error").error("workflow_failed")
         handler.queue.join()
         messages.send_text.assert_called_once()
+
+
+class CrossProcessAlertSuppressionTests(unittest.TestCase):
+    """The in-memory dedupe dies with the process, so a restart loop paged the
+    administrator once per restart — 1988 times on 2026-10-15."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.suppress_path = Path(folder.name) / "admin_alerts.json"
+        self.messages = Mock()
+        self.messages.send_text.return_value = {"message_id": "alert"}
+
+    def handler(self, **kwargs):
+        """A fresh handler stands in for a fresh process."""
+        handler = AdminAlertHandler(self.messages, "ou_admin",
+                                    suppress_path=self.suppress_path, **kwargs)
+        self.addCleanup(handler.close)
+        return handler
+
+    def fire(self, handler, message="bind failed"):
+        handler.emit(logging.LogRecord("uvicorn.error", logging.ERROR, "", 1,
+                                       message, (), None))
+        handler.queue.join()
+
+    def test_a_restart_does_not_repeat_the_same_alert(self):
+        self.fire(self.handler())
+        self.fire(self.handler())
+        self.assertEqual(self.messages.send_text.call_count, 1)
+
+    def test_a_different_error_still_gets_through(self):
+        self.fire(self.handler(), "bind failed")
+        self.fire(self.handler(), "job store unreachable")
+        self.assertEqual(self.messages.send_text.call_count, 2)
+
+    def test_expired_memory_lets_the_alert_through_again(self):
+        self.fire(self.handler())
+        self.suppress_path.write_text(
+            json.dumps({"uvicorn.error|40|bind failed": "2020-01-01T00:00:00+00:00"}),
+            encoding="utf-8")
+        self.fire(self.handler())
+        self.assertEqual(self.messages.send_text.call_count, 2)
+
+    def test_damaged_memory_never_blocks_alerts(self):
+        self.suppress_path.write_text("{ not json", encoding="utf-8")
+        self.fire(self.handler())
+        self.assertEqual(self.messages.send_text.call_count, 1)
+
+    def test_suppression_is_reported_once_per_process(self):
+        with self.assertLogs("service.alerts", level="WARNING") as captured:
+            self.fire(self.handler())
+            self.fire(self.handler())
+            self.fire(self.handler())
+        reported = [r for r in captured.records
+                    if "admin_alert_suppressed" in r.getMessage()]
+        # One for each restarted process, so the silence is explainable.
+        self.assertEqual(len(reported), 2)
+        self.assertEqual(self.messages.send_text.call_count, 1)
+
+    def test_without_a_path_it_behaves_like_before(self):
+        handler = AdminAlertHandler(self.messages, "ou_admin")
+        self.addCleanup(handler.close)
+        self.fire(handler)
+        self.fire(handler)
+        self.assertEqual(self.messages.send_text.call_count, 1)
+
+    def test_configured_handler_remembers_across_restarts(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        settings = AppSettings(
+            state_dir=folder.name,
+            feishu=FeishuSettings("app", "secret", "base"),
+            deepseek=DeepSeekSettings("key"),
+            admin_open_id="ou_admin")
+        root = logging.getLogger()
+        self.addCleanup(root.setLevel, root.level)
+        handler = configure_admin_alerts(settings)
+        self.addCleanup(root.removeHandler, handler)
+        self.addCleanup(handler.close)
+        self.assertEqual(handler._suppress_path,
+                         Path(folder.name) / "admin_alerts.json")
 
 
 class DiagnosticTests(unittest.TestCase):
