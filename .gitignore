@@ -28,3 +28,7 @@ logs/
 # 交付给 WorkBuddy 的入口文档:含接口 token,不进版本库。
 docs/skill-template/
 docs/skill-query/SKILL.md
+
+# Deployment branch: local reference documents are not server inputs.
+/docs/
+/prompts/README.md
