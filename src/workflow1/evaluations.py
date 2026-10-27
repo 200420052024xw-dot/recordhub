@@ -16,6 +16,7 @@ from tool.bitable_fields import (
 from schema import FinalEvaluation, TableConfig
 from workflow1.models import DailySnapshot, UnitStatus
 from tool.feishu import BitableService
+from tool.diagnostics import stage_diagnostics
 
 
 def evaluation_key(target_date: date, evaluator_id: str, log_id: str) -> str:
@@ -61,6 +62,7 @@ class AiEvaluationRepository:
             self.bitable.batch_update(self.table.table_id, updates[offset:offset + 500])
         return len(updates)
 
+    @stage_diagnostics("publish_evaluations")
     def publish(
         self, snapshot: DailySnapshot
     ) -> tuple[dict[str, tuple[str, str]], dict[str, str]]:

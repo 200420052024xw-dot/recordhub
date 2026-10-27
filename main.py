@@ -75,21 +75,22 @@ def check_config(settings: AppSettings) -> int:
         not settings.workflow2_enabled or not workflow2_missing) else 1
 
 
-def main() -> int:
+def _main() -> int:
     load_env_file()
     settings = AppSettings.from_env()
     # Covers serve and every CLI branch; console goes to stderr so the JSON
     # printed by check-config and friends stays pipeable.
-    setup_logging(settings)
-    from service.alerts import configure_admin_alerts
-    configure_admin_alerts(settings)
     parser = argparse.ArgumentParser(description="RecordHub Workflow1 and Workflow2 service")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("check-config")
+    diagnostics_parser = subparsers.add_parser("diagnostics", help="导出三天保留期内的诊断资料")
+    selectors = diagnostics_parser.add_mutually_exclusive_group(required=True)
+    selectors.add_argument("--event-id")
+    selectors.add_argument("--execution-id")
 
     serve_parser = subparsers.add_parser("serve")
     serve_parser.add_argument("--host", default="0.0.0.0")
-    serve_parser.add_argument("--port", type=int, default=8000)
+    serve_parser.add_argument("--port", type=int, default=8100)
 
     run_parser = subparsers.add_parser("run-workflow")
     run_parser.add_argument("--date", required=True, type=date.fromisoformat)
@@ -113,6 +114,14 @@ def main() -> int:
     workflow2_resume.add_argument("--run-id", required=True)
     args = parser.parse_args()
     command = args.command or "check-config"
+    if command == "diagnostics":
+        from config.logs import query_diagnostics
+        result = query_diagnostics(settings, event_id=args.event_id, execution_id=args.execution_id)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["status"] == "found" else 1
+    setup_logging(settings)
+    from service.alerts import configure_admin_alerts
+    configure_admin_alerts(settings)
     if command == "check-config":
         return check_config(settings)
     if command == "serve":
@@ -185,9 +194,18 @@ def main() -> int:
     return 0
 
 
+def main() -> int:
+    from tool.diagnostics import execution_context
+    from service.alerts import close_admin_alerts
+    with execution_context(operation="cli"):
+        try:
+            return _main()
+        except Exception:
+            logger.exception("command_failed")
+            raise
+        finally:
+            close_admin_alerts()
+
+
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception:
-        logger.exception("command_failed")
-        raise
+    raise SystemExit(main())

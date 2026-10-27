@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
 from inspect import signature
+from time import monotonic
+from uuid import uuid4
 
 _context = ContextVar("diagnostic_context", default={})
 
@@ -137,17 +139,78 @@ def diagnostic_context(**values):
         _context.reset(token)
 
 
+@contextmanager
+def execution_context(**values):
+    """Create an execution only at an entry boundary; preserve nested calls."""
+    with diagnostic_context(execution_id=_context.get().get("execution_id") or uuid4().hex, **values):
+        yield
+
+
+def stage_diagnostics(stage):
+    """Summarize operations which propagate failures to their business caller."""
+    def decorate(function):
+        @wraps(function)
+        def call(*args, **kwargs):
+            with execution_context(stage=stage):
+                started = monotonic()
+                try:
+                    result = function(*args, **kwargs)
+                except BaseException as exc:
+                    if isinstance(exc, Exception) and not hasattr(exc, "_recordhub_stage"):
+                        exc._recordhub_stage = stage
+                    if isinstance(exc, Exception):
+                        previous = getattr(exc, "_recordhub_context", {})
+                        if previous.get("execution_id") != _context.get().get("execution_id"):
+                            exc._recordhub_context = dict(_context.get())
+                    logging.getLogger(function.__module__).info("stage_finished", extra={
+                        "fields": {"status": "failed", "elapsed_ms": round((monotonic() - started) * 1000)}})
+                    raise
+                failed = len(result[1]) if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict) else 0
+                if stage == "report_index" and isinstance(result, dict):
+                    failed = len(result)
+                succeeded = len(result[0]) if isinstance(result, tuple) and result and hasattr(result[0], "__len__") else None
+                logging.getLogger(function.__module__).info("stage_finished", extra={
+                    "fields": {"status": "partial" if failed else "success", "successful_count": succeeded,
+                               "failed_count": failed, "elapsed_ms": round((monotonic() - started) * 1000)},
+                    "alert": "recovery" if not failed else False})
+                return result
+        return call
+    return decorate
+
+
 def workflow_diagnostics(workflow: str):
     def decorate(function):
-        target_name = list(signature(function).parameters)[1]
+        call_signature = signature(function)
+        target_name = list(call_signature.parameters)[1]
         @wraps(function)
         def call(self, *args, **kwargs):
             target = args[0] if args else kwargs[target_name]
-            with diagnostic_context(workflow=workflow,
+            bound = call_signature.bind(self, *args, **kwargs)
+            notification = {"notification_key": bound.arguments["key"]} if "key" in bound.arguments else {}
+            with execution_context(workflow=workflow,
                                     target_date=str(getattr(target, "scheduled_date", target)),
-                                    run_id=getattr(target, "run_id", "-"),
-                                    operation=function.__name__):
-                return function(self, *args, **kwargs)
+                                    run_id=getattr(target, "run_id", str(target)),
+                                    operation=function.__name__, **notification):
+                started = monotonic()
+                try:
+                    result = function(self, *args, **kwargs)
+                except BaseException as exc:
+                    if isinstance(exc, Exception):
+                        previous = getattr(exc, "_recordhub_context", {})
+                        if previous.get("execution_id") != _context.get().get("execution_id"):
+                            exc._recordhub_context = dict(_context.get())
+                    logging.getLogger(function.__module__).info("execution_finished", extra={
+                        "fields": {"status": "failed", "elapsed_ms": round((monotonic() - started) * 1000)}})
+                    raise
+                status = result.get("status", "unknown") if isinstance(result, dict) else getattr(result, "status", "unknown")
+                status = str(getattr(status, "value", status)).lower()
+                fields = {"status": status, "elapsed_ms": round((monotonic() - started) * 1000)}
+                if isinstance(result, dict):
+                    fields.update({k: v for k, v in result.items() if k in {"expected", "written", "human_confirmed", "auto_confirmed"}})
+                    fields["failed_count"] = len(result.get("issues", {}))
+                logging.getLogger(function.__module__).info("execution_finished", extra={"fields": fields,
+                    "alert": "recovery" if status in {"completed", "complete", "success"} else False})
+                return result
         return call
     return decorate
 
@@ -156,19 +219,24 @@ def redact(value: str) -> str:
     value = re.sub(r"(?i)(Bearer\s+)[^\s\"']+", r"\1[REDACTED]", value)
     return re.sub(
         r"(?i)((?:access_key|ticket|app_secret|api_key|tenant_access_token|"
-        r"access_token|authorization)[\"']?\s*[:=]\s*[\"']?)[^\s&\"',}]+",
+        r"access_token|authorization|password|admin_token|workbuddy_token|query_token|review_token)[\"']?\s*[:=]\s*[\"']?)[^\s&\"',}]+",
         r"\1[REDACTED]", value)
 
 
 def error_summary(exc: BaseException) -> str:
-    parts = [f"{type(exc).__name__}: {str(exc) or '(no message)'}"]
+    message = str(exc) or "(no message)"
+    if hasattr(exc, "errors"):
+        message = json.dumps(exc.errors(include_input=False, include_context=False), ensure_ascii=False, default=str)
+    parts = [f"{type(exc).__name__}: {message}"]
     for name in ("provider", "status_code", "code", "method", "path", "request_id"):
         value = getattr(exc, name, None)
         if value is not None:
             parts.append(f"{name}={value}")
     details = getattr(exc, "details", None)
-    if details is not None:
-        parts.append("response=" + json.dumps(details, ensure_ascii=False, default=str))
+    if isinstance(details, dict):
+        # Provider responses can echo submitted student content. Keep technical fields only.
+        detail = {key: details[key] for key in ("code", "msg", "message", "request_id") if key in details}
+        parts.append("response=" + json.dumps(detail, ensure_ascii=False, default=str))
     return redact(" ".join(parts))
 
 
@@ -193,9 +261,10 @@ class DiagnosticFormatter(logging.Formatter):
         explanation = self._explanation(record)
         if explanation:
             output += "\n中文说明=" + explanation
-        if _context.get():
+        context = getattr(record, "diagnostic_snapshot", _context.get())
+        if context:
             translated = {CONTEXT_LABELS.get(key, key): value
-                          for key, value in _context.get().items()}
+                          for key, value in context.items()}
             output += "\n业务上下文=" + json.dumps(translated, ensure_ascii=False, default=str)
         if record.exc_info and record.exc_info[1]:
             exc = record.exc_info[1]

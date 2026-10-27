@@ -21,7 +21,7 @@ from tool.bitable_fields import field_datetime, record_fields, references, scala
 from tool.cloud_docs import (CloudDocsService, divider_block, label_value_block,
                              markdown_blocks, paragraph_block, text_block)
 from tool.feishu import MessageService
-from tool.diagnostics import error_summary, workflow_diagnostics, diagnostic_context
+from tool.diagnostics import error_summary, workflow_diagnostics, diagnostic_context, stage_diagnostics
 from tool.notifications import NotificationPolicy, manual_notifications, record_outcome
 from workflow1.documents import DailyDocuments
 from workflow2.models import (CycleRun, DepartmentAnalysis, DepartmentResult,
@@ -741,6 +741,7 @@ class Workflow2:
                 semantic_validator=validate, array_root=True)
             run.team_results[code] = {"content": output.model_dump(mode="json")}
             self.store.save(run)
+    @stage_diagnostics("generate_documents")
     def _documents(self, run: CycleRun, organization: Organization) -> None:
         leader = organization.person_map().get(organization.team_leader_id or "")
         if leader is None or not leader.open_id:

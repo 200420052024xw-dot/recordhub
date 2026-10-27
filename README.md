@@ -6,6 +6,8 @@
 
 RecordHub 的 Workflow1 每天读取前一自然日的飞书工作日志，逐条调用一次 DeepSeek Prompt，收集人工评价后生成三级飞书云文档。消息发送与错误告警见 [调用说明](docs/消息发送与错误告警.md)。
 
+WorkBuddy 提交日志前可自动展示本人前天日志的最终评价，沿用日志提交 Token；接口契约与入口接入见 [提交前历史评价](docs/提交前历史评价.md)。
+
 ## 代码位置
 
 - `tool/`：飞书鉴权、多维表格、消息、Drive 和云文档接口，以及 HTTP 传输与表字段解析。
@@ -44,16 +46,16 @@ Copy-Item config/tables.example.toml config/tables.toml
 .\.venv\Scripts\python.exe -m pip install --no-build-isolation -e .
 .\.venv\Scripts\python.exe main.py check-config
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\.venv\Scripts\python.exe main.py serve --host 0.0.0.0 --port 8000
+.\.venv\Scripts\python.exe main.py serve --host 127.0.0.1 --port 8100
 ```
 
-生产服务器由 systemd 托管，**只能有一个进程**：重启一律用 `systemctl restart recordhub.service`，不要手工运行 `main.py serve`。unit、退避配置、端口预检和部署步骤见 [服务器部署](docs/部署.md)。
+新服务器通过宝塔管理站点与 HTTPS，应用监听 `127.0.0.1:8100`，由 systemd 托管，**只能有一个进程**：重启一律用 `systemctl restart recordhub.service`。配置模板、迁移与回滚步骤见 [服务器部署](docs/部署.md)，本地验证结果见 [部署前检查记录](docs/部署前检查记录.md)。
 
-运行日志同时输出到终端（stderr，不污染 CLI 的 JSON stdout）和 `logs/recordhub.log`，每天 0 点轮转，按 `RECORDHUB_LOG_RETENTION_DAYS` 保留天数（默认 3 天，含当天），级别可用 `RECORDHUB_LOG_LEVEL` 调整；HTTP 访问日志一并写入文件。
+运行日志同时输出到终端（stderr，不污染 CLI 的 JSON stdout）和 `logs/recordhub.*.jsonl`。每次执行都有执行编号，日志按天或 20 MiB 轮转；日志、异常堆栈及事故资料默认保留 3 天，启动及每小时清理超过 72 小时的记录。使用 `recordhub diagnostics --event-id ...` 或 `--execution-id ...` 导出关联证据。配置与宝塔部署说明见 [日志与 AI 告警](docs/日志与AI告警.md)。
 
-错误日志包含调用堆栈、处理阶段、业务日期与接口错误详情，并通过 `RECORDHUB_ADMIN_OPEN_ID` 即时通知管理员。历史漏发和发送失败的业务消息不再自动补发；管理员可通过 `POST /admin/notifications/send` 选择日期发送未成功的消息。规则、参数和调用示例见 [消息发送与错误告警](docs/消息发送与错误告警.md)。
+最终业务故障通过 `RECORDHUB_ADMIN_OPEN_ID` 通知管理员。普通故障沿用现有 DeepSeek 分析一次，分析失败或超时直接发送脱敏报错原文；紧急故障先发送原文，分析成功后补充。同类故障首次通知，持续发生时每 6 小时最多汇总一次，对应业务明确成功后通知恢复。业务消息的人工发送入口仍为 `POST /admin/notifications/send`。
 
-每日运行状态在 `data/state/workflow1/YYYY-MM-DD.json`。只运行一个服务进程（日志文件轮转不支持多进程共写）。已完成状态按 `RECORDHUB_SNAPSHOT_RETENTION_DAYS` 保留；未完成的日期超过 `RECORDHUB_STALE_INCOMPLETE_ALERT_DAYS`（默认 3 天）发管理员告警，超过 `RECORDHUB_STALE_INCOMPLETE_PURGE_DAYS`（默认 7 天）连状态文件一起删除，删除时若该日期仍持有飞书记录映射会额外告警（映射丢失后再跑该日期会产生重复行）。两档都必须为正整数，且清理天数必须大于告警天数。每天 3:30 执行。服务启动时不执行工作流，只重读人员表/部门表（失败时使用持久化的组织缓存）；每日任务随后按日程运行，未完成的人工评价在配置的截止时间采用现有 AI 结果并在文档标注"人工未评价"。飞书长连接用于及时核对问卷结果。飞书消息采用稳定 UUID 去重；发送结果不明且超过飞书去重窗口时会停下并要求人工核对。
+每日运行状态在 `data/state/workflow1/YYYY-MM-DD.json`。只运行一个业务服务进程，避免重复调度；手动 CLI 使用独立日志文件。已完成状态按 `RECORDHUB_SNAPSHOT_RETENTION_DAYS` 保留；未完成的日期超过 `RECORDHUB_STALE_INCOMPLETE_ALERT_DAYS`（默认 3 天）发管理员告警，超过 `RECORDHUB_STALE_INCOMPLETE_PURGE_DAYS`（默认 7 天）连状态文件一起删除，删除时若该日期仍持有飞书记录映射会额外告警（映射丢失后再跑该日期会产生重复行）。两档都必须为正整数，且清理天数必须大于告警天数。每天 3:30 执行。服务启动时不执行工作流，只重读人员表/部门表（失败时使用持久化的组织缓存）；每日任务随后按日程运行，未完成的人工评价在配置的截止时间采用现有 AI 结果并在文档标注"人工未评价"。飞书长连接用于及时核对问卷结果。飞书消息采用稳定 UUID 去重；发送结果不明且超过飞书去重窗口时会停下并要求人工核对。
 
 当前版本的云文档接口和真实飞书表字段仍需在目标租户中联调。配置检查只验证本地映射，无法替代飞书 API 权限与字段类型检查。
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock
@@ -396,6 +397,101 @@ class StageTests(unittest.TestCase):
         self.assertEqual(result["items"], [])
 
 
+class PreviousEvaluationTests(unittest.TestCase):
+    def test_final_evaluation_is_only_for_the_submitter(self) -> None:
+        day = TODAY - timedelta(days=2)
+        organization = make_organization()
+        logs = [make_log("own", "S1"), make_log("other", "S2")]
+        for source, label in (("HUMAN", "人工"), ("AI", "AI")):
+            with self.subTest(source=source):
+                snapshot = make_snapshot(day, organization, logs, {
+                    "own": confirmed("own", "S1", source=source),
+                    "other": confirmed("other", "S2", positive="别人的评价"),
+                })
+                service = build_service(organization=organization,
+                    logs_by_day={day: logs}, snapshots={day: snapshot})
+                self.assertEqual(service.previous_evaluation("S1"), {
+                    "code": OK, "log_date": day.isoformat(), "status": "ready",
+                    "evaluation": {"positive": "肯定", "improvement": "改进", "source": label},
+                })
+
+    def test_backbone_gets_own_evaluation_not_subordinates(self) -> None:
+        day = TODAY - timedelta(days=2)
+        logs = [make_log("subordinate", "S1")]
+        service = build_service(logs_by_day={day: logs})
+        self.assertEqual(service.previous_evaluation("B1"), {
+            "code": OK, "log_date": day.isoformat(), "status": "no_log",
+            "evaluation": None,
+        })
+
+    def test_unconfirmed_or_incomplete_evaluation_is_pending(self) -> None:
+        day = TODAY - timedelta(days=2)
+        organization = make_organization()
+        logs = [make_log("own", "S1")]
+        states = [None, LogEvaluationState(
+            log_id="own", person_id="S1", evaluator_id="B1",
+            status=UnitStatus.WAITING_CONFIRMATION,
+            positive_ai="AI 初评", improvement_ai="未定稿",
+            positive_final="尚未确认", improvement_final="尚未确认"),
+            confirmed("own", "S1", improvement="")]
+        for state in states:
+            with self.subTest(state=state):
+                snapshot = make_snapshot(day, organization, logs,
+                                         {"own": state} if state else {})
+                service = build_service(organization=organization,
+                    logs_by_day={day: logs}, snapshots={day: snapshot})
+                self.assertEqual(service.previous_evaluation("S1"), {
+                    "code": OK, "log_date": day.isoformat(), "status": "pending",
+                    "evaluation": None,
+                })
+
+    def test_missing_snapshot_is_rebuilt(self) -> None:
+        day = TODAY - timedelta(days=2)
+        organization = make_organization()
+        logs = [make_log("own", "S1")]
+        service = build_service(organization=organization, logs_by_day={day: logs})
+        snapshot = make_snapshot(day, organization, logs, {"own": confirmed("own", "S1")})
+        service.rebuilder = Mock()
+        service.rebuilder.rebuild.return_value = {day: snapshot}
+        self.assertEqual(service.previous_evaluation("S1")["status"], "ready")
+        service.rebuilder.rebuild.assert_called_once_with(day, day)
+
+    def test_local_date_boundaries(self) -> None:
+        moments = [
+            (datetime(2026, 3, 1, 12, tzinfo=SHANGHAI), "2026-02-27"),
+            (datetime(2026, 1, 1, 12, tzinfo=SHANGHAI), "2025-12-30"),
+            (datetime(2026, 10, 26, 23, 59, tzinfo=SHANGHAI), "2026-10-24"),
+            (datetime(2026, 10, 27, 0, 0, tzinfo=SHANGHAI), "2026-10-25"),
+            (datetime.fromisoformat("2026-10-26T16:00:00+00:00"), "2026-10-25"),
+        ]
+        for moment, expected in moments:
+            with self.subTest(moment=moment):
+                service = build_service()
+                service._clock = lambda: moment
+                self.assertEqual(service.previous_evaluation("S1")["log_date"], expected)
+
+    def test_invalid_inactive_and_unsupported_people(self) -> None:
+        organization = make_organization()
+        organization.person_map()["S2"].active = False
+        service = build_service(organization=organization)
+        for person_id, code in (("missing", OUT_OF_SCOPE), ("S2", OUT_OF_SCOPE),
+                                ("M1", ROLE_NOT_ALLOWED), ("L1", ROLE_NOT_ALLOWED)):
+            with self.subTest(person_id=person_id):
+                self.assertEqual(service.previous_evaluation(person_id), {"code": code})
+
+    def test_read_failure_is_not_reported_as_no_log(self) -> None:
+        for component, method in (("log_repository", "logs_in_window"),
+                                  ("rebuilder", "rebuild"),
+                                  ("organization_cache", "get")):
+            with self.subTest(component=component):
+                service = build_service()
+                failing = Mock()
+                getattr(failing, method).side_effect = RuntimeError("读取失败")
+                setattr(service, component, failing)
+                with self.assertLogs("service.workbuddy_query.service", level="ERROR"):
+                    self.assertEqual(service.previous_evaluation("S1"), {"code": QUERY_FAILED})
+
+
 class QueryFailureTests(unittest.TestCase):
     def test_data_source_failure_becomes_query_failed(self) -> None:
         class Boom:
@@ -459,6 +555,8 @@ class TokenSeparationTests(unittest.TestCase):
         service = Mock()
         service.query.return_value = {"code": OK, "items": []}
         service.identity.return_value = {"code": OK, "person_id": "S1"}
+        service.previous_evaluation.return_value = {
+            "code": OK, "log_date": "2026-10-12", "status": "no_log", "evaluation": None}
         runtime = Runtime(settings=settings, infrastructure=Mock(),
                           organization_cache=Mock(),
                           workflows={binding.name: binding}, query=service)
@@ -477,6 +575,53 @@ class TokenSeparationTests(unittest.TestCase):
                          headers={"Authorization": "Bearer query-token"})
         self.assertEqual(ok.status_code, 200)
         self.assertEqual(ok.json()["code"], OK)
+
+    def test_previous_evaluation_uses_submit_token_without_query_token(self) -> None:
+        client = self._client(self._settings(query_token=""))
+        path = "/workbuddy/v1/work-logs/previous-evaluation"
+        body = {"person_id": "S1"}
+        for token in (None, "admin-token", "query-token", "review-token"):
+            with self.subTest(token=token):
+                headers = {"Authorization": f"Bearer {token}"} if token else {}
+                self.assertEqual(client.post(path, json=body, headers=headers).status_code, 401)
+        response = client.post(path, json=body,
+                               headers={"Authorization": "Bearer workbuddy-token"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "no_log")
+        client.app.state.runtime.query.previous_evaluation.assert_called_once_with("S1")
+
+    def test_previous_evaluation_request_cannot_override_day_or_scope(self) -> None:
+        client = self._client(self._settings())
+        for extra in ({"log_date": "2026-10-13"}, {"target": {"type": "group"}},
+                      {"name": "别人"}, {"range": {"shortcut": "yesterday"}}):
+            with self.subTest(extra=extra):
+                response = client.post("/workbuddy/v1/work-logs/previous-evaluation",
+                    json={"person_id": "S1", **extra},
+                    headers={"Authorization": "Bearer workbuddy-token"})
+                self.assertEqual(response.status_code, 422)
+        client.app.state.runtime.query.previous_evaluation.assert_not_called()
+
+    def test_previous_evaluation_business_failure_stays_http_200(self) -> None:
+        client = self._client(self._settings())
+        client.app.state.runtime.query.previous_evaluation.return_value = {"code": QUERY_FAILED}
+        response = client.post("/workbuddy/v1/work-logs/previous-evaluation",
+            json={"person_id": "S1"}, headers={"Authorization": "Bearer workbuddy-token"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"code": QUERY_FAILED})
+
+    def test_previous_evaluation_unconfigured_token_and_service(self) -> None:
+        path = "/workbuddy/v1/work-logs/previous-evaluation"
+        for missing in ("token", "service"):
+            with self.subTest(missing=missing):
+                settings = self._settings()
+                if missing == "token":
+                    settings = replace(settings, workbuddy_token="")
+                client = self._client(settings)
+                if missing == "service":
+                    client.app.state.runtime.query = None
+                response = client.post(path, json={"person_id": "S1"},
+                    headers={"Authorization": "Bearer workbuddy-token"})
+                self.assertEqual(response.status_code, 503)
 
     def test_query_token_cannot_reach_admin(self) -> None:
         client = self._client(self._settings())

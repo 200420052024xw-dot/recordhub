@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from tool.diagnostics import stage_diagnostics
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from datetime import date, datetime, time, timedelta
@@ -344,6 +345,7 @@ class LogRepository:
             self.bitable.batch_update(self.table.table_id, updates[offset:offset + 500])
         return len(updates)
 
+    @stage_diagnostics("read_logs")
     def get_logs_by_date(
         self, target_date: date,
         organization: Organization | None = None,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
 import time
 from collections.abc import Callable
 from typing import TypeVar
@@ -13,6 +14,7 @@ from pydantic import BaseModel, ValidationError
 from llm.client import DeepSeekClient
 from llm.errors import LLMError, LLMValidationError
 from tool.errors import DeepSeekApiError, StructuredOutputError
+from tool.diagnostics import stage_diagnostics, diagnostic_context
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -76,6 +78,7 @@ class PromptService:
         self.client = client
         self.max_attempts = max_attempts
 
+    @stage_diagnostics("ai_evaluation")
     def execute(
         self, *, prompt_code: str, template: str,
         input_data: BaseModel | str, output_model: type[T],
@@ -87,6 +90,8 @@ class PromptService:
         array_root=True 时提示词输出顶层 JSON 数组，这里把它包成 output_model 的 items。
         """
         schema = output_model.model_json_schema()
+        logger.info("llm_prompt_selected", extra={"fields": {"prompt_code": prompt_code,
+            "prompt_hash": hashlib.sha256(template.encode("utf-8")).hexdigest()}})
         if array_root:
             schema = schema.get("properties", {}).get("items", schema)
         root_kind = "数组" if array_root else "对象"

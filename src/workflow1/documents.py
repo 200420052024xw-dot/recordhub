@@ -19,6 +19,7 @@ from data.store import FileStateStore
 from schema import CloudObject, Department, Person
 from workflow1.models import DailySnapshot, UnitStatus
 from tool.cloud_docs import CloudDocsService, divider_block, text_block
+from tool.diagnostics import stage_diagnostics
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DIVIDER_TYPE = 22
@@ -213,6 +214,7 @@ class DailyDocuments:
 
     # ---- 三级文档装配 ----
 
+    @stage_diagnostics("generate_documents")
     def advance(self, target_date: date,
                 on_issue: Callable[[str, str], None] | None = None,
                 ) -> dict[str, CloudObject]:

@@ -41,6 +41,10 @@ class IdentityRequest(StrictModel):
     name: str = Field(min_length=1, max_length=32)
 
 
+class PreviousEvaluationRequest(StrictModel):
+    person_id: str = Field(min_length=1, max_length=64)
+
+
 class Target(StrictModel):
     type: Literal["self", "person", "group", "department"] = "self"
     name: str | None = Field(default=None, max_length=64)

@@ -194,7 +194,7 @@ class AlertTests(unittest.TestCase):
         messages.send_text.assert_called_once()
         self.assertIn("admin_alert_delivery_failed", logs.output[0])
 
-    def test_plain_warning_does_not_alert_but_warning_with_exception_does(self):
+    def test_warning_with_exception_is_evidence_not_an_alert(self):
         messages = Mock()
         messages.send_text.return_value = {"message_id": "alert"}
         handler = self.attach(messages)
@@ -204,8 +204,7 @@ class AlertTests(unittest.TestCase):
         except Exception:
             logging.getLogger("test.error").warning("failed", exc_info=True)
         handler.queue.join()
-        messages.send_text.assert_called_once()
-        self.assertIn("AssertionError: (no message)", messages.send_text.call_args.args[1])
+        messages.send_text.assert_not_called()
 
     def test_log_verbosity_does_not_disable_error_alerts(self):
         messages = Mock()
@@ -256,10 +255,10 @@ class CrossProcessAlertSuppressionTests(unittest.TestCase):
         self.assertEqual(self.messages.send_text.call_count, 2)
 
     def test_expired_memory_lets_the_alert_through_again(self):
-        self.fire(self.handler())
-        self.suppress_path.write_text(
-            json.dumps({"uvicorn.error|40|bind failed": "2020-01-01T00:00:00+00:00"}),
-            encoding="utf-8")
+        handler = self.handler()
+        self.fire(handler)
+        with handler.store.transaction() as db:
+            db.execute("UPDATE incidents SET last_report=0")
         self.fire(self.handler())
         self.assertEqual(self.messages.send_text.call_count, 2)
 
@@ -268,15 +267,14 @@ class CrossProcessAlertSuppressionTests(unittest.TestCase):
         self.fire(self.handler())
         self.assertEqual(self.messages.send_text.call_count, 1)
 
-    def test_suppression_is_reported_once_per_process(self):
-        with self.assertLogs("service.alerts", level="WARNING") as captured:
-            self.fire(self.handler())
-            self.fire(self.handler())
-            self.fire(self.handler())
-        reported = [r for r in captured.records
-                    if "admin_alert_suppressed" in r.getMessage()]
-        # One for each restarted process, so the silence is explainable.
-        self.assertEqual(len(reported), 2)
+    def test_suppressed_occurrences_are_counted_across_processes(self):
+        handler = self.handler()
+        self.fire(handler)
+        self.fire(self.handler())
+        self.fire(self.handler())
+        with handler.store.lock:
+            count = handler.store.db.execute("SELECT count FROM incidents").fetchone()[0]
+        self.assertEqual(count, 3)
         self.assertEqual(self.messages.send_text.call_count, 1)
 
     def test_without_a_path_it_behaves_like_before(self):

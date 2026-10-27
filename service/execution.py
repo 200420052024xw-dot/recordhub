@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from data.store import FileStateStore, utc_now
+from tool.diagnostics import execution_context
 
 logger = logging.getLogger(__name__)
 scheduled_generation = ContextVar("scheduled_generation", default=False)
@@ -198,6 +199,10 @@ class Appointments:
                    and datetime.fromisoformat(t["due"]) <= utc_now() for t in self.journal.all())
 
     def execute(self, key):
+        with execution_context(operation="appointment", appointment_key=key):
+            return self._execute(key)
+
+    def _execute(self, key):
         task = self.journal.claim(key)
         if task is None:
             return
@@ -228,9 +233,12 @@ class Appointments:
                           expires=expires, retry=True, attempt=task["attempt"] + 1)
                 logger.warning("appointment_retry_scheduled key=%s error=%s", key, task["error"])
             else:
-                logger.exception("appointment_exhausted key=%s error=%s", key, task["error"])
+                logger.exception("appointment_exhausted key=%s error=%s", key, task["error"],
+                    extra={"fields": {"key": key.split("#retry:")[0]}})
         else:
             task["status"] = "done"
+            logger.info("appointment_completed key=%s", key,
+                extra={"fields": {"key": key.split("#retry:")[0]}, "alert": "recovery"})
         finally:
             scheduled_generation.reset(generation_token)
             if task["status"] in {"done", "failed", "expired"}:

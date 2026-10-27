@@ -10,6 +10,7 @@ from data.store import FileStateStore
 from schema import CloudObject, TableConfig
 from workflow1.models import DailySnapshot
 from tool.feishu import BitableService
+from tool.diagnostics import stage_diagnostics
 
 
 class WorkflowReportRepository:
@@ -19,6 +20,7 @@ class WorkflowReportRepository:
         self.table = config.tables["reports"]
         self.store = store
 
+    @stage_diagnostics("report_index")
     def publish(self, snapshot: DailySnapshot,
                 objects: dict[str, CloudObject]) -> dict[str, str]:
         """Index documents in the report table; returns issue entries to log."""

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypeVar
 
 from config.settings import DeepSeekSettings
 from tool.errors import DeepSeekApiError, StructuredOutputError
 from tool.http import HttpTransport
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 JsonValidator = Callable[[dict[str, Any]], T]
@@ -55,8 +59,11 @@ class DeepSeekClient:
         try:
             return validator(result)
         except Exception as exc:
+            detail = type(exc).__name__
+            if hasattr(exc, "errors"):
+                detail += ": " + json.dumps(exc.errors(include_input=False, include_context=False), default=str)
             raise StructuredOutputError(
-                f"Structured output validation failed: {exc}", raw=content
+                f"Structured output validation failed: {detail}", raw=content
             ) from exc
 
     def _complete(
@@ -75,16 +82,21 @@ class DeepSeekClient:
         }
         if response_format:
             body["response_format"] = dict(response_format)
-        response = self.transport.request(
-            "POST",
-            f"{self.settings.base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.settings.api_key}",
-                "Content-Type": "application/json; charset=utf-8",
-            },
-            json_body=body,
-        )
+        started = time.monotonic()
+        try:
+            response = self.transport.request(
+                "POST", f"{self.settings.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self.settings.api_key}",
+                         "Content-Type": "application/json; charset=utf-8"}, json_body=body)
+        except Exception:
+            logger.info("llm_request_finished", extra={"fields": {"model": self.settings.model,
+                "status": "transport_error", "elapsed_ms": round((time.monotonic() - started) * 1000)}})
+            raise
         data = response.data if isinstance(response.data, dict) else {}
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        logger.info("llm_request_finished", extra={"fields": {"model": self.settings.model,
+            "status_code": response.status_code, "elapsed_ms": round((time.monotonic() - started) * 1000),
+            **{key: usage[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens") if key in usage}}})
         if not 200 <= response.status_code < 300 or "error" in data:
             error = data.get("error", {}) if isinstance(data, dict) else {}
             raise DeepSeekApiError(

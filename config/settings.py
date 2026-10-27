@@ -68,8 +68,14 @@ class AppSettings:
     event_stream_enabled: bool = True
     archive_parent_folder_token: str = ""
     log_dir: str = "logs"
-    log_retention_days: int = 2
+    log_retention_days: int = 3
     log_level: str = "INFO"
+    log_max_bytes: int = 20 * 1024 * 1024
+    log_directory_max_bytes: int = 1024 * 1024 * 1024
+    alert_ai_enabled: bool = True
+    alert_analysis_timeout_seconds: int = 15
+    alert_summary_minutes: int = 360
+    release: str = "unknown"
     # 日志查询（WorkBuddy 查询口径）专用 token；留空时查询接口 503 不可用。
     query_token: str = ""
     # 批改（WorkBuddy 批改口径）专用 token；留空时批改接口 503 不可用。
@@ -130,9 +136,15 @@ class AppSettings:
                 "RECORDHUB_ARCHIVE_PARENT_FOLDER_TOKEN", "").strip(),
             log_dir=os.getenv("RECORDHUB_LOG_DIR", "logs").strip() or "logs",
             log_retention_days=_positive_int(
-                "RECORDHUB_LOG_RETENTION_DAYS", 2
+                "RECORDHUB_LOG_RETENTION_DAYS", 3
             ),
             log_level=_log_level("RECORDHUB_LOG_LEVEL", "INFO"),
+            log_max_bytes=_positive_int("RECORDHUB_LOG_MAX_BYTES", 20 * 1024 * 1024),
+            log_directory_max_bytes=_positive_int("RECORDHUB_LOG_DIRECTORY_MAX_BYTES", 1024 * 1024 * 1024),
+            alert_ai_enabled=_boolean("RECORDHUB_ALERT_AI_ENABLED", True),
+            alert_analysis_timeout_seconds=_positive_int("RECORDHUB_ALERT_ANALYSIS_TIMEOUT_SECONDS", 15),
+            alert_summary_minutes=_positive_int("RECORDHUB_ALERT_SUMMARY_MINUTES", 360),
+            release=os.getenv("RECORDHUB_RELEASE", "unknown").strip() or "unknown",
             query_token=os.getenv("RECORDHUB_QUERY_TOKEN", "").strip(),
             review_token=os.getenv("RECORDHUB_REVIEW_TOKEN", "").strip(),
         )

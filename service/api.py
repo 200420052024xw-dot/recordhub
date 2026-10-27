@@ -21,7 +21,7 @@ from config.schedules import ScheduleConfig
 from schema import Organization, PersonCreateRequest, PersonUpdateRequest
 from service.bitable_events import BitableEventStream
 from service.runtime import Runtime, build_runtime, capture_notification_backlog
-from service.workbuddy_query.models import IdentityRequest, QueryRequest
+from service.workbuddy_query.models import IdentityRequest, PreviousEvaluationRequest, QueryRequest
 from service.workbuddy_review.models import PendingRequest, ReviewSubmitRequest
 from workflow1.models import (
     ConfirmationRequest,
@@ -29,7 +29,7 @@ from workflow1.models import (
     WorkBuddySubmitRequest,
 )
 from workflow1.workbuddy_inbox import LogSubmitService
-from tool.diagnostics import error_summary
+from tool.diagnostics import error_summary, execution_context, diagnostic_context
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +58,12 @@ def create_app(
         load_env_file()
         settings = AppSettings.from_env()
     if runtime is None:
-        from service.alerts import configure_admin_alerts
-        configure_admin_alerts(settings)
+        from service.alerts import AdminAlertHandler, configure_admin_alerts
+        from config.logs import RetainedJSONHandler, setup_logging
+        if not any(isinstance(h, RetainedJSONHandler) for h in logging.getLogger().handlers):
+            setup_logging(settings)
+        if not any(isinstance(h, AdminAlertHandler) for h in logging.getLogger().handlers):
+            configure_admin_alerts(settings)
     active_runtime = runtime or build_runtime(settings)
     schedules = load_schedule_config(settings.schedule_config_path)
     app = FastAPI(
@@ -69,12 +73,35 @@ def create_app(
     )
     app.state.runtime = active_runtime
 
+    @app.middleware("http")
+    async def diagnostic_request(request: Request, call_next):
+        from uuid import uuid4
+        from time import monotonic
+        execution_id = uuid4().hex
+        request.state.execution_id = execution_id
+        started = monotonic()
+        with diagnostic_context(execution_id=execution_id, operation="http", method=request.method,
+                                path=request.url.path):
+            try:
+                response = await call_next(request)
+            except Exception:
+                logger.info("http_request_finished", extra={"fields": {"status": "failed",
+                    "elapsed_ms": round((monotonic() - started) * 1000)}})
+                raise
+            response.headers["X-RecordHub-Execution-ID"] = execution_id
+            logger.info("http_request_finished", extra={"fields": {"status_code": response.status_code,
+                "elapsed_ms": round((monotonic() - started) * 1000)}})
+            return response
+
     @app.exception_handler(Exception)
     async def unexpected_error(request: Request, exc: Exception):
-        logger.error("http_request_failed method=%s path=%s error=%s",
-                     request.method, request.url.path, error_summary(exc),
-                     exc_info=(type(exc), exc, exc.__traceback__))
-        return JSONResponse(status_code=500, content={"detail": "Internal server error; see service logs"})
+        with diagnostic_context(execution_id=getattr(request.state, "execution_id", "-"), operation="http",
+                                method=request.method, path=request.url.path):
+            logger.error("http_request_failed method=%s path=%s error=%s",
+                         request.method, request.url.path, error_summary(exc),
+                         exc_info=(type(exc), exc, exc.__traceback__))
+        return JSONResponse(status_code=500, content={"detail": "Internal server error; see service logs"},
+            headers={"X-RecordHub-Execution-ID": getattr(request.state, "execution_id", "-")})
 
     @app.get("/health/live")
     def live() -> dict[str, str]:
@@ -313,6 +340,11 @@ def _register_routes(app: FastAPI, runtime: Runtime, settings: AppSettings) -> N
                 status_code=503, detail="Query endpoint is not configured")
         return runtime.query
 
+    @app.post("/workbuddy/v1/work-logs/previous-evaluation",
+              dependencies=[Depends(require_workbuddy)])
+    def workbuddy_previous_evaluation(request: PreviousEvaluationRequest) -> dict:
+        return query_service().previous_evaluation(request.person_id)
+
     @app.post("/workbuddy/v1/queries/identity",
               dependencies=[Depends(require_query)])
     def workbuddy_query_identity(request: IdentityRequest) -> dict:
@@ -433,7 +465,20 @@ def _make_lifespan(runtime: Runtime, settings: AppSettings, schedules: ScheduleC
                 scheduler.shutdown(wait=True)
             logger.info("service_stopped")
 
-    return lifespan
+    @asynccontextmanager
+    async def observed_lifespan(app: FastAPI):
+        with execution_context(operation="service_lifecycle"):
+            try:
+                async with lifespan(app):
+                    yield
+            except Exception:
+                logger.critical("service_start_failed", exc_info=True)
+                raise
+            finally:
+                from service.alerts import close_admin_alerts
+                close_admin_alerts()
+
+    return observed_lifespan
 
 
 def _build_scheduler(

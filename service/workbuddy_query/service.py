@@ -20,7 +20,7 @@ from schema import TableConfig
 from schema.domain import Organization, Person
 from tool.feishu import BitableService
 from workflow1.models import UnitStatus
-from workflow1.workbuddy_inbox import WorkBuddyInbox
+from workflow1.workbuddy_inbox import SUPPORTED_ROLES, WorkBuddyInbox
 from workflow2.feishu_material import SnapshotRebuilder
 
 from service.workbuddy_query.cache import TtlCache
@@ -117,6 +117,30 @@ class WorkBuddyQueryService:
         }
 
     # ------------------------------------------------------------- 查询
+
+    def previous_evaluation(self, person_id: str) -> dict:
+        """提交前展示前天日志的最终评价；日期只由服务端决定。"""
+        try:
+            day = self._clock().astimezone(SHANGHAI).date() - timedelta(days=2)
+            organization = self.organization_cache.get()
+            person = organization.person_map().get(person_id)
+            if person is None or not person.active:
+                raise QueryError(OUT_OF_SCOPE)
+            if person.role not in SUPPORTED_ROLES:
+                raise QueryError(ROLE_NOT_ALLOWED)
+            items = self._log_items(day, day, {person.person_id}, organization)
+            evaluation = items[0].get("evaluation") if items else None
+            return {
+                "code": OK,
+                "log_date": day.isoformat(),
+                "status": "ready" if evaluation else ("pending" if items else "no_log"),
+                "evaluation": evaluation,
+            }
+        except QueryError as exc:
+            return exc.payload()
+        except Exception:
+            logger.exception("previous_evaluation_failed person_id=%s", person_id)
+            return {"code": QUERY_FAILED}
 
     def query(self, request: QueryRequest) -> dict:
         try:

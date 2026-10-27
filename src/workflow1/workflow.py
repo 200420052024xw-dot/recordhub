@@ -129,7 +129,8 @@ class Workflow1:
         added = self.store.update_snapshot(target_date, mutate)
         if added:
             logger.error("workflow1_issue_recorded date=%s key=%s reason=%s",
-                         target_date, key, reason, exc_info=sys.exc_info()[0] is not None)
+                         target_date, key, reason, exc_info=sys.exc_info()[0] is not None,
+                         extra={"alert": "evidence" if key.endswith(":ai-failed") else None})
 
     def _flush_workbuddy_inbox(self, target_date: date) -> dict[str, str]:
         """把对话入口收到的日志写回飞书,必须发生在建快照之前。
@@ -213,7 +214,8 @@ class Workflow1:
             if run.status == WorkflowStatus.COMPLETED:
                 logger.debug("workflow1_already_completed date=%s", target_date)
                 return run
-            logger.info("workflow1_start date=%s", target_date)
+            logger.info("workflow1_start date=%s", target_date,
+                        extra={"fields": {"workflow_run_id": run.workflow_run_id}})
             try:
                 snapshot = self.store.load_snapshot(target_date)
                 if snapshot is not None and snapshot.schema_version != 2:
@@ -385,9 +387,12 @@ class Workflow1:
                             f"原样放进「肯定之处_AI」，改进栏指向它，请人工核对后确认："
                             f"{error_summary(exc)}")
                         continue
-                    self._defer_or_give_up(target_date, log_id, exc)
+                    with diagnostic_context(log_id=log_id, stage="ai_evaluation"):
+                        self._defer_or_give_up(target_date, log_id, exc)
         logger.info("workflow1_logs_evaluated date=%s pending=%d failed=%d",
-                    target_date, len(pending), len(failures))
+                    target_date, len(pending), len(failures), extra={"fields": {
+                        "stage": "ai_evaluation", "status": "partial" if failures else "success",
+                        "successful_count": len(pending) - len(failures), "failed_count": len(failures)}})
 
     def _defer_or_give_up(self, target_date: date, log_id: str, exc: Exception) -> None:
         """接口/网络失败的日志评价：延后重试，最多 llm_retry_limit 次；仍失败才报管理员。"""

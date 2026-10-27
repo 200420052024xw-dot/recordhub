@@ -14,6 +14,8 @@ import lark_oapi as lark
 from config.logs import silence_third_party_console_handlers
 from config.settings import AppSettings
 from tool.feishu import BitableService
+from tool.diagnostics import execution_context
+from contextvars import copy_context, Context
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,7 @@ logger = logging.getLogger(__name__)
 class _Job:
     table_id: str
     record_id: str
+    context: Context | None = None
 
 
 class BitableEventStream:
@@ -86,9 +89,10 @@ class BitableEventStream:
                     if key in self.pending:
                         continue
                     self.pending.add(key)
-                self.queue.put(_Job(table_id, record_id))
-                logger.info("feishu_event_enqueued table_id=%s record_id=%s action=%s",
-                            table_id, record_id, action.action)
+                with execution_context(operation="feishu_event", table_id=table_id, record_id=record_id):
+                    self.queue.put(_Job(table_id, record_id, copy_context()))
+                    logger.info("feishu_event_enqueued table_id=%s record_id=%s action=%s",
+                                table_id, record_id, action.action)
         except Exception:
             logger.exception("feishu_event_callback_failed")
 
@@ -113,7 +117,13 @@ class BitableEventStream:
             if job is None:
                 return
             try:
-                self.handlers[job.table_id](job.record_id)
+                def process():
+                    with execution_context(operation="feishu_event", table_id=job.table_id, record_id=job.record_id):
+                        try:
+                            self.handlers[job.table_id](job.record_id)
+                        except Exception:
+                            logger.exception("feishu_event_worker_failed")
+                (job.context or copy_context()).run(process)
             except Exception:
                 logger.exception("feishu_event_worker_failed")
             finally:

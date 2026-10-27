@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import sys
 import tempfile
@@ -45,7 +46,7 @@ class LoggingSetupTests(unittest.TestCase):
         self._directory.cleanup()
 
     def _log_file(self) -> Path:
-        return self.log_dir / "recordhub.log"
+        return next(h.active_path for h in self.root.handlers if hasattr(h, "active_path"))
 
     def _read_log(self) -> str:
         for handler in self.root.handlers:
@@ -65,8 +66,8 @@ class LoggingSetupTests(unittest.TestCase):
         # stderr keeps stdout free for the CLI's JSON payloads.
         self.assertIs(console[0].stream, sys.stderr)
         handler = rotating[0]
-        # 3 days = today's file + 2 midnight-rotated backups.
-        self.assertEqual(handler.backupCount, 1)
+        # Record-age retention also trims partially expired files.
+        self.assertEqual(handler.retention_days, 3)
         self.assertEqual(handler.when.upper(), "MIDNIGHT")
         self.assertEqual(handler.encoding, "utf-8")
         self.assertEqual(self.root.level, logging.INFO)
@@ -77,7 +78,7 @@ class LoggingSetupTests(unittest.TestCase):
         text = self._read_log()
         self.assertIn("probe 1", text)
         self.assertIn("uvicorn.access", text)
-        self.assertIn("中文说明=HTTP 请求访问记录。", text)
+        self.assertEqual(json.loads(text)["explanation"], "HTTP 请求访问记录。")
 
     def test_application_event_includes_chinese_explanation(self) -> None:
         setup_logging(settings_for(str(self.log_dir)))
@@ -85,7 +86,7 @@ class LoggingSetupTests(unittest.TestCase):
             "workflow1_finalize_failed date=%s stage=%s", "2026-10-08", "advance")
         text = self._read_log()
         self.assertIn("workflow1_finalize_failed", text)
-        self.assertIn("中文说明=每日流程在截止收尾阶段失败", text)
+        self.assertIn("每日流程在截止收尾阶段失败", json.loads(text)["explanation"])
 
     def test_setup_is_idempotent(self) -> None:
         setup_logging(settings_for(str(self.log_dir)))
@@ -98,7 +99,7 @@ class LoggingSetupTests(unittest.TestCase):
         setup_logging(settings_for(str(self.log_dir), log_retention_days=1))
         handler = next(h for h in self.root.handlers
                        if isinstance(h, TimedRotatingFileHandler))
-        self.assertEqual(handler.backupCount, 0)
+        self.assertEqual(handler.retention_days, 1)
 
     def test_invalid_level_rejected(self) -> None:
         with patch.dict(os.environ, {"RECORDHUB_LOG_LEVEL": "verbose"}):

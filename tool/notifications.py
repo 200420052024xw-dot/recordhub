@@ -150,7 +150,7 @@ class NotificationPolicy:
             FileStateStore._atomic_write(self.path, state)
             record_outcome(key, "sent", message_id=message_id)
             logger.info("notification_delivered date=%s key=%s message_id=%s manual=%s",
-                        target_date, key, message_id, manual)
+                        target_date, key, message_id, manual, extra={"alert": "recovery"})
             return result
 
     def retry_report(self, key, messages):
