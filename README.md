@@ -122,13 +122,13 @@ cp .env.example .env
 
 ### 3. 配置数据表映射
 
-`config/tables.toml` 保存各数据表的 `table_id` 和字段中文名。首次部署可从空白模板复制：
+`config/tables.toml` 保存各数据表的 `table_id` 和字段中文名。`config/tables.example.toml` 是不带真实 ID 的空白模板；如果部署环境只有模板，可复制后填写：
 
 ```bash
 cp config/tables.example.toml config/tables.toml
 ```
 
-然后按实际飞书多维表格填写。`table_id` 是多维表链接里的 `tbl...`，不是表单的 `shrcn...`。可选的 `[tables.person_departments]` 用于跨部门任职；删掉或留空 `table_id` 即保持单部门模式。
+如果仓库里已经有 `config/tables.toml`，直接修改它，不要用模板覆盖。两者都按实际飞书多维表格填写。`table_id` 是多维表链接里的 `tbl...`，不是表单的 `shrcn...`。可选的 `[tables.person_departments]` 用于跨部门任职；删掉或留空 `table_id` 即保持单部门模式。
 
 ### 4. 配置调度与提示词
 
