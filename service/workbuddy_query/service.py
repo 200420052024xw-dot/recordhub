@@ -19,7 +19,9 @@ from data.store import FileStateStore
 from schema import TableConfig
 from schema.domain import Organization, Person
 from tool.feishu import BitableService
+from workflow1.final_evaluation import render_final_evaluation
 from workflow1.models import UnitStatus
+from workflow1.units import effective_text
 from workflow1.workbuddy_inbox import SUPPORTED_ROLES, WorkBuddyInbox
 from workflow2.feishu_material import SnapshotRebuilder
 
@@ -41,7 +43,9 @@ from service.workbuddy_query.permissions import (
     ROLE_LEADER,
     ROLE_MINISTER,
     ScopeResolver,
+    member_roles,
     scope_of,
+    widest_scope,
 )
 from service.workbuddy_query.ranges import clamp_view_window, resolve_window
 from service.workbuddy_query.stage import StageReader
@@ -106,14 +110,28 @@ class WorkBuddyQueryService:
             logger.warning("query_ambiguous_name name=%s matches=%d", name, len(matches))
             return {"code": DUPLICATE_NAME, "name": name.strip()}
         person = matches[0]
-        department = organization.department_map().get(person.department_id or "")
+        departments_map = organization.department_map()
+        departments = []
+        for membership in person.membership_list():
+            department = departments_map.get(membership.department_id)
+            if department is None:
+                continue
+            departments.append({
+                "department_id": membership.department_id,
+                "department_name": department.name,
+                "role": membership.role,
+                "primary": membership.primary,
+                "scope": scope_of(membership.role),
+            })
+        primary_department = departments_map.get(person.department_id or "")
         return {
             "code": OK,
             "person_id": person.person_id,
             "name": person.name,
             "role": person.role,
-            "department_name": department.name if department else "",
-            "scope": scope_of(person.role),
+            "department_name": primary_department.name if primary_department else "",
+            "scope": widest_scope(person),
+            "departments": departments,
         }
 
     # ------------------------------------------------------------- 查询
@@ -126,7 +144,7 @@ class WorkBuddyQueryService:
             person = organization.person_map().get(person_id)
             if person is None or not person.active:
                 raise QueryError(OUT_OF_SCOPE)
-            if person.role not in SUPPORTED_ROLES:
+            if not (member_roles(person) & set(SUPPORTED_ROLES)):
                 raise QueryError(ROLE_NOT_ALLOWED)
             items = self._log_items(day, day, {person.person_id}, organization)
             evaluation = items[0].get("evaluation") if items else None
@@ -207,30 +225,45 @@ class WorkBuddyQueryService:
                 evaluation = self._evaluation(snapshot, log.log_id)
                 if evaluation is not None:
                     item["evaluation"] = evaluation
+                if log.final_evaluation.strip():
+                    # 定稿写回后的日志行自带合并评价，直接作为返回内容来源。
+                    merged = dict(evaluation) if evaluation else {}
+                    merged["text"] = log.final_evaluation.strip()
+                    merged["source"] = "FINAL"
+                    item["evaluation"] = merged
                 items.append(item)
             day += timedelta(days=1)
         items.sort(key=lambda item: (item["date"], item["name"]))
         return items
 
-    @staticmethod
-    def _evaluation(snapshot, log_id: str) -> dict | None:
+    def _evaluation(self, snapshot, log_id: str) -> dict | None:
         if snapshot is None:
             return None
-        state = snapshot.log_evaluations.get(log_id)
-        if state is None or state.status != UnitStatus.CONFIRMED:
+        units = sorted(
+            (unit for unit in snapshot.evaluation_units.values()
+             if unit.log_id == log_id and unit.status == UnitStatus.CONFIRMED),
+            key=lambda unit: (min(unit.department_ids or [""]), unit.evaluator_id))
+        if not units:
             return None
-        positive = (state.positive_final or "").strip()
-        improvement = (state.improvement_final or "").strip()
-        if not positive or not improvement:
+        text = render_final_evaluation(snapshot, log_id)
+        if len(units) == 1:
+            source, positive, improvement = effective_text(snapshot, units[0])
+            if not positive or not improvement:
+                return None
+            return {"positive": positive, "improvement": improvement,
+                    "source": _SOURCE_LABELS.get(source, source),
+                    "text": text or None}
+        if not text:
             return None
-        return {"positive": positive, "improvement": improvement,
-                "source": _SOURCE_LABELS.get(state.source, state.source)}
+        has_human = any(unit.source == "HUMAN" for unit in units)
+        return {"text": text, "source": "人工" if has_human else "AI",
+                "positive": text, "improvement": text}
 
     # ------------------------------------------------------- 评价·今天
 
     def _review(self, request: QueryRequest, organization: Organization,
                 person: Person, resolver: ScopeResolver, today: date) -> dict:
-        if person.role not in REVIEW_ROLES:
+        if not (member_roles(person) & REVIEW_ROLES):
             raise QueryError(ROLE_NOT_ALLOWED)
         target_ids = (resolver.resolve_target(request.target, person)
                       if request.target is not None
@@ -284,12 +317,12 @@ class WorkBuddyQueryService:
 
     def _stage(self, request: QueryRequest, organization: Organization,
                person: Person, resolver: ScopeResolver, today: date) -> dict:
-        if person.role not in STAGE_ROLES:
+        if not (member_roles(person) & STAGE_ROLES):
             raise QueryError(CONTENT_NOT_SUPPORTED)
         start, end = resolve_window(request.range, today=today)
         start, end = clamp_view_window(start, end, today=today)
         target_ids = resolver.resolve_target(request.target, person)
-        is_leader = person.role == ROLE_LEADER
+        is_leader = ROLE_LEADER in member_roles(person)
         # 负责人的权限上界是全体；只有明确指定了部门/个人/小组才收窄本次范围。
         narrowed = request.target is not None and request.target.type != "self"
         if is_leader and not narrowed:

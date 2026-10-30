@@ -12,6 +12,7 @@ from typing import Any
 from data.errors import FeishuReadError
 from schema import (
     Department,
+    Membership,
     Organization,
     Person,
     TableConfig,
@@ -60,10 +61,18 @@ class OrganizationRepository:
             persons_table = self.config.tables["persons"]
             department_records = self.bitable.list_records(departments_table.table_id)
             person_records = self.bitable.list_records(persons_table.table_id)
+            membership_table = self.config.tables.get("person_departments")
+            membership_records = []
+            membership_fields = {}
+            if membership_table is not None and membership_table.table_id.strip():
+                membership_records = self.bitable.list_records(membership_table.table_id)
+                membership_fields = membership_table.fields
             if self.use_person_field_ids:
                 return self._parse_organization(
                     departments_table.fields, department_records,
                     persons_table.fields, person_records,
+                    membership_fields=membership_fields,
+                    membership_records=membership_records,
                     use_person_field_ids=True,
                 )
             mobile_field = persons_table.fields["mobile"]
@@ -95,6 +104,8 @@ class OrganizationRepository:
                 persons_table.fields,
                 person_records,
                 mobile_open_ids,
+                membership_fields=membership_fields,
+                membership_records=membership_records,
             )
         except Exception as exc:
             raise FeishuReadError(f"Unable to refresh organization cache: {exc}") from exc
@@ -107,6 +118,8 @@ class OrganizationRepository:
         person_records,
         mobile_open_ids=None,
         use_person_field_ids=False,
+        membership_fields=None,
+        membership_records=None,
     ):
         mobile_open_ids = mobile_open_ids or {}
         def person_open_id(item, values) -> str:
@@ -163,23 +176,62 @@ class OrganizationRepository:
                 leader_id = resolve_reference(
                     values.get(person_fields["minister_ref"]), person_aliases
                 )
+            department_id = resolve_reference(
+                values.get(person_fields["department_ref"]), department_aliases
+            ) or None
+            memberships = ([Membership(department_id=department_id, role=role,
+                                       leader_id=leader_id or None, primary=True)]
+                           if department_id else [])
             persons.append(
                 Person(
                     person_id=person_id,
                     name=display_name(values.get(person_fields["name"])),
                     role=role,
-                    department_id=resolve_reference(
-                        values.get(person_fields["department_ref"]),
-                        department_aliases,
-                    )
-                    or None,
+                    department_id=department_id,
                     leader_id=leader_id or None,
+                    memberships=memberships,
                     open_id=person_open_id(item, values) or None,
                     mobile=scalar(values.get(person_fields["mobile"])).strip() or None,
                     source_record_id=str(item.get("record_id", "")) or None,
                     active=field_boolean(values.get(person_fields.get("active"))),
                 )
             )
+
+        # Extra departments are memberships only: never add a Person row here,
+        # otherwise a cross-department person would be counted twice everywhere.
+        if membership_fields and membership_records:
+            person_by_id = {person.person_id: person for person in persons}
+            for item in membership_records:
+                values = record_fields(item)
+                person_id = resolve_reference(
+                    values.get(membership_fields["person_ref"]), person_aliases
+                )
+                if not person_id and membership_fields.get("name"):
+                    person_id = person_aliases.get(
+                        display_name(values.get(membership_fields["name"])).strip(), "")
+                person = person_by_id.get(person_id)
+                if person is None:
+                    continue
+                department_id = resolve_reference(
+                    values.get(membership_fields["department_ref"]),
+                    department_aliases,
+                )
+                if not department_id:
+                    continue
+                role = scalar(values.get(membership_fields["role"])).strip()
+                leader_id = resolve_reference(
+                    values.get(membership_fields["leader_ref"]), person_aliases
+                )
+                if not leader_id and role == "骨干学生" and membership_fields.get("minister_ref"):
+                    leader_id = resolve_reference(
+                        values.get(membership_fields["minister_ref"]), person_aliases
+                    )
+                person.memberships.append(Membership(
+                    department_id=department_id,
+                    role=role,
+                    leader_id=leader_id or None,
+                    primary=False,
+                ))
 
         departments = []
         for item, values, department_id in department_rows:
@@ -213,12 +265,38 @@ class OrganizationRepository:
         person_by_id = {person.person_id: person for person in persons if person.person_id}
         person_ids = set(person_by_id)
         department_ids = {item.department_id for item in departments if item.department_id}
+        membership_by_key: dict[tuple[str, str], Membership] = {}
+        subject_roles: dict[tuple[str, str], set[str]] = defaultdict(set)
+        evaluator_roles: dict[str, set[str]] = defaultdict(set)
         for person in persons:
             anomalies.extend(
                 OrganizationRepository._person_anomalies(
                     person, person_by_id, person_ids, department_ids
                 )
             )
+            for item in person.membership_list():
+                key = (person.person_id, item.department_id)
+                if key in membership_by_key:
+                    anomalies.append(
+                        f"人员「{person.name}」在部门 {item.department_id} 存在重复成员关系")
+                membership_by_key[key] = item
+                if item.role in {"基层学生", "骨干学生"} and item.leader_id:
+                    subject_roles[(person.person_id, item.leader_id)].add(item.role)
+                if item.role in {"骨干学生", "部长"}:
+                    evaluator_roles[person.person_id].add(item.role)
+        for (person_id, evaluator_id), roles in subject_roles.items():
+            if len(roles) > 1:
+                person = person_by_id.get(person_id)
+                evaluator = person_by_id.get(evaluator_id)
+                anomalies.append(
+                    f"人员「{person.name if person else person_id}」与评价人"
+                    f"「{evaluator.name if evaluator else evaluator_id}」在多个部门"
+                    "的被评价角色不同，无法共用同一条评价")
+        for person_id, roles in evaluator_roles.items():
+            if len(roles) > 1:
+                anomalies.append(
+                    f"人员「{person_by_id[person_id].name}」在不同部门承担不同评价角色"
+                    f"（{'/'.join(sorted(roles))}），无法共用同一条评价")
         for department in departments:
             if department.active and department.minister_id not in person_ids:
                 anomalies.append(f"部门 {department.department_id} 缺少有效部长")
@@ -232,19 +310,48 @@ class OrganizationRepository:
         label = f"人员「{person.name or '未知'}」（ID：{person.person_id or '未填'}）"
         if not person.person_id or not person.name or not person.role:
             anomalies.append(f"人员记录缺少编号、姓名或角色: {person.name or '未知'}")
+        memberships = person.membership_list()
+        if person.role != "团队负责人" and not memberships:
+            anomalies.append(f"{label} 没有成员关系")
+        if memberships and sum(item.primary for item in memberships) != 1:
+            anomalies.append(f"{label} 必须恰好有一条主部门关系")
+        seen_departments: set[str] = set()
+        for item in memberships:
+            if item.department_id in seen_departments:
+                anomalies.append(f"{label} 在部门 {item.department_id} 存在重复成员关系")
+            seen_departments.add(item.department_id)
+            if item.department_id not in department_ids:
+                anomalies.append(f"{label} 的部门 {item.department_id} 不存在")
+            if item.role not in {"基层学生", "骨干学生", "部长", "团队负责人"}:
+                anomalies.append(f"{label} 在部门 {item.department_id} 的角色无效：{item.role}")
+            if not item.primary and item.role == "团队负责人":
+                anomalies.append(f"{label} 不能在跨部门表中配置团队负责人")
+            if item.role in {"基层学生", "骨干学生"}:
+                if not item.leader_id:
+                    anomalies.append(f"{label} 在部门 {item.department_id} 没有直属上级")
+                elif item.leader_id not in person_ids:
+                    anomalies.append(f"{label} 在部门 {item.department_id} 的直属上级不存在")
+                elif item.leader_id == person.person_id:
+                    anomalies.append(f"{label} 的直属上级不能是本人")
+                else:
+                    expected = "骨干学生" if item.role == "基层学生" else "部长"
+                    leader = person_by_id[item.leader_id]
+                    leader_membership = next(
+                        (one for one in leader.membership_list()
+                         if one.department_id == item.department_id), None)
+                    if leader_membership is None:
+                        anomalies.append(
+                            f"{label} 的直属上级「{leader.name}」不在部门 {item.department_id}")
+                    elif leader_membership.role != expected:
+                        anomalies.append(
+                            f"{label} 在部门 {item.department_id} 的直属上级角色应为 {expected}")
         if person.department_id and person.department_id not in department_ids:
-            anomalies.append(f"{label} 的部门不存在")
+            anomalies.append(f"{label} 的主部门不存在")
+        primary = next((item for item in memberships if item.primary), None)
+        if primary and person.department_id and primary.department_id != person.department_id:
+            anomalies.append(f"{label} 的主部门与人员表所属部门不一致")
         if person.leader_id and person.leader_id not in person_ids:
             anomalies.append(f"{label} 的直属上级不存在")
-        if person.active and person.role in {"基层学生", "骨干学生"}:
-            if not person.leader_id:
-                anomalies.append(f"{label} 没有直属上级")
-            elif person.leader_id in person_ids:
-                expected = "骨干学生" if person.role == "基层学生" else "部长"
-                if person_by_id[person.leader_id].role != expected:
-                    anomalies.append(
-                        f"{label} 的直属上级角色应为 {expected}"
-                    )
         return anomalies
 
 
@@ -262,9 +369,11 @@ class OrganizationCache:
         self.repository = repository
         self._lock = threading.RLock()
 
+    CACHE_KEY = "organization_v2"
+
     def get(self) -> Organization:
         with self._lock:
-            cached = self.store.load_cache("organization")
+            cached = self.store.load_cache(self.CACHE_KEY)
             if cached is not None:
                 return Organization.model_validate(cached)
             return self.refresh()
@@ -272,16 +381,34 @@ class OrganizationCache:
     def refresh(self) -> Organization:
         with self._lock:
             organization = self.repository.load()
-            self.store.save_cache("organization", organization.model_dump(mode="json"))
-            logger.info("organization_cache_refreshed persons=%d departments=%d anomalies=%d",
-                        len(organization.persons), len(organization.departments),
-                        len(organization.anomalies))
+            self.store.save_cache(self.CACHE_KEY, organization.model_dump(mode="json"))
+            logger.info(
+                "organization_cache_refreshed persons=%d memberships=%d departments=%d anomalies=%d",
+                len(organization.persons),
+                sum(len(person.membership_list()) for person in organization.persons),
+                len(organization.departments), len(organization.anomalies))
             return organization
+
+    @staticmethod
+    def _sync_primary_membership(person: Person) -> None:
+        if not person.department_id:
+            person.memberships = [item for item in person.memberships if not item.primary]
+            return
+        primary = next((item for item in person.memberships if item.primary), None)
+        if primary is None:
+            person.memberships.insert(0, Membership(
+                department_id=person.department_id, role=person.role,
+                leader_id=person.leader_id, primary=True))
+            return
+        primary.department_id = person.department_id
+        primary.role = person.role
+        primary.leader_id = person.leader_id
 
     def add_person(self, person: Person) -> Organization:
         def mutate(organization: Organization) -> None:
             if any(item.person_id == person.person_id for item in organization.persons):
                 raise ValueError(f"人员 {person.person_id} 已存在")
+            self._sync_primary_membership(person)
             organization.persons.append(person)
 
         return self._mutate(mutate)
@@ -294,6 +421,7 @@ class OrganizationCache:
                 raise LookupError(f"人员 {person_id} 不存在")
             for field, value in changes.items():
                 setattr(person, field, value)
+            self._sync_primary_membership(person)
 
         return self._mutate(mutate)
 
@@ -316,7 +444,7 @@ class OrganizationCache:
             organization.team_leader_id = team_leaders[0] if len(team_leaders) == 1 else None
             organization.anomalies = OrganizationRepository._find_anomalies(
                 organization.departments, organization.persons)
-            self.store.save_cache("organization", organization.model_dump(mode="json"))
+            self.store.save_cache(self.CACHE_KEY, organization.model_dump(mode="json"))
             return organization
 
 
@@ -344,6 +472,66 @@ class LogRepository:
         for offset in range(0, len(updates), 500):
             self.bitable.batch_update(self.table.table_id, updates[offset:offset + 500])
         return len(updates)
+
+    def write_final_evaluations(self, snapshot) -> tuple[dict[str, str], dict[str, str]]:
+        """Idempotently merge each log's units into the 最终评价 column.
+
+        Returns ``(written, issues)``. Rows are only updated when the current
+        cell differs; failures are reported as issues and never raise.
+        """
+        written: dict[str, str] = {}
+        issues: dict[str, str] = {}
+        # Imported here to avoid an import cycle at module load:
+        # workflow1.workflow imports data.repositories.
+        from workflow1.final_evaluation import render_final_evaluation
+        field = self.table.fields.get("final_evaluation", "")
+        if not field.strip():
+            issues["final:field-not-configured"] = (
+                "日志表未配置「最终评价」字段映射，无法写回最终评价")
+            return written, issues
+        targets = []
+        for log in snapshot.logs:
+            if not log.source_record_id:
+                issues[f"final:{log.log_id}:missing-record"] = (
+                    f"日志 {log.log_id} 缺少原始飞书记录 ID，最终评价未写回")
+                continue
+            targets.append(log)
+        if not targets:
+            return written, issues
+        current: dict[str, str] = {}
+        try:
+            for record in self.bitable.list_records(self.table.table_id):
+                values = record_fields(record)
+                record_id = str(record.get("record_id", ""))
+                if record_id:
+                    current[record_id] = scalar(values.get(field))
+        except Exception as exc:
+            issues["final:read-failed"] = (
+                f"读取日志表现有最终评价失败：{exc}；本次不写回")
+            return written, issues
+        updates = []
+        for log in targets:
+            text = render_final_evaluation(snapshot, log.log_id)
+            if not text:
+                continue
+            if current.get(log.source_record_id, "") == text:
+                written[log.log_id] = text  # already identical, nothing to do
+                continue
+            updates.append((log.log_id, log.source_record_id, text))
+        for offset in range(0, len(updates), 500):
+            chunk = updates[offset:offset + 500]
+            try:
+                self.bitable.batch_update(self.table.table_id, [
+                    {"record_id": record_id, "fields": {field: text}}
+                    for _, record_id, text in chunk])
+            except Exception as exc:
+                for log_id, _, _text in chunk:
+                    issues[f"final:{log_id}:write-failed"] = (
+                        f"日志 {log_id} 的最终评价写回失败：{exc}")
+                continue
+            for log_id, _, text in chunk:
+                written[log_id] = text
+        return written, issues
 
     @stage_diagnostics("read_logs")
     def get_logs_by_date(
@@ -487,6 +675,8 @@ class LogRepository:
                         reflection=scalar(row["values"].get(f["reflection"])),
                         other=scalar(row["values"].get(f["other"])),
                         full_log=scalar(row["values"].get(f["full_log"])),
+                        final_evaluation=(scalar(row["values"].get(f["final_evaluation"]))
+                                          if f.get("final_evaluation") else ""),
                         achievement_refs=(json.loads(scalar(row["values"].get(f["achievement_refs"])) or "[]")
                             if f.get("achievement_refs") else []),
                         resources=([LogResource.model_validate(item) for item in

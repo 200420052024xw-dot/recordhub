@@ -23,13 +23,32 @@ SCOPE_BY_ROLE = {
     ROLE_LEADER: "all",
 }
 
+_ROLE_ORDER = (ROLE_LEADER, ROLE_MINISTER, ROLE_BACKBONE, ROLE_BASIC)
+
 
 def scope_of(role: str) -> str:
     return SCOPE_BY_ROLE.get(role, "self")
 
 
+def member_roles(person: Person) -> set[str]:
+    """All roles a person holds across memberships (primary role included)."""
+    roles = {item.role for item in person.membership_list()}
+    if person.role:
+        roles.add(person.role)
+    return roles
+
+
+def widest_scope(person: Person) -> str:
+    """Top-level scope: the widest among all membership roles."""
+    roles = member_roles(person)
+    for role in _ROLE_ORDER:
+        if role in roles:
+            return SCOPE_BY_ROLE[role]
+    return "self"
+
+
 class ScopeResolver:
-    """把「能查谁」和「这次查谁」都算成一组 person_id。"""
+    """把「能查谁」和「这次查谁」都算成一组 person_id。跨部门的人按全部成员关系取并集。"""
 
     def __init__(self, organization: Organization) -> None:
         self.organization = organization
@@ -37,26 +56,34 @@ class ScopeResolver:
         self._subordinates = organization.subordinates()
 
     def allowed_ids(self, person: Person) -> set[str]:
-        role = person.role
-        if role == ROLE_LEADER:
+        roles = member_roles(person)
+        if ROLE_LEADER in roles:
             return {item.person_id for item in self.organization.persons if item.active}
-        if role == ROLE_MINISTER:
-            same_department = {
-                item.person_id for item in self.organization.persons
-                if item.active and item.department_id == person.department_id}
-            return same_department | {person.person_id}
-        if role == ROLE_BACKBONE:
-            return self.direct_reports(person) | {person.person_id}
-        return {person.person_id}
+        ids = {person.person_id}
+        if ROLE_MINISTER in roles:
+            for department in self.organization.departments:
+                if department.minister_id == person.person_id and department.active:
+                    ids |= {item.person_id
+                            for item, _membership in self.organization.members_in_department(
+                                department.department_id)}
+            for membership in person.membership_list():
+                if membership.role == ROLE_MINISTER:
+                    ids |= {item.person_id
+                            for item, _membership in self.organization.members_in_department(
+                                membership.department_id)}
+        if ROLE_BACKBONE in roles:
+            ids |= self.direct_reports(person)
+        return ids
 
     def direct_reports(self, person: Person) -> set[str]:
         return {item.person_id
                 for item in self._subordinates.get(person.person_id, [])}
 
     def department_ids(self, person_ids: set[str]) -> set[str]:
-        return {self._people[pid].department_id
-                for pid in person_ids
-                if pid in self._people and self._people[pid].department_id}
+        departments: set[str] = set()
+        for pid in person_ids:
+            departments.update(self.organization.departments_of(pid))
+        return departments
 
     def resolve_target(self, target: Target | None, querier: Person) -> set[str]:
         target = target or Target()
@@ -80,7 +107,7 @@ class ScopeResolver:
 
     def _group(self, name: str | None) -> set[str]:
         matches = [item for item in self.organization.persons_named(name or "")
-                   if item.role == ROLE_BACKBONE]
+                   if ROLE_BACKBONE in member_roles(item)]
         if len(matches) != 1:
             raise QueryError(TARGET_NOT_FOUND)
         backbone = matches[0]
@@ -92,6 +119,6 @@ class ScopeResolver:
                    if wanted and item.active and item.name.strip() == wanted]
         if len(matches) != 1:
             raise QueryError(TARGET_NOT_FOUND)
-        department_id = matches[0].department_id
-        return {item.person_id for item in self.organization.persons
-                if item.active and item.department_id == department_id}
+        return {item.person_id
+                for item, _membership in self.organization.members_in_department(
+                    matches[0].department_id)}

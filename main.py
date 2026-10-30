@@ -32,6 +32,9 @@ def check_config(settings: AppSettings) -> int:
     missing = settings.missing_variables()
     table_config_error = ""
     workflow2_missing: list[str] = []
+    multi_department = False
+    final_evaluation_configured = False
+    warnings: list[str] = []
     try:
         tables = load_table_config(settings.table_config_path)
         required = ("stage_analysis", "stage_confirmation", "stage_report",
@@ -41,6 +44,12 @@ def check_config(settings: AppSettings) -> int:
                              if name not in tables.tables or not tables.tables[name].table_id]
         if not schedules.workflows["s05_people_suggestions"].options.get("form_url"):
             workflow2_missing.append("monthly_form_url")
+        membership_table = tables.tables.get("person_departments")
+        multi_department = bool(membership_table and membership_table.table_id.strip())
+        final_evaluation_configured = bool(
+            tables.tables["logs"].fields.get("final_evaluation", "").strip())
+        if not final_evaluation_configured:
+            warnings.append("日志表未配置「最终评价」字段，最终评价写回将被跳过")
     except ValueError as exc:
         table_config_error = str(exc)
     result = {
@@ -49,6 +58,9 @@ def check_config(settings: AppSettings) -> int:
         "missing_variables": missing,
         "table_config_error": table_config_error or None,
         "workflow2_missing": workflow2_missing,
+        "multi_department": multi_department,
+        "final_evaluation_configured": final_evaluation_configured,
+        "warnings": warnings,
         "feishu_base_url": settings.feishu.base_url,
         "deepseek_base_url": settings.deepseek.base_url,
         "deepseek_model": settings.deepseek.model,
@@ -102,6 +114,13 @@ def _main() -> int:
     finalize_parser.add_argument("--date", type=date.fromisoformat)
     flush_parser = subparsers.add_parser("flush-workbuddy")
     flush_parser.add_argument("--date", type=date.fromisoformat)
+    final_eval_parser = subparsers.add_parser("write-final-evaluations")
+    final_eval_parser.add_argument("--date", required=True, type=date.fromisoformat)
+    migrate_parser = subparsers.add_parser("migrate-state")
+    migrate_group = migrate_parser.add_mutually_exclusive_group(required=True)
+    migrate_group.add_argument("--date", type=date.fromisoformat)
+    migrate_group.add_argument("--before", type=date.fromisoformat)
+    migrate_group.add_argument("--all", action="store_true")
 
     refresh_parser = subparsers.add_parser("refresh-cache")
     refresh_parser.add_argument(
@@ -176,12 +195,37 @@ def _main() -> int:
         print(json.dumps({"date": target.isoformat(), "written": written,
                           "issues": issues}, ensure_ascii=False, indent=2))
         return 0
+    elif command == "write-final-evaluations":
+        result = workflow1.workflow.write_final_evaluations(args.date)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    elif command == "migrate-state":
+        if args.date:
+            dates = [args.date]
+        else:
+            dates = [run.target_date for run in workflow1.store.list_incomplete_workflows()
+                     if args.all or (args.before and run.target_date < args.before)]
+        migrated = []
+        skipped = []
+        for one in dates:
+            snapshot = workflow1.store.load_snapshot(one)
+            if snapshot is None:
+                skipped.append(one.isoformat())
+                continue
+            workflow1.store.save_snapshot(snapshot)
+            migrated.append({"date": one.isoformat(),
+                             "schema_version": snapshot.schema_version})
+        print(json.dumps({"migrated": migrated, "skipped": skipped},
+                         ensure_ascii=False, indent=2))
+        return 0
     elif command == "refresh-cache":
         payload: dict[str, object] = {}
         if args.cache in {"organization", "all"}:
             organization = runtime.organization_cache.refresh()
             payload["organization"] = {
                 "persons": len(organization.persons),
+                "memberships": sum(len(person.membership_list())
+                                   for person in organization.persons),
                 "departments": len(organization.departments),
                 "anomalies": organization.anomalies,
             }

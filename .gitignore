@@ -25,6 +25,10 @@ logs/
 # Local recovery archives (may contain full Git history and local configuration)
 /local-backups/
 
+# Personnel import backups and spreadsheets may contain names, phones and ID numbers
+data/backups/
+*.xlsx
+
 # 交付给 WorkBuddy 的入口文档:含接口 token,不进版本库。
 docs/skill-template/
 docs/skill-query/SKILL.md

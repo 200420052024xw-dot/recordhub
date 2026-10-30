@@ -107,7 +107,10 @@ class StageReader:
                 owner = self._people.get(owner_id)
                 if owner is None:
                     continue
-                department_id = owner.department_id
+                # 任务编号形如 {run_id}:{department_id}；同一部长跨部门时以任务
+                # 指定的部门为准，而不是人员的单值主部门。
+                department_id = (task_id.rsplit(":", 1)[-1]
+                                 if ":" in task_id else owner.department_id)
                 if department_ids is not None and department_id not in department_ids:
                     continue
                 department = self._departments.get(department_id or "")

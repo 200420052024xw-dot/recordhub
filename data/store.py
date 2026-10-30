@@ -46,12 +46,14 @@ class FileStateStore:
         *,
         workflow_type: str = "workflow1",
         snapshot_model: type | None = None,
+        snapshot_migrator: Callable[[Any], Any] | None = None,
     ) -> None:
         self.root = Path(root)
         self.workflow_type = workflow_type
         self.runs_dir = self.root / workflow_type
         self.checked_dir = self.root / "checked" / workflow_type
         self._snapshot_model = snapshot_model
+        self._snapshot_migrator = snapshot_migrator
         self._lock = threading.RLock()
         self._migrate_legacy_layout()
 
@@ -91,6 +93,12 @@ class FileStateStore:
                 "FileStateStore was created without snapshot_model"
             )
         return self._snapshot_model
+
+    def _load_snapshot_model(self, raw: dict[str, Any]) -> Any:
+        snapshot = self._snapshot_class().model_validate(raw)
+        if self._snapshot_migrator is not None:
+            snapshot = self._snapshot_migrator(snapshot)
+        return snapshot
 
     def get_or_create_workflow(self, target_date: date) -> WorkflowRun:
         with self._lock:
@@ -205,7 +213,7 @@ class FileStateStore:
         with self._lock:
             document = self._load_document(target_date)
             raw = document.get("snapshot")
-            return self._snapshot_class().model_validate(raw) if raw else None
+            return self._load_snapshot_model(raw) if raw else None
 
     def load_check_snapshot(self, target_date: date) -> Any:
         with self._lock:
@@ -218,7 +226,7 @@ class FileStateStore:
             if document.get("schema_version") != self.schema_version:
                 raise WorkflowStateError(f"Unsupported checked state schema in {path}")
             raw = document.get("snapshot")
-            return self._snapshot_class().model_validate(raw) if raw else None
+            return self._load_snapshot_model(raw) if raw else None
 
     def update_snapshot(
         self, target_date: date, mutator: Callable[[Any], T]
@@ -227,7 +235,7 @@ class FileStateStore:
             raw = document.get("snapshot")
             if raw is None:
                 raise WorkflowStateError(f"Snapshot is missing for {target_date}")
-            snapshot = self._snapshot_class().model_validate(raw)
+            snapshot = self._load_snapshot_model(raw)
             result = mutator(snapshot)
             snapshot.updated_at = utc_now()
             document["snapshot"] = snapshot.model_dump(mode="json")

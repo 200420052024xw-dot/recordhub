@@ -572,18 +572,20 @@ class Workflow2:
         """
         if kind == "stage":
             return [None]
-        students = [person for person in organization.persons if person.active
-                    and person.role in {"基层学生", "骨干学生"}
-                    and person.department_id == department.department_id]
+        dept_members = organization.members_in_department(
+            department.department_id, roles={"基层学生", "骨干学生"})
         groups: list[list[str]] = []
         assigned: set[str] = set()
-        for core in [person for person in students if person.role == "骨干学生"]:
+        for core, membership in dept_members:
+            if membership.role != "骨干学生":
+                continue
             members = [core.person_id] + [
-                person.person_id for person in students
-                if person.role == "基层学生" and person.leader_id == core.person_id]
+                person.person_id for person, other in dept_members
+                if other.role == "基层学生" and other.leader_id == core.person_id]
             assigned.update(members)
             groups.append(members)
-        orphans = [person.person_id for person in students if person.person_id not in assigned]
+        orphans = [person.person_id for person, _membership in dept_members
+                   if person.person_id not in assigned]
         if orphans:
             groups.append(orphans)
         return groups or [None]
@@ -739,7 +741,12 @@ class Workflow2:
                 template=Path("prompts/S10.txt").read_text(encoding="utf-8").strip(),
                 input_data=data, output_model=SUMMARY_MODELS[code],
                 semantic_validator=validate, array_root=True)
-            run.team_results[code] = {"content": output.model_dump(mode="json")}
+            content = output.model_dump(mode="json")
+            for item in content.get("items", []):
+                for key in ("contributors", "proposers"):
+                    if isinstance(item.get(key), list):
+                        item[key] = list(dict.fromkeys(item[key]))
+            run.team_results[code] = {"content": content}
             self.store.save(run)
     @stage_diagnostics("generate_documents")
     def _documents(self, run: CycleRun, organization: Organization) -> None:

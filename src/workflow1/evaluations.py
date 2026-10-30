@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 
 from data.store import FileStateStore
@@ -14,13 +15,44 @@ from tool.bitable_fields import (
     scalar,
 )
 from schema import FinalEvaluation, TableConfig
-from workflow1.models import DailySnapshot, UnitStatus
+from workflow1.models import AiEvaluationState, DailySnapshot, UnitStatus
+from workflow1.units import (
+    ai_for,
+    evaluation_table_for,
+    unit_key,
+    units_for_log,
+)
 from tool.feishu import BitableService
 from tool.diagnostics import stage_diagnostics
 
 
+def ai_key(target_date: date, log_id: str) -> str:
+    return f"{target_date.isoformat()}:AI:{log_id}"
+
+
+def human_key(target_date: date, evaluator_id: str, log_id: str) -> str:
+    return f"{target_date.isoformat()}:HUMAN:{evaluator_id}:{log_id}"
+
+
 def evaluation_key(target_date: date, evaluator_id: str, log_id: str) -> str:
+    """Legacy v2 key, kept for reading existing rows."""
     return f"{target_date.isoformat()}:EVAL:{evaluator_id}:{log_id}"
+
+
+def parse_evaluation_key(raw: str) -> tuple[date, str | None, str] | None:
+    """Return ``(date, evaluator_id_or_None, log_id)``; ``None`` if malformed."""
+    parts = raw.split(":")
+    if len(parts) == 3 and parts[1] == "AI":
+        try:
+            return date.fromisoformat(parts[0]), None, parts[2]
+        except ValueError:
+            return None
+    if len(parts) == 4 and parts[1] in {"HUMAN", "EVAL"}:
+        try:
+            return date.fromisoformat(parts[0]), parts[2], parts[3]
+        except ValueError:
+            return None
+    return None
 
 
 def review_day_datetime(target_date: date) -> datetime:
@@ -31,6 +63,19 @@ def review_day_datetime(target_date: date) -> datetime:
 
 def review_day_timestamp(target_date: date) -> int:
     return int(review_day_datetime(target_date).timestamp() * 1000)
+
+
+def _primary_evaluator(snapshot: DailySnapshot, log_id: str) -> str:
+    units = units_for_log(snapshot, log_id)
+    if not units:
+        return ""
+    evaluator_ids = {unit.evaluator_id for unit in units}
+    person = snapshot.organization.person_map().get(units[0].person_id)
+    if person is not None:
+        for membership in person.membership_list():
+            if membership.primary and membership.leader_id in evaluator_ids:
+                return membership.leader_id or ""
+    return min(evaluator_ids)
 
 
 class AiEvaluationRepository:
@@ -49,7 +94,7 @@ class AiEvaluationRepository:
         }
         updates = []
         for log in snapshot.logs:
-            state = snapshot.log_evaluations.get(log.log_id)
+            state = snapshot.ai_evaluations.get(log.log_id)
             if state is None or not state.record_id:
                 continue
             record = records.get(state.record_id)
@@ -66,12 +111,11 @@ class AiEvaluationRepository:
     def publish(
         self, snapshot: DailySnapshot
     ) -> tuple[dict[str, tuple[str, str]], dict[str, str]]:
-        """Idempotently write AI rows plus 未填写日志 marker rows.
+        """Idempotently write one AI row per log plus missing-log markers.
 
-        Reentrant: units already mapped (``record_id`` set), units still
-        waiting on the LLM, and failed units (already in the issue ledger)
-        are skipped. Rows missing a party's OpenID are skipped and reported
-        through the returned issues instead of failing the whole day.
+        v3 AI keys are ``{date}:AI:{log_id}``.  Existing v2 rows keyed by
+        ``{date}:EVAL:{evaluator_id}:{log_id}`` are reused by ``(date, log_id)``
+        instead of creating a second AI row for the same log.
         """
         f = self.table.fields
         business_field = f.get("business_key")
@@ -81,6 +125,7 @@ class AiEvaluationRepository:
         existing = self.bitable.list_records(self.table.table_id)
         existing_by_id = {str(record.get("record_id", "")): record for record in existing}
         by_evaluation: dict[str, tuple[str, str]] = {}
+        legacy_by_log: dict[tuple[date, str], list[tuple[str, str, str]]] = defaultdict(list)
         duplicate_keys: set[str] = set()
         evaluated_at = review_day_timestamp(snapshot.target_date)
         for record in existing:
@@ -94,39 +139,47 @@ class AiEvaluationRepository:
                 if business_id in by_evaluation:
                     duplicate_keys.add(business_id)
                 by_evaluation[business_id] = (record_id, evaluation_id)
+                parsed = parse_evaluation_key(business_id)
+                if parsed is not None and parsed[1] is not None:
+                    day, evaluator_id, log_id = parsed
+                    legacy_by_log[(day, log_id)].append(
+                        (record_id, evaluation_id, evaluator_id or ""))
         mapped: dict[str, tuple[str, str]] = {}
         # log_id is None for marker rows, which need no local mapping.
         creates: list[tuple[str | None, dict]] = []
-        for state in snapshot.log_evaluations.values():
+        for log_id, state in snapshot.ai_evaluations.items():
+            log = logs.get(log_id)
+            if log is None:
+                continue
+            person = people[log.person_id]
             if state.record_id:
-                person = people[state.person_id]
                 record = existing_by_id.get(state.record_id)
-                if (record and person.role == "基层学生" and f.get("person_name")
-                        and scalar(record_fields(record).get(f["person_name"])).strip()
-                        != person.name):
-                    self.bitable.update_record(self.table.table_id, state.record_id,
-                                               {f["person_name"]: person.name})
-                continue
-            if not state.evaluator_id or state.status == UnitStatus.FAILED:
-                continue
+                if record is not None:
+                    current = record_fields(record)
+                    updates = {}
+                    if scalar(current.get(f["source_log"])) != log.content():
+                        updates[f["source_log"]] = log.content()
+                    if (person.role == "基层学生" and f.get("person_name")
+                            and scalar(current.get(f["person_name"])).strip() != person.name):
+                        updates[f["person_name"]] = person.name
+                    if updates:
+                        self.bitable.update_record(self.table.table_id,
+                                                   state.record_id, updates)
+                    evaluation_id = state.evaluation_id or scalar(
+                        current.get(f["evaluation_id"]))
+                    mapped[log_id] = (state.record_id, evaluation_id)
+                    continue
             if state.status not in {UnitStatus.WAITING_CONFIRMATION,
                                     UnitStatus.CONFIRMED}:
                 continue
-            log = logs[state.log_id]
-            person = people[state.person_id]
-            evaluator = people[state.evaluator_id]
             if not log.source_record_id:
                 raise ValueError(f"日志 {log.log_id} 缺少原始飞书记录 ID")
-            if (person.role != "基层学生" and not person.open_id) or not evaluator.open_id:
-                missing_id = state.person_id if not person.open_id and person.role != "基层学生" else state.evaluator_id
-                role = "提交人" if missing_id == state.person_id else "评价人"
-                who = people[missing_id]
-                issues[f"person:{missing_id}:missing-open-id"] = (
-                    f"日志 {log.log_id} 的{role}「{who.name}」缺少 OpenID，"
+            if person.role != "基层学生" and not person.open_id:
+                issues[f"person:{person.person_id}:missing-open-id"] = (
+                    f"日志 {log.log_id} 的提交人「{person.name}」缺少 OpenID，"
                     "AI 评价行未写回，请补录后调用重评接口")
                 continue
-            key = evaluation_key(
-                snapshot.target_date, state.evaluator_id, state.log_id)
+            key = ai_key(snapshot.target_date, log_id)
             if key in duplicate_keys:
                 raise ValueError(f"AI 评价业务编号 {key} 存在重复记录")
             hit = by_evaluation.get(key)
@@ -140,14 +193,32 @@ class AiEvaluationRepository:
                     updates[f["person_name"]] = person.name
                 if updates:
                     self.bitable.update_record(self.table.table_id, hit[0], updates)
-                mapped[state.log_id] = hit
+                mapped[log_id] = hit
                 continue
-            # Equal log text does not identify a submission, day, or evaluator.
-            # Only a saved record ID or the full business key can reclaim a row.
+            legacy = legacy_by_log.get((snapshot.target_date, log_id), [])
+            if legacy:
+                primary = _primary_evaluator(snapshot, log_id)
+                chosen = next((row for row in legacy if row[2] == primary), None)
+                chosen = chosen or min(legacy, key=lambda row: row[2])
+                if len(legacy) > 1:
+                    issues[f"log:{log_id}:legacy-ai-duplicate"] = (
+                        f"日志 {log_id} 存在多条旧 EVAL AI 评价行，已复用 "
+                        f"{chosen[0]}，其余请人工核对")
+                current = record_fields(existing_by_id[chosen[0]])
+                updates = {}
+                if scalar(current.get(f["source_log"])) != log.content():
+                    updates[f["source_log"]] = log.content()
+                if person.role == "基层学生" and f.get("person_name") and (
+                        scalar(current.get(f["person_name"])).strip() != person.name):
+                    updates[f["person_name"]] = person.name
+                if updates:
+                    self.bitable.update_record(self.table.table_id, chosen[0], updates)
+                mapped[log_id] = (chosen[0], chosen[1])
+                continue
             identity = ({f["person_name"]: person.name}
                         if person.role == "基层学生" and f.get("person_name")
                         else {f["person_ref"]: [{"id": person.open_id}]})
-            creates.append((state.log_id, {
+            creates.append((log_id, {
                 business_field or f["evaluation_id"]: key,
                 **identity,
                 f["source_log"]: log.content(),
@@ -253,6 +324,11 @@ class HumanEvaluationRepository:
                    for record in self.bitable.list_records(table.table_id)]
         return [record for record in records if self._within_window(snapshot, record)]
 
+    def _table_name(self, record: dict) -> str:
+        table = self._record_table(record)
+        return next(name for name, item in self.tables.items()
+                    if item.table_id == table.table_id)
+
     def parse(self, snapshot: DailySnapshot,
               record: dict) -> tuple[str, FinalEvaluation] | None:
         f = self._record_table(record).fields
@@ -262,31 +338,48 @@ class HumanEvaluationRepository:
         evaluation_id = scalar(values.get(f["evaluation_id"]))
         if not evaluation_id:
             return None
-        matches = [state for state in snapshot.log_evaluations.values()
-                   if state.evaluation_id == evaluation_id]
-        if not matches:
-            # Explicit business keys must never fall back to a different log.
-            if ":EVAL:" in evaluation_id:
+        people = snapshot.organization.person_map()
+        logs = {log.log_id: log for log in snapshot.logs}
+        table_name = self._table_name(record)
+        expected_role = ("基层学生" if table_name.endswith("_backbone")
+                         else "骨干学生")
+        parsed = parse_evaluation_key(evaluation_id)
+        if parsed is not None:
+            day, evaluator_id, log_id = parsed
+            if day != snapshot.target_date or evaluator_id is None:
                 return None
-            people = snapshot.organization.person_map()
+            unit = snapshot.evaluation_units.get(unit_key(log_id, evaluator_id))
+            matches = [unit] if unit is not None else []
+            if not matches:
+                return None
+        else:
             authors = set(references(values.get(f["submitted_by"])))
             original = scalar(values.get(f.get("source_log", ""))).strip()
-            logs = {log.log_id: log for log in snapshot.logs}
-            matches = [state for state in snapshot.log_evaluations.values()
-                       if state.evaluator_id
-                       and self._matches_person(values, f, people[state.person_id])
-                       and people[state.evaluator_id].open_id in authors
-                       and (not original or (state.log_id in logs
-                            and logs[state.log_id].content().strip() == original))]
+            matches = []
+            for unit in snapshot.evaluation_units.values():
+                person = people.get(unit.person_id)
+                evaluator = people.get(unit.evaluator_id)
+                if person is None or evaluator is None:
+                    continue
+                if not self._matches_person(values, f, person, expected_role):
+                    continue
+                if not self._matches_author(authors, evaluator):
+                    continue
+                if original and logs[unit.log_id].content().strip() != original:
+                    continue
+                if evaluation_table_for(unit, snapshot.organization) != table_name:
+                    continue
+                matches.append(unit)
             if not matches:
                 return None
         if len(matches) != 1:
-            raise ValueError(f"人工评价 {evaluation_id} 无法唯一对应当日一条日志")
-        state = matches[0]
-        people = snapshot.organization.person_map()
-        person = people[state.person_id]
-        evaluator = people[state.evaluator_id]
-        if not self._matches_person(values, f, person):
+            raise ValueError(f"人工评价 {evaluation_id} 无法唯一对应当日评价单元")
+        unit = matches[0]
+        person = people.get(unit.person_id)
+        evaluator = people.get(unit.evaluator_id)
+        if person is None or evaluator is None:
+            return None
+        if not self._matches_person(values, f, person, expected_role):
             raise ValueError(f"人工评价 {evaluation_id} 的被审核人与快照不符")
         evaluator_refs = set(references(values.get(f.get("evaluator_ref", ""))))
         if evaluator_refs and not evaluator_refs.intersection(
@@ -294,10 +387,10 @@ class HumanEvaluationRepository:
                  evaluator.source_record_id}):
             raise ValueError(f"人工评价 {evaluation_id} 的 evaluator_ref 与快照不符")
         authors = set(references(values.get(f["submitted_by"])))
-        allowed = {evaluator.person_id, evaluator.name,
-                   evaluator.open_id, evaluator.source_record_id}
-        if not authors.intersection(allowed):
+        if not self._matches_author(authors, evaluator):
             raise ValueError(f"人工评价 {evaluation_id} 的填写人不是直属评价人")
+        if evaluation_table_for(unit, snapshot.organization) != table_name:
+            raise ValueError(f"人工评价 {evaluation_id} 与评价单元的表类型不符")
         positive_flag = scalar(values.get(f["positive_confirmed"])).strip() if f.get("positive_confirmed") else ""
         improvement_flag = scalar(values.get(f["improvement_confirmed"])).strip() if f.get("improvement_confirmed") else ""
         if f.get("positive_confirmed") and f.get("improvement_confirmed"):
@@ -306,22 +399,33 @@ class HumanEvaluationRepository:
             allowed = {"确认无误", "需修改"}
             if positive_flag not in allowed or improvement_flag not in allowed:
                 raise ValueError(f"人工评价 {evaluation_id} 的确认选项无效")
-            positive = (state.positive_ai or "") if positive_flag == "确认无误" else scalar(values.get(f["positive_final"])).strip()
-            improvement = (state.improvement_ai or "") if improvement_flag == "确认无误" else scalar(values.get(f["improvement_final"])).strip()
+            ai = ai_for(snapshot, unit.log_id)
+            positive = ((ai.positive_ai or "") if positive_flag == "确认无误"
+                        else scalar(values.get(f["positive_final"])).strip())
+            improvement = ((ai.improvement_ai or "") if improvement_flag == "确认无误"
+                           else scalar(values.get(f["improvement_final"])).strip())
         else:
             positive = scalar(values.get(f["positive_final"])).strip()
             improvement = scalar(values.get(f["improvement_final"])).strip()
         if not positive or not improvement:
             return None
-        key = evaluation_key(snapshot.target_date, state.evaluator_id, state.log_id)
+        key = unit_key(unit.log_id, unit.evaluator_id)
         return key, FinalEvaluation(
-            person_id=state.person_id, log_id=state.log_id,
-            evaluator_id=state.evaluator_id, positive=positive,
+            person_id=unit.person_id, log_id=unit.log_id,
+            evaluator_id=unit.evaluator_id, positive=positive,
             improvement=improvement, source="HUMAN")
 
     @staticmethod
-    def _matches_person(values: dict, fields: dict, person) -> bool:
-        if person.role == "基层学生" and fields.get("basic_name"):
+    def _matches_author(authors: set[str], person) -> bool:
+        return bool(authors.intersection(
+            {person.person_id, person.name, person.open_id or "",
+             person.source_record_id or ""}))
+
+    @staticmethod
+    def _matches_person(values: dict, fields: dict, person,
+                        role: str | None = None) -> bool:
+        role = role or person.role
+        if role == "基层学生" and fields.get("basic_name"):
             name = scalar(values.get(fields["basic_name"])).strip()
             return bool(name and name == person.name
                         and not references(values.get(fields.get("backbone_ref", ""))))

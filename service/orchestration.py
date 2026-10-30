@@ -167,21 +167,24 @@ class Orchestrator:
                 if payload.get("logs"):
                     def reopen(snapshot):
                         for key in payload["logs"]:
-                            state = snapshot.log_evaluations[key]
-                            if state.status == UnitStatus.FAILED:
+                            state = snapshot.ai_evaluations.get(key)
+                            if state is not None and state.status == UnitStatus.FAILED:
                                 state.status, state.error, state.retry_after = UnitStatus.PENDING, None, None
+                            for unit in snapshot.evaluation_units.values():
+                                if unit.log_id == key and unit.status == UnitStatus.FAILED:
+                                    unit.status, unit.error = UnitStatus.PENDING, None
                     workflow.store.update_snapshot(day, reopen)
                 result = workflow.start(day)
                 if result.status == "FAILED":
                     raise ValueError(result.last_error)
                 snapshot = workflow.store.load_snapshot(day)
                 if snapshot:
-                    pending = [s.log_id for s in snapshot.log_evaluations.values()
+                    pending = [s.log_id for s in snapshot.ai_evaluations.values()
                                if s.status in {UnitStatus.PENDING, UnitStatus.RUNNING}]
                     if pending:
                         self.book("daily_generate", dict(payload, logs=pending), utc_now(), lane="ai",
                                   expires=workflow.prompt_service.deadline, suffix="batch:" + ",".join(pending), retry=True)
-                    for state in snapshot.log_evaluations.values():
+                    for state in snapshot.ai_evaluations.values():
                         if state.status == UnitStatus.FAILED and state.retry_after:
                             when = state.retry_after
                             self.book("daily_generate", dict(payload, logs=[state.log_id]), when, lane="ai",

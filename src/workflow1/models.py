@@ -48,10 +48,30 @@ class LogPromptOutput(StrictModel):
         return self
 
 
+class AiEvaluationState(StrictModel):
+    """One AI evaluation per log, independent of evaluators."""
+
+    log_id: str
+    status: UnitStatus = UnitStatus.PENDING
+    positive_ai: str | None = None
+    improvement_ai: str | None = None
+    record_id: str | None = None
+    evaluation_id: str | None = None
+    evaluated_at: datetime | None = None
+    ai_evaluated_at: datetime | None = None
+    prompt_source: Literal["TABLE", "BUILTIN"] | None = None
+    prompt_record_id: str | None = None
+    error: str | None = None
+    retry_count: int = 0
+    retry_after: datetime | None = None
+    fallback: str = ""
+
+
 class LogEvaluationState(StrictModel):
     log_id: str
     person_id: str
     evaluator_id: str
+    department_ids: list[str] = Field(default_factory=list)
     status: UnitStatus = UnitStatus.PENDING
     positive_ai: str | None = None
     improvement_ai: str | None = None
@@ -77,19 +97,25 @@ class LogEvaluationState(StrictModel):
 class EvaluatorProgress(StrictModel):
     evaluator_id: str
     log_ids: list[str] = Field(default_factory=list)
+    unit_keys: list[str] = Field(default_factory=list)
     notified: bool = False
     closed: bool = False
 
 
 class DailySnapshot(StrictModel):
-    schema_version: int = 2
+    schema_version: int = 3
     workflow_run_id: str
     target_date: date
     organization: Organization
     logs: list[WorkLog]
     submission_status: dict[str, SubmissionStatus]
+    # v2 compatibility: populated only while loading/migrating old snapshots.
     log_evaluations: dict[str, LogEvaluationState] = Field(default_factory=dict)
+    ai_evaluations: dict[str, AiEvaluationState] = Field(default_factory=dict)
+    evaluation_units: dict[str, LogEvaluationState] = Field(default_factory=dict)
     evaluators: dict[str, EvaluatorProgress] = Field(default_factory=dict)
+    final_evaluations: dict[str, str] = Field(default_factory=dict)
+    final_evaluations_written_at: dict[str, datetime] = Field(default_factory=dict)
     cloud_objects: dict[str, CloudObject] = Field(default_factory=dict)
     evaluations_published: bool = False
     issues: dict[str, str] = Field(default_factory=dict)

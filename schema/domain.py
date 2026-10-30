@@ -10,16 +10,39 @@ from pydantic import Field, field_validator, model_validator
 from schema.base import StrictModel, TableDefinition
 
 
+class Membership(StrictModel):
+    """A person's role in one department.
+
+    Primary membership is mirrored on ``Person.department_id/leader_id/role``
+    for backward compatibility; extra departments live only here.
+    """
+
+    department_id: str
+    role: str
+    leader_id: str | None = None
+    primary: bool = False
+
+
 class Person(StrictModel):
     person_id: str
     name: str
     role: str
     department_id: str | None = None
     leader_id: str | None = None
+    memberships: list[Membership] = Field(default_factory=list)
     open_id: str | None = None
     mobile: str | None = None
     source_record_id: str | None = None
     active: bool = True
+
+    def membership_list(self) -> list[Membership]:
+        """All memberships, synthesizing the primary one for legacy data."""
+        if self.memberships:
+            return self.memberships
+        if not self.department_id:
+            return []
+        return [Membership(department_id=self.department_id, role=self.role,
+                           leader_id=self.leader_id, primary=True)]
 
 
 class Department(StrictModel):
@@ -42,13 +65,77 @@ class Organization(StrictModel):
     def department_map(self) -> dict[str, Department]:
         return {department.department_id: department for department in self.departments}
 
-    def subordinates(self) -> dict[str, list[Person]]:
-        result: dict[str, list[Person]] = {}
+    def memberships_of(self, person_id: str) -> list[Membership]:
+        person = self.person_map().get(person_id)
+        return person.membership_list() if person else []
+
+    def membership(self, person_id: str, department_id: str) -> Membership | None:
+        for item in self.memberships_of(person_id):
+            if item.department_id == department_id:
+                return item
+        return None
+
+    def person_in_department(self, person_id: str,
+                             department_id: str) -> Person | None:
+        person = self.person_map().get(person_id)
+        return person if person and self.membership(person_id, department_id) else None
+
+    def departments_of(self, person_id: str) -> list[str]:
+        return [item.department_id for item in self.memberships_of(person_id)]
+
+    def evaluator_for(self, person_id: str, department_id: str) -> str | None:
+        item = self.membership(person_id, department_id)
+        return item.leader_id if item else None
+
+    def members_in_department(self, department_id: str,
+                              roles: set[str] | None = None) -> list[tuple[Person, Membership]]:
+        result: list[tuple[Person, Membership]] = []
         for person in self.persons:
-            if person.active and person.leader_id:
-                result.setdefault(person.leader_id, []).append(person)
-        for people in result.values():
-            people.sort(key=lambda item: item.person_id)
+            if not person.active:
+                continue
+            for item in person.membership_list():
+                if item.department_id != department_id:
+                    continue
+                if roles is not None and item.role not in roles:
+                    continue
+                result.append((person, item))
+        result.sort(key=lambda pair: pair[0].person_id)
+        return result
+
+    def reports_of(self, evaluator_id: str,
+                   department_id: str | None = None) -> list[tuple[Person, Membership]]:
+        result: list[tuple[Person, Membership]] = []
+        for person in self.persons:
+            if not person.active:
+                continue
+            for item in person.membership_list():
+                if item.leader_id != evaluator_id:
+                    continue
+                if department_id is not None and item.department_id != department_id:
+                    continue
+                result.append((person, item))
+        result.sort(key=lambda pair: pair[0].person_id)
+        return result
+
+    def subordinates(self) -> dict[str, list[Person]]:
+        """Direct reports across all memberships, deduplicated by person."""
+        grouped: dict[str, list[Person]] = {}
+        for person in self.persons:
+            if not person.active:
+                continue
+            for item in person.membership_list():
+                if item.leader_id:
+                    grouped.setdefault(item.leader_id, []).append(person)
+        result: dict[str, list[Person]] = {}
+        for leader_id, people in grouped.items():
+            seen: set[str] = set()
+            unique = []
+            for person in people:
+                if person.person_id not in seen:
+                    seen.add(person.person_id)
+                    unique.append(person)
+            unique.sort(key=lambda item: item.person_id)
+            result[leader_id] = unique
         return result
 
     def persons_named(self, name: str) -> list[Person]:
@@ -87,6 +174,7 @@ class WorkLog(StrictModel):
     reflection: str = ""
     other: str = ""
     full_log: str = ""
+    final_evaluation: str = ""
     achievement_refs: list[str] = Field(default_factory=list)
     resources: list[LogResource] = Field(default_factory=list)
 
@@ -165,12 +253,18 @@ class PersonCreateRequest(StrictModel):
         return self
 
     def to_person(self) -> Person:
+        department_id = (self.department_id or "").strip() or None
+        leader_id = (self.leader_id or "").strip() or None
+        role = self.role.strip()
         return Person(
             person_id=self.person_id.strip(),
             name=self.name.strip(),
-            role=self.role.strip(),
-            department_id=(self.department_id or "").strip() or None,
-            leader_id=(self.leader_id or "").strip() or None,
+            role=role,
+            department_id=department_id,
+            leader_id=leader_id,
+            memberships=([Membership(department_id=department_id, role=role,
+                                     leader_id=leader_id, primary=True)]
+                         if department_id else []),
             open_id=(self.open_id or "").strip() or None,
             active=self.active,
         )

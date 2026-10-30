@@ -17,7 +17,19 @@ role = "角色"
 leader_ref = "直属上级"
 minister_ref = "本部部长"
 department_ref = "所属部门"
-remark = "备注"
+mobile = "手机号"
+
+# Optional: one row per extra department for a person（飞书表：跨部门人员信息）。
+# 填上真实 table_id 才启用多部门；留空/删除本节则保持单部门。
+[tables.person_departments]
+table_id = "tblGr5O7GOduYP70"
+[tables.person_departments.fields]
+person_ref = "人员编号"
+name = "姓名"
+role = "角色"
+leader_ref = "直属上级"
+minister_ref = "本部部长"
+department_ref = "所属部门"
 mobile = "手机号"
 
 [tables.logs]
@@ -32,6 +44,7 @@ difficulties = "工作困难："
 reflection = "心得反思："
 other = "其他："
 full_log = "完整日志"
+final_evaluation = "最终评价"
 
 # ---------- Workflow1 output and confirmation tables ----------
 
@@ -77,6 +90,7 @@ improvement_confirmed = "需改进之处_AI是否确认："
 table_id = "tblHG8enRcoNwdqv"
 [tables.check_details.fields]
 title = "文本"
+department = "部门"
 reporter_ref = "报告人"
 role = "角色"
 reported_at = "报告时间"

@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from data.store import FileStateStore
 from schema import CloudObject, Department, Person
 from workflow1.models import DailySnapshot, UnitStatus
+from workflow1.units import effective_text, units_closed_for, units_for_log
 from tool.cloud_docs import CloudDocsService, divider_block, text_block
 from tool.diagnostics import stage_diagnostics
 
@@ -33,8 +34,8 @@ def department_doc_title(target_date: date, department: Department) -> str:
     return f"{target_date:%m-%d} {department.name}日志"
 
 
-def group_doc_title(target_date: date, backbone: Person) -> str:
-    return f"{target_date:%m-%d} {backbone.name}同学小组日志"
+def group_doc_title(target_date: date, department_name: str, backbone: Person) -> str:
+    return f"{target_date:%m-%d} {department_name}·{backbone.name}同学小组日志"
 
 
 class DailyDocuments:
@@ -157,39 +158,52 @@ class DailyDocuments:
         return blocks
 
     def _evaluation_blocks(self, snapshot: DailySnapshot,
-                           state) -> list[dict]:
-        if state is None:
+                           unit) -> list[dict]:
+        if unit is None:
             return [text_block("未评价")]
-        if state.status == UnitStatus.FAILED:
-            return [text_block("-评价：评价生成失败（可重评）")]
         people = snapshot.organization.person_map()
-        if state.source == "HUMAN" and state.evaluator_id in people:
-            evaluator = people[state.evaluator_id]
-            label = f"-评价人：{evaluator.name}，{evaluator.role}"
-        elif state.manual_skipped:
+        source, positive, improvement = effective_text(snapshot, unit)
+        evaluator = people.get(unit.evaluator_id)
+        if source == "FAILED" or unit.status == UnitStatus.FAILED:
+            return [text_block("-评价：评价生成失败（可重评）")]
+        if source == "HUMAN" and evaluator is not None:
+            role = evaluator.role
+            membership = snapshot.organization.membership(
+                unit.evaluator_id, unit.department_ids[0]) if unit.department_ids else None
+            if membership is not None:
+                role = membership.role
+            label = f"-评价人：{evaluator.name}，{role}"
+        elif unit.manual_skipped:
             label = "-评价人：系统AI（人工未评价）"
         else:
             label = "-评价人：系统AI"
         blocks = [text_block(label)]
-        if state.evaluated_at is not None:
-            blocks.append(text_block(f"-评价时间：{self._datetime_line(state.evaluated_at)}"))
-        blocks.append(text_block(f"-肯定之处：{state.positive_final or '无'}"))
-        if state.fallback == "unparsed":
+        evaluated_at = unit.confirmed_at or unit.evaluated_at
+        if evaluated_at is not None:
+            blocks.append(text_block(f"-评价时间：{self._datetime_line(evaluated_at)}"))
+        blocks.append(text_block(f"-肯定之处：{positive or '无'}"))
+        if unit.fallback == "unparsed" and source != "HUMAN":
             # 「详情见肯定之处」是给填表人看的指路话，报告里只写内容本身，不写这句标记。
             return blocks
-        blocks.append(text_block(f"-改进之处：{state.improvement_final or '无'}"))
+        blocks.append(text_block(f"-改进之处：{improvement or '无'}"))
         return blocks
 
     def _person_blocks(self, snapshot: DailySnapshot, person: Person,
-                       departments: dict[str, Department]) -> list[dict]:
-        department = departments.get(person.department_id or "")
+                       department: Department | None,
+                       department_id: str | None = None) -> list[dict]:
+        organization = snapshot.organization
+        membership = (organization.membership(person.person_id, department_id)
+                      if department_id else None)
+        if membership is None:
+            membership = next(iter(person.membership_list()), None)
+        role = membership.role if membership is not None else person.role
         dept_line = (f"-所属部门：{department.department_id}·{department.name}"
                      if department else "-所属部门：无")
         blocks = [
             text_block(f"{person.name}的日志", heading=3),
             text_block(dept_line),
-            text_block(f"-角色：{person.role}"),
-            text_block(f"-是否为骨干：{self._backbone_flag(person.role)}"),
+            text_block(f"-角色：{role}"),
+            text_block(f"-是否为骨干：{self._backbone_flag(role)}"),
             text_block(f"-时间：{self._date_line(snapshot.target_date)}"),
         ]
         logs = sorted((log for log in snapshot.logs if log.person_id == person.person_id),
@@ -208,8 +222,15 @@ class DailyDocuments:
                 if chunk.strip():
                     blocks.append(text_block(chunk))
             blocks.append(text_block("评价", heading=4))
-            blocks.extend(self._evaluation_blocks(
-                snapshot, snapshot.log_evaluations.get(log.log_id)))
+            units = units_for_log(snapshot, log.log_id)
+            if department_id is not None:
+                units = [unit for unit in units
+                         if department_id in unit.department_ids]
+            if not units:
+                blocks.append(text_block("未评价"))
+                continue
+            for unit in units:
+                blocks.extend(self._evaluation_blocks(snapshot, unit))
         return blocks
 
     # ---- 三级文档装配 ----
@@ -233,40 +254,41 @@ class DailyDocuments:
             minister = people[department.minister_id]
             minister_folder = self._folder(day_folder,
                 f"{minister.name}_{department.department_id}")
-            backbones = sorted((person for person in snapshot.organization.persons
-                if person.active and person.role == "骨干学生"
-                and person.department_id == department.department_id),
-                key=lambda item: item.person_id)
+            dept_members = snapshot.organization.members_in_department(
+                department.department_id)
+            backbones = sorted((person for person, membership in dept_members
+                if membership.role == "骨干学生"), key=lambda item: item.person_id)
             group_members: dict[str, list[str]] = {}
             for backbone in backbones:
-                direct = sorted((person for person in snapshot.organization.persons
-                    if person.active and person.leader_id == backbone.person_id
-                    and person.role == "基层学生"), key=lambda item: item.person_id)
-                progress = snapshot.evaluators.get(backbone.person_id)
-                if progress and not progress.closed:
+                direct = sorted((person for person, membership in dept_members
+                    if membership.role == "基层学生"
+                    and membership.leader_id == backbone.person_id),
+                    key=lambda item: item.person_id)
+                if not units_closed_for(snapshot, backbone.person_id,
+                                        department.department_id):
                     continue
                 member_ids = [backbone.person_id,
                               *[person.person_id for person in direct]]
                 group_members[backbone.person_id] = member_ids
-                title = group_doc_title(target_date, backbone)
+                title = group_doc_title(target_date, department.name, backbone)
                 blocks = [text_block(title, heading=1)]
                 for index, person_id in enumerate(member_ids):
                     if index:
                         blocks.append(divider_block())
                     blocks.extend(self._person_blocks(
-                        snapshot, people[person_id], departments))
-                key = f"{target_date}:MEMBERS:{backbone.person_id}"
+                        snapshot, people[person_id], department,
+                        department.department_id))
+                key = f"{target_date}:MEMBERS:{department.department_id}:{backbone.person_id}"
                 backbone_folder = self._folder(minister_folder,
                     f"{backbone.name}_{backbone.person_id}")
                 result[key] = self._document(target_date, key, backbone_folder,
                     title, blocks, on_issue)
-            required = [progress for progress in snapshot.evaluators.values()
-                if progress.evaluator_id == department.minister_id
-                or people[progress.evaluator_id].department_id == department.department_id]
-            if any(not progress.closed for progress in required):
+            required = [unit for unit in snapshot.evaluation_units.values()
+                if department.department_id in unit.department_ids]
+            if any(unit.status != UnitStatus.CONFIRMED for unit in required):
                 continue
-            if any(f"{target_date}:MEMBERS:{person.person_id}" not in result
-                   for person in backbones):
+            if any(f"{target_date}:MEMBERS:{department.department_id}:{person.person_id}"
+                   not in result for person in backbones):
                 continue
             title = department_doc_title(target_date, department)
             blocks = [text_block(title, heading=1)]
@@ -278,9 +300,9 @@ class DailyDocuments:
                                                [backbone.person_id])
                 blocks.extend(self._stats_blocks(
                     snapshot, member_ids, "该小组提交情况", named=True))
-                child = result[f"{target_date}:MEMBERS:{backbone.person_id}"]
+                child = result[f"{target_date}:MEMBERS:{department.department_id}:{backbone.person_id}"]
                 blocks.append(text_block(
-                    f"【{group_doc_title(target_date, backbone)}】", link=child.url))
+                    f"【{group_doc_title(target_date, department.name, backbone)}】", link=child.url))
             key = f"{target_date}:DEPARTMENT:{department.department_id}"
             result[key] = self._document(target_date, key, minister_folder,
                 title, blocks, on_issue)
@@ -296,9 +318,9 @@ class DailyDocuments:
                 blocks.append(divider_block())
                 blocks.append(text_block(f"{minister.name}老师部门：", heading=3))
                 dept_ids = [person.person_id
-                            for person in snapshot.organization.persons
-                            if person.active and person.department_id == department.department_id
-                            and person.person_id in snapshot.submission_status]
+                            for person, _membership in snapshot.organization.members_in_department(
+                                department.department_id)
+                            if person.person_id in snapshot.submission_status]
                 blocks.extend(self._stats_blocks(
                     snapshot, dept_ids, "部门提交情况", named=False))
                 child = result[f"{target_date}:DEPARTMENT:{department.department_id}"]

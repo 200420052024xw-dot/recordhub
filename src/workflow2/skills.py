@@ -77,6 +77,8 @@ class MaterialScope(TextModel):
 class EvaluationText(TextModel):
     evaluator_id: str = Field(min_length=1)
     evaluator_role: str = Field(min_length=1)
+    department_ids: list[str] = Field(default_factory=list)
+    department_name: str = ""
     evaluated_at: datetime | None = None
     positive: str = ""
     improvement: str = ""
@@ -413,13 +415,20 @@ def _evaluation_text(record: TextRecord) -> str:
     reviews = record.evaluations
     if not reviews:
         return "无"
-    review = reviews[0]
-    parts = []
-    if review.positive.strip():
-        parts.append(f"肯定之处：{review.positive.strip()}")
-    if review.improvement.strip():
-        parts.append(f"改进之处：{review.improvement.strip()}")
-    return "\n".join(parts) or "无"
+    blocks = []
+    for review in reviews:
+        parts = []
+        if review.positive.strip():
+            parts.append(f"肯定之处：{review.positive.strip()}")
+        if review.improvement.strip():
+            parts.append(f"改进之处：{review.improvement.strip()}")
+        text = "\n".join(parts) or "无"
+        if len(reviews) > 1:
+            label = review.department_name or "、".join(review.department_ids)
+            if label:
+                text = f"{label}评价：\n{text}"
+        blocks.append(text)
+    return "\n".join(blocks)
 
 
 def _periodic_material(data: SkillInput, *, with_backbone: bool) -> str:

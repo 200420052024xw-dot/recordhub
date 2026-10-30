@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import sys
+from collections import defaultdict
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta
@@ -24,8 +25,9 @@ from tool.notifications import (NotificationPolicy, manual_delivery,
                                 manual_notifications, record_outcome, confirmed_unsent)
 from workflow1.documents import DailyDocuments
 from workflow1.evaluations import (AiEvaluationRepository, HumanEvaluationRepository,
-                                   review_day_datetime)
+                                   evaluation_table_for, review_day_datetime)
 from workflow1.reports import WorkflowReportRepository
+from workflow1.roster import RosterStore
 from workflow1.submission_statistics import SubmissionStatisticsRepository
 
 logger = logging.getLogger(__name__)
@@ -92,6 +94,7 @@ class Workflow1:
                  admin_open_id: str = "",
                  notifications: NotificationPolicy | None = None) -> None:
         self.store = store
+        self.roster = RosterStore(store.root)
         self.organization_cache = organization_cache
         self.log_repository = log_repository
         self.ai_evaluations = ai_evaluations
@@ -218,8 +221,10 @@ class Workflow1:
                         extra={"fields": {"workflow_run_id": run.workflow_run_id}})
             try:
                 snapshot = self.store.load_snapshot(target_date)
-                if snapshot is not None and snapshot.schema_version != 2:
+                if snapshot is not None and snapshot.schema_version != 3:
                     raise ValueError("旧版 Workflow1 快照不能按新流程续跑；请人工迁移该日期状态")
+                if snapshot is not None and not self.roster.exists(target_date):
+                    self.roster.save(snapshot)
                 pending_issues = self._flush_workbuddy_inbox(target_date)
                 if snapshot is None:
                     self.store.set_status(target_date, WorkflowStatus.SNAPSHOT_BUILDING)
@@ -233,6 +238,7 @@ class Workflow1:
                         workflow_run_id=run.workflow_run_id, target_date=target_date,
                         organization=organization, logs=logs, now=utc_now())
                     self.store.save_snapshot(snapshot)
+                    self.roster.save(snapshot)
                     self.store.set_status(target_date, WorkflowStatus.SNAPSHOT_READY)
                     for key, reason in read_issues.items():
                         self._record_issue(target_date, key, reason)
@@ -251,17 +257,20 @@ class Workflow1:
                     self._record_issue(target_date, key, reason)
                 def save_published(item: DailySnapshot) -> None:
                     for log_id, (record_id, evaluation_id) in mapped.items():
-                        item.log_evaluations[log_id].record_id = record_id
-                        item.log_evaluations[log_id].evaluation_id = evaluation_id
+                        state = item.ai_evaluations.get(log_id)
+                        if state is not None:
+                            state.record_id = record_id
+                            state.evaluation_id = evaluation_id
                     item.evaluations_published = all(
                         state.status not in {UnitStatus.PENDING, UnitStatus.RUNNING}
-                        for state in item.log_evaluations.values())
+                        for state in item.ai_evaluations.values())
                 if mapped or not snapshot.evaluations_published:
                     self.store.update_snapshot(target_date, save_published)
                 self.notify_evaluators_if_due(target_date)
                 self._reconcile_human(target_date)
                 if self._deadline_passed(target_date):
                     self._close_remaining(target_date)
+                    self.write_final_evaluations(target_date)
                 self.advance(target_date)
             except Exception as exc:
                 logger.exception("workflow1_failed date=%s", target_date)
@@ -280,10 +289,14 @@ class Workflow1:
 
     @staticmethod
     def _reset_failed(snapshot: DailySnapshot) -> None:
-        for state in snapshot.log_evaluations.values():
+        for state in snapshot.ai_evaluations.values():
             if state.status in {UnitStatus.FAILED, UnitStatus.RUNNING}:
                 state.status = UnitStatus.PENDING
                 state.error = None
+        for unit in snapshot.evaluation_units.values():
+            if unit.status in {UnitStatus.FAILED, UnitStatus.RUNNING}:
+                unit.status = UnitStatus.PENDING
+                unit.error = None
 
     def recover_incomplete(self) -> list[WorkflowRun]:
         # 启动恢复不重置 FAILED：只有显式调用 resume（重评接口）才会重跑失败项。
@@ -293,8 +306,8 @@ class Workflow1:
     def _process_logs(self, target_date: date) -> None:
         snapshot = self.store.load_snapshot(target_date)
         assert snapshot is not None
-        # FAILED 单元只能由 resume 接口显式重置，自动路径永不重评。
-        pending = [state for state in snapshot.log_evaluations.values()
+        # FAILED 的 AI 只能由 resume 接口显式重置，自动路径永不重评。
+        pending = [log_id for log_id, state in snapshot.ai_evaluations.items()
                    if state.status in {UnitStatus.PENDING, UnitStatus.RUNNING}]
         if limit := getattr(self, "batch_limit", None):
             pending = pending[:limit]
@@ -305,17 +318,33 @@ class Workflow1:
         if not builtin_template:
             raise ValueError(f"Workflow1 prompt 为空：{self.prompt_path}")
         logs = {log.log_id: log for log in snapshot.logs}
+        units_by_log: dict[str, list] = defaultdict(list)
+        for unit in snapshot.evaluation_units.values():
+            units_by_log[unit.log_id].append(unit)
+
+        def prompt_evaluator(log_id: str) -> str:
+            units = units_by_log.get(log_id, [])
+            if not units:
+                return ""
+            evaluator_ids = {unit.evaluator_id for unit in units}
+            person = snapshot.organization.person_map().get(units[0].person_id)
+            if person is not None:
+                for membership in person.membership_list():
+                    if membership.primary and membership.leader_id in evaluator_ids:
+                        return membership.leader_id or ""
+            return min(evaluator_ids)
 
         def process(log_id: str) -> tuple[str, str, str, str, str | None]:
-            state = snapshot.log_evaluations[log_id]
+            state = snapshot.ai_evaluations[log_id]
             log = logs[log_id]
-            selected = (self.prompt_repository.resolve("S01", state.evaluator_id)
-                        if self.prompt_repository and state.evaluator_id else None)
+            evaluator_id = prompt_evaluator(log_id)
+            selected = (self.prompt_repository.resolve("S01", evaluator_id)
+                        if self.prompt_repository and evaluator_id else None)
             template = selected.template if selected else builtin_template
             with diagnostic_context(workflow="workflow1", target_date=str(target_date),
-                                    log_id=log_id, person_id=state.person_id):
+                                    log_id=log_id, person_id=log.person_id):
                 prompt_input = LogPromptInput(target_date=target_date,
-                    person_id=state.person_id, log_id=log_id, log=log.content())
+                    person_id=log.person_id, log_id=log_id, log=log.content())
                 try:
                     output = self.prompt_service.execute(
                         prompt_code="LOG", template=template,
@@ -325,7 +354,7 @@ class Workflow1:
                         raise
                     logger.warning(
                         "personal_prompt_failed_fallback workflow=workflow1 log_id=%s "
-                        "user_id=%s record_id=%s", log_id, state.evaluator_id,
+                        "user_id=%s record_id=%s", log_id, evaluator_id,
                         selected.record_id, exc_info=True)
                     output = self.prompt_service.execute(
                         prompt_code="LOG", template=builtin_template,
@@ -338,48 +367,56 @@ class Workflow1:
         failures = []
         with ThreadPoolExecutor(max_workers=self.llm_concurrency) as pool:
             from contextvars import copy_context
-            futures = {pool.submit(copy_context().run, process, state.log_id): state.log_id
-                       for state in pending}
+            futures = {pool.submit(copy_context().run, process, log_id): log_id
+                       for log_id in pending}
             for future in as_completed(futures):
                 log_id = futures[future]
                 try:
                     _, positive, improvement, prompt_source, prompt_record_id = future.result()
                     def save(item: DailySnapshot) -> None:
-                        state = item.log_evaluations[log_id]
-                        state.positive_ai = state.positive_final = positive
-                        state.improvement_ai = state.improvement_final = improvement
+                        state = item.ai_evaluations[log_id]
+                        state.positive_ai = positive
+                        state.improvement_ai = improvement
                         state.prompt_source = prompt_source
                         state.prompt_record_id = prompt_record_id
                         state.status = (UnitStatus.WAITING_CONFIRMATION
-                            if state.evaluator_id else UnitStatus.CONFIRMED)
+                            if units_by_log.get(log_id) else UnitStatus.CONFIRMED)
                         # 飞书查找引用的“等于今天”按当天 00:00:00 精确比较。
-                        # AI 评价统一使用审核日零点；人工确认仍保留真实发生时间。
                         state.evaluated_at = review_day_datetime(target_date)
                         state.ai_evaluated_at = state.evaluated_at
                         if state.status == UnitStatus.CONFIRMED:
                             state.confirmed_at = state.evaluated_at
                         state.error = None
+                        for unit in item.evaluation_units.values():
+                            if unit.log_id != log_id:
+                                continue
+                            if unit.status in {UnitStatus.PENDING, UnitStatus.RUNNING}:
+                                unit.status = state.status
+                                unit.error = None
                     self.store.update_snapshot(target_date, save)
                 except Exception as exc:
                     failures.append(log_id)
                     unparsed = _unparsed_output(exc)
                     if unparsed:
-                        # 模型其实产出了内容，只是没法解析成两个字段：留着比丢掉强。
-                        # 这条是 warning 且不带 exc_info，不触发管理员告警。
                         logger.warning("workflow1_log_unparsed date=%s log_id=%s error=%s",
                                        target_date, log_id, error_summary(exc))
                         def degrade(item: DailySnapshot) -> None:
-                            state = item.log_evaluations[log_id]
-                            state.positive_ai = state.positive_final = unparsed
-                            state.improvement_ai = state.improvement_final = UNPARSED_IMPROVEMENT
+                            state = item.ai_evaluations[log_id]
+                            state.positive_ai = unparsed
+                            state.improvement_ai = UNPARSED_IMPROVEMENT
                             state.status = (UnitStatus.WAITING_CONFIRMATION
-                                if state.evaluator_id else UnitStatus.CONFIRMED)
+                                if units_by_log.get(log_id) else UnitStatus.CONFIRMED)
                             state.evaluated_at = review_day_datetime(target_date)
                             state.ai_evaluated_at = state.evaluated_at
                             if state.status == UnitStatus.CONFIRMED:
                                 state.confirmed_at = state.evaluated_at
                             state.error = error_summary(exc)
                             state.fallback = "unparsed"
+                            for unit in item.evaluation_units.values():
+                                if unit.log_id == log_id and unit.status in {
+                                        UnitStatus.PENDING, UnitStatus.RUNNING}:
+                                    unit.status = state.status
+                                    unit.error = state.error
                         self.store.update_snapshot(target_date, degrade)
                         self._record_issue(
                             target_date, f"log:{log_id}:ai-unparsed",
@@ -397,13 +434,13 @@ class Workflow1:
     def _defer_or_give_up(self, target_date: date, log_id: str, exc: Exception) -> None:
         """接口/网络失败的日志评价：延后重试，最多 llm_retry_limit 次；仍失败才报管理员。"""
         snapshot = self.store.load_snapshot(target_date)
-        current = snapshot.log_evaluations.get(log_id) if snapshot else None
+        current = snapshot.ai_evaluations.get(log_id) if snapshot else None
         attempt = (current.retry_count if current else 0) + 1
         reason = error_summary(exc)
         if attempt <= self.llm_retry_limit:
             retry_after = utc_now() + self.llm_retry_delay
             def defer(item: DailySnapshot) -> None:
-                state = item.log_evaluations[log_id]
+                state = item.ai_evaluations[log_id]
                 state.status = UnitStatus.FAILED
                 state.retry_count = attempt
                 state.retry_after = retry_after
@@ -415,11 +452,13 @@ class Workflow1:
                            retry_after, reason)
             return
         def give_up(item: DailySnapshot) -> None:
-            state = item.log_evaluations[log_id]
-            state.positive_ai = state.positive_final = FAILED_EVALUATION_TEXT
-            state.improvement_ai = state.improvement_final = FAILED_EVALUATION_TEXT
+            state = item.ai_evaluations[log_id]
+            state.positive_ai = FAILED_EVALUATION_TEXT
+            state.improvement_ai = FAILED_EVALUATION_TEXT
+            has_units = any(unit.log_id == log_id
+                            for unit in item.evaluation_units.values())
             state.status = (UnitStatus.WAITING_CONFIRMATION
-                if state.evaluator_id else UnitStatus.CONFIRMED)
+                if has_units else UnitStatus.CONFIRMED)
             state.evaluated_at = review_day_datetime(target_date)
             state.ai_evaluated_at = state.evaluated_at
             if state.status == UnitStatus.CONFIRMED:
@@ -427,6 +466,12 @@ class Workflow1:
             state.retry_after = None
             state.error = reason
             state.fallback = "failed"
+            for unit in item.evaluation_units.values():
+                if unit.log_id == log_id and unit.status in {
+                        UnitStatus.PENDING, UnitStatus.RUNNING}:
+                    unit.status = state.status
+                    unit.error = reason
+                    unit.fallback = "failed"
         self.store.update_snapshot(target_date, give_up)
         self._record_issue(
             target_date, f"log:{log_id}:ai-failed",
@@ -461,10 +506,10 @@ class Workflow1:
                     and not result.last_error
                     and snapshot is not None and snapshot.evaluations_published
                     and any(state.status == UnitStatus.WAITING_CONFIRMATION
-                            for state in snapshot.log_evaluations.values())
+                            for state in snapshot.evaluation_units.values())
                     and all(state.status in {UnitStatus.WAITING_CONFIRMATION, UnitStatus.CONFIRMED}
                             and not state.error and state.fallback != "failed"
-                            for state in snapshot.log_evaluations.values())
+                            for state in snapshot.evaluation_units.values())
                     and not self._deadline_passed(run.target_date)):
                 logger.info("workflow1_waiting_manual_confirmation date=%s", run.target_date)
                 continue
@@ -487,17 +532,21 @@ class Workflow1:
             snapshot = self.store.load_snapshot(target_date)
             if snapshot is None:
                 continue
-            due = {state.log_id for state in snapshot.log_evaluations.values()
+            due = {state.log_id for state in snapshot.ai_evaluations.values()
                    if state.status == UnitStatus.FAILED and state.retry_after
                    and state.retry_after <= now}
             if not due:
                 continue
             def reopen(item: DailySnapshot) -> None:
-                for state in item.log_evaluations.values():
+                for state in item.ai_evaluations.values():
                     if state.log_id in due:
                         state.status = UnitStatus.PENDING
                         state.retry_after = None
                         state.error = None
+                for unit in item.evaluation_units.values():
+                    if unit.log_id in due and unit.status == UnitStatus.FAILED:
+                        unit.status = UnitStatus.PENDING
+                        unit.error = None
             self.store.update_snapshot(target_date, reopen)
             logger.info("workflow1_evaluation_retry date=%s logs=%s",
                         target_date, sorted(due))
@@ -545,32 +594,54 @@ class Workflow1:
         snapshot = self.store.load_snapshot(target_date)
         assert snapshot is not None
         people = snapshot.organization.person_map()
+        departments = snapshot.organization.department_map()
+        # 按评价人 + 目标表单分组；表单由被评价人在该部门的角色决定。
+        groups: dict[tuple[str, str], list] = defaultdict(list)
+        for unit in snapshot.evaluation_units.values():
+            table_name = evaluation_table_for(unit, snapshot.organization)
+            groups[(unit.evaluator_id, table_name)].append(unit)
         for evaluator_id, progress in snapshot.evaluators.items():
-            if not progress.log_ids:
+            evaluator_groups = {table: units
+                                for (owner, table), units in groups.items()
+                                if owner == evaluator_id}
+            if not evaluator_groups:
                 self.store.update_snapshot(target_date,
                     lambda item: setattr(item.evaluators[evaluator_id], "closed", True))
                 continue
-            names = sorted({people[snapshot.log_evaluations[log_id].person_id].name
-                            for log_id in progress.log_ids})
-            key = f"{target_date}:FORM:{evaluator_id}"
+            legacy_key = f"{target_date}:FORM:{evaluator_id}"
+            legacy_sent = self.store.notification_sent(target_date, legacy_key)
             evaluator = people[evaluator_id]
-            form_url = self.review_form_urls.get(evaluator.role)
-            if not form_url:
-                raise ValueError(f"评价人「{evaluator.name}」的角色 {evaluator.role} 未配置审核表单")
             open_id = evaluator.open_id or ""
-            if open_id:
-                scope = "骨干" if evaluator.role == "部长" else "成员"
-                self._send_business_notification(target_date, key, open_id,
-                    f"{greeting(evaluator)}"
-                    f"请评价以下{scope} {date_cn(target_date)} 的工作日志"
-                    f"（共 {len(progress.log_ids)} 条）：\n{'、'.join(names)}"
-                    f"\n问卷：{form_url}")
-            else:
-                self._record_issue(
-                    target_date, f"person:{evaluator_id}:missing-open-id",
-                    f"评价人「{people[evaluator_id].name}」缺少 OpenID，"
-                    "问卷通知未发送，请补录")
-                record_outcome(key, "failed", error="评价人缺少 OpenID")
+            for table_name, units in sorted(evaluator_groups.items()):
+                form_key = "minister" if table_name == "human_evaluations" else "backbone"
+                key = f"{target_date}:FORM:{evaluator_id}:{form_key}"
+                if legacy_sent:
+                    # 升级当天已按旧 key 发过通知，不再重复打扰。
+                    continue
+                form_url = self.review_form_urls.get(
+                    "部长" if table_name == "human_evaluations" else "骨干学生", "")
+                if not form_url:
+                    raise ValueError(
+                        f"评价人「{evaluator.name}」的表单 {table_name} 未配置审核表单")
+                entries = sorted(
+                    (f"{departments[unit.department_ids[0]].name}·"
+                     f"{people[unit.person_id].name}"
+                     if unit.department_ids and unit.department_ids[0] in departments
+                     else people[unit.person_id].name)
+                    for unit in units)
+                if open_id:
+                    scope = "骨干" if table_name == "human_evaluations" else "成员"
+                    self._send_business_notification(target_date, key, open_id,
+                        f"{greeting(evaluator)}"
+                        f"请评价以下{scope} {date_cn(target_date)} 的工作日志"
+                        f"（共 {len(units)} 条）：\n{'、'.join(entries)}"
+                        f"\n问卷：{form_url}")
+                else:
+                    self._record_issue(
+                        target_date, f"person:{evaluator_id}:missing-open-id",
+                        f"评价人「{evaluator.name}」缺少 OpenID，"
+                        "问卷通知未发送，请补录")
+                    record_outcome(key, "failed", error="评价人缺少 OpenID")
             self.store.update_snapshot(target_date,
                 lambda item: setattr(item.evaluators[evaluator_id], "notified", True))
 
@@ -593,7 +664,7 @@ class Workflow1:
         if not snapshot.evaluations_published:
             return 0
         accepted = 0
-        parsed_records = {}
+        parsed_records: dict[str, object] = {}
         for record in self.human_evaluations.for_date(snapshot):
             parsed = self.human_evaluations.parse(snapshot, record)
             if parsed is None:
@@ -603,25 +674,28 @@ class Workflow1:
             if previous is not None and previous != evaluation:
                 raise ValueError(f"问卷结果评价编号重复且内容冲突：{key}")
             parsed_records[key] = evaluation
-        for evaluation in parsed_records.values():
-            log_id = evaluation.log_id
-            state = snapshot.log_evaluations[log_id]
-            if (state.source == "HUMAN" and state.positive_final == evaluation.positive
-                    and state.improvement_final == evaluation.improvement):
+        for key, evaluation in parsed_records.items():
+            unit = snapshot.evaluation_units.get(key)
+            if unit is None:
                 continue
-            progress = snapshot.evaluators[evaluation.evaluator_id]
-            if progress.closed:
+            if (unit.source == "HUMAN" and unit.positive_final == evaluation.positive
+                    and unit.improvement_final == evaluation.improvement):
                 continue
-            def save(item: DailySnapshot) -> None:
-                state = item.log_evaluations[log_id]
+            progress = snapshot.evaluators.get(evaluation.evaluator_id)
+            if progress is not None and progress.closed:
+                continue
+            def save(item: DailySnapshot, key=key, evaluation=evaluation) -> None:
+                state = item.evaluation_units[key]
                 state.positive_final = evaluation.positive
                 state.improvement_final = evaluation.improvement
                 state.source = "HUMAN"
                 state.status = UnitStatus.CONFIRMED
                 state.evaluated_at = utc_now()
                 state.confirmed_at = state.evaluated_at
+                state.error = None
+                state.fallback = ""
             self.store.update_snapshot(target_date, save)
-            snapshot.log_evaluations[log_id].source = "HUMAN"
+            snapshot.evaluation_units[key].source = "HUMAN"
             accepted += 1
         return accepted
 
@@ -640,23 +714,43 @@ class Workflow1:
         count = 0
         def close(snapshot: DailySnapshot) -> None:
             nonlocal count
+            for key, unit in snapshot.evaluation_units.items():
+                if unit.status == UnitStatus.FAILED:
+                    continue  # 失败项已在台账，标注由文档层呈现，不阻塞放行
+                if unit.status not in {UnitStatus.WAITING_CONFIRMATION,
+                                       UnitStatus.CONFIRMED}:
+                    raise ValueError(f"日志 {unit.log_id} 尚无有效 AI 评价")
+                if unit.status != UnitStatus.CONFIRMED:
+                    unit.status = UnitStatus.CONFIRMED
+                    unit.confirmed_at = utc_now()
+                    if unit.source != "HUMAN":
+                        unit.manual_skipped = True
+                    count += 1
             for progress in snapshot.evaluators.values():
-                for log_id in progress.log_ids:
-                    state = snapshot.log_evaluations[log_id]
-                    if state.status == UnitStatus.FAILED:
-                        continue  # 失败项已在台账，标注由文档层呈现，不阻塞放行
-                    if state.status not in {UnitStatus.WAITING_CONFIRMATION,
-                                            UnitStatus.CONFIRMED}:
-                        raise ValueError(f"日志 {log_id} 尚无有效 AI 评价")
-                    if state.status != UnitStatus.CONFIRMED:
-                        state.status = UnitStatus.CONFIRMED
-                        state.confirmed_at = utc_now()
-                        if state.source != "HUMAN":
-                            state.manual_skipped = True
-                        count += 1
                 progress.closed = True
         self.store.update_snapshot(target_date, close)
         return count
+
+    def write_final_evaluations(self, target_date: date) -> dict:
+        """把各日志的评价单元合并写回日志表「最终评价」；幂等，可补写。"""
+        with self._lock:
+            snapshot = self.store.load_snapshot(target_date)
+            if snapshot is None:
+                raise ValueError(f"{target_date} 缺少快照，不能写回最终评价")
+            written, issues = self.log_repository.write_final_evaluations(snapshot)
+            if written:
+                def save(item: DailySnapshot) -> None:
+                    item.final_evaluations.update(written)
+                    now = utc_now()
+                    for log_id in written:
+                        item.final_evaluations_written_at[log_id] = now
+                self.store.update_snapshot(target_date, save)
+            for key, reason in issues.items():
+                self._record_issue(target_date, key, reason)
+            logger.info("workflow1_final_evaluations_written date=%s written=%d issues=%d",
+                        target_date, len(written), len(issues))
+            return {"target_date": target_date.isoformat(),
+                    "written": len(written), "issues": issues}
 
     @workflow_diagnostics("workflow1")
     def finalize_pending_confirmations(self, target_date: date) -> dict:
@@ -680,23 +774,31 @@ class Workflow1:
                 if not all(progress.closed for progress in snapshot.evaluators.values()):
                     human = self._reconcile_human(target_date)
                 def fill_errors(item):
-                    for state in item.log_evaluations.values():
+                    for state in item.ai_evaluations.values():
                         if state.status in {UnitStatus.PENDING, UnitStatus.RUNNING, UnitStatus.FAILED}:
                             state.status = UnitStatus.WAITING_CONFIRMATION
-                            state.positive_ai = state.positive_final = "生成错误：" + (state.error or "截止前未生成评价")
-                            state.improvement_ai = state.improvement_final = "生成错误：评价缺失"
+                            state.positive_ai = "生成错误：" + (state.error or "截止前未生成评价")
+                            state.improvement_ai = "生成错误：评价缺失"
                             state.fallback = "failed"
                             state.retry_after = None
+                    for unit in item.evaluation_units.values():
+                        if unit.status in {UnitStatus.PENDING, UnitStatus.RUNNING, UnitStatus.FAILED}:
+                            unit.status = UnitStatus.WAITING_CONFIRMATION
+                            unit.fallback = "failed"
                     item.evaluations_published = True
                 self.store.update_snapshot(target_date, fill_errors)
                 stage = "close_remaining"
                 auto = self._close_remaining(target_date)
+                stage = "write_final_evaluations"
+                final = self.write_final_evaluations(target_date)
                 stage = "advance_documents_reports_notifications"
                 self.advance(target_date)
-                logger.info("workflow1_finalized date=%s human_confirmed=%d auto_confirmed=%d",
-                            target_date, human, auto)
+                logger.info("workflow1_finalized date=%s human_confirmed=%d auto_confirmed=%d "
+                            "final_written=%d",
+                            target_date, human, auto, final["written"])
                 return {"target_date": target_date.isoformat(),
                         "human_confirmed": human, "auto_confirmed": auto,
+                        "final_written": final["written"],
                         "errors": []}
             except Exception as exc:
                 logger.exception("workflow1_finalize_failed date=%s stage=%s error=%s",
@@ -712,7 +814,11 @@ class Workflow1:
             raise ValueError("Workflow1 仅处理人工评价表事件")
         if request.table_id != self.human_evaluations.tables[request.table_name].table_id:
             raise ValueError("人工评价表 ID 不匹配")
-        target_date = date.fromisoformat(request.business_key.split(":", 1)[0])
+        try:
+            target_date = date.fromisoformat(request.business_key.split(":", 1)[0])
+        except ValueError:
+            # 自动编号等非日期前缀的行：退回遍历未完成日期匹配。
+            target_date = None
         return self.handle_human_record(request.record_id, target_date=target_date,
                                         expected_key=request.business_key,
                                         table_id=request.table_id)
@@ -732,8 +838,8 @@ class Workflow1:
                 parsed = self.human_evaluations.parse(snapshot, record)
                 if parsed is None:
                     continue
-                if expected_key and parsed[0] != expected_key:
-                    raise ValueError("问卷事件与评价编号不一致")
+                # parse 返回的是评价单元键（log:evaluator），不再与
+                # 完整业务编号比较；记录本身的 evaluation_id 已在 parse 中校验。
                 accepted = self._reconcile_human(one_date)
                 return {"status": "confirmed" if accepted else "duplicate",
                         "business_key": parsed[0]}

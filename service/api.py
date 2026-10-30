@@ -422,7 +422,8 @@ def _make_lifespan(runtime: Runtime, settings: AppSettings, schedules: ScheduleC
             organization = runtime.organization_cache.refresh()
         except Exception:
             # Use the persisted organization cache if startup refresh fails.
-            if runtime.organization_cache.store.load_cache("organization") is None:
+            if runtime.organization_cache.store.load_cache(
+                    runtime.organization_cache.CACHE_KEY) is None:
                 raise
             logger.exception("organization_refresh_failed_using_persisted_cache")
             organization = runtime.organization_cache.get()

@@ -16,8 +16,10 @@ from tool.http import HttpTransport, UrllibTransport
 from tool.notifications import NotificationPolicy, capture_notifications
 from workflow1.documents import DailyDocuments
 from workflow1.evaluations import AiEvaluationRepository, HumanEvaluationRepository
+from workflow1.migration import migrate_snapshot
 from workflow1.models import DailySnapshot
 from workflow1.reports import WorkflowReportRepository
+from workflow1.roster import RosterStore
 from workflow1.submission_statistics import SubmissionStatisticsRepository
 from workflow1.settings import LogSubmitSettings, W1Settings
 from workflow1.workbuddy_inbox import LogSubmitService, WorkBuddyInbox
@@ -99,6 +101,7 @@ def build_runtime(settings: AppSettings) -> Runtime:
         settings.state_dir,
         workflow_type="workflow1",
         snapshot_model=DailySnapshot,
+        snapshot_migrator=migrate_snapshot,
     )
     organization_cache = OrganizationCache(
         store, OrganizationRepository(
@@ -147,6 +150,7 @@ def build_runtime(settings: AppSettings) -> Runtime:
         rebuilder=SnapshotRebuilder(
             infrastructure.bitable, tables, organization_cache, log_repository,
             auto_advance_at=w1.auto_advance_at,
+            roster_store=RosterStore(settings.state_dir),
         ),
         cursor_secret=settings.query_token,
     )
@@ -211,6 +215,7 @@ def build_runtime(settings: AppSettings) -> Runtime:
         preparer = MaterialPreparer(store, rebuilder=SnapshotRebuilder(
             infrastructure.bitable, tables, organization_cache, log_repository,
             auto_advance_at=w1.auto_advance_at,
+            roster_store=RosterStore(settings.state_dir),
         ))
         workflow2 = Workflow2(
             store=Workflow2Store(settings.state_dir), preparer=preparer,

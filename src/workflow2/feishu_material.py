@@ -23,8 +23,10 @@ from tool.bitable_fields import (SHANGHAI, alias_index, field_datetime,
                                   record_fields, record_submission_time,
                                   resolve_reference, scalar)
 from tool.feishu import BitableService
-from workflow1.models import (DailySnapshot, EvaluatorProgress,
+from workflow1.evaluations import parse_evaluation_key
+from workflow1.models import (AiEvaluationState, DailySnapshot, EvaluatorProgress,
                               LogEvaluationState, UnitStatus)
+from workflow1.units import unit_key
 
 _AI_SENTINEL = "\0ai\0"
 
@@ -33,26 +35,44 @@ class SnapshotRebuilder:
     def __init__(self, bitable: BitableService, tables: TableConfig,
                  organization_cache: OrganizationCache,
                  log_repository: LogRepository, *,
-                 auto_advance_at: str = "12:00") -> None:
+                 auto_advance_at: str = "12:00",
+                 roster_store=None) -> None:
         self.bitable = bitable
         self.tables = tables
         self.organization_cache = organization_cache
         self.log_repository = log_repository
         self.auto_advance_at = auto_advance_at
+        self.roster_store = roster_store
 
     def rebuild(self, start: date, end: date) -> dict[date, DailySnapshot]:
         organization = self.organization_cache.get()
-        logs_by_day = self.log_repository.logs_in_window(start, end, organization)
-        ai_rows = self._read_ai_rows(organization)
-        human_rows = self._read_human_rows(organization, ai_rows)
-        people = organization.person_map()
+        day_organizations: dict[date, Organization] = {}
+        day = start
+        while day <= end:
+            archived = (self.roster_store.load_organization(day)
+                        if self.roster_store is not None else None)
+            day_organizations[day] = archived or organization
+            day += timedelta(days=1)
+        # Historical people may already be deleted from the current tables;
+        # keep every roster person available for name/reference resolution.
+        persons = {person.person_id: person for person in organization.persons}
+        for archived in day_organizations.values():
+            for person in archived.persons:
+                persons.setdefault(person.person_id, person)
+        reader_organization = organization.model_copy(
+            update={"persons": list(persons.values())})
+        logs_by_day = self.log_repository.logs_in_window(
+            start, end, reader_organization)
+        ai_rows = self._read_ai_rows(reader_organization)
+        human_rows = self._read_human_rows(reader_organization, ai_rows)
         now = utc_now()
         rebuilt: dict[date, DailySnapshot] = {}
         day = start
         while day <= end:
+            day_organization = day_organizations[day]
             rebuilt[day] = self._assemble(
                 day, logs_by_day.get(day, ([], {}))[0], ai_rows, human_rows,
-                organization, people, now)
+                day_organization, day_organization.person_map(), now)
             day += timedelta(days=1)
         return rebuilt
 
@@ -60,15 +80,18 @@ class SnapshotRebuilder:
                   ai_rows: dict, human_rows: dict, organization: Organization,
                   people: dict, now: datetime) -> DailySnapshot:
         submission_status: dict[str, SubmissionStatus] = {}
-        log_evaluations: dict[str, LogEvaluationState] = {}
+        ai_evaluations: dict[str, AiEvaluationState] = {}
+        evaluation_units: dict[str, LogEvaluationState] = {}
         evaluators: dict[str, EvaluatorProgress] = {}
         logs_by_person: dict[str, WorkLog] = {log.person_id: log for log in logs}
-        eligible = sorted(
-            (person for person in people.values()
-             if person.active and person.role in {"基层学生", "骨干学生"}),
-            key=lambda person: person.person_id)
         auto_confirmed = self._deadline_passed(day, now)
-        for person in eligible:
+        for person in sorted(people.values(), key=lambda item: item.person_id):
+            if not person.active:
+                continue
+            memberships = [item for item in person.membership_list()
+                           if item.role in {"基层学生", "骨干学生"}]
+            if not memberships:
+                continue
             log = logs_by_person.get(person.person_id)
             if log is None:
                 submission_status[person.person_id] = SubmissionStatus(
@@ -77,55 +100,77 @@ class SnapshotRebuilder:
             submission_status[person.person_id] = SubmissionStatus(
                 person_id=person.person_id, submitted=True,
                 log_id=log.log_id, log_ids=[log.log_id])
-            state = LogEvaluationState(
-                log_id=log.log_id, person_id=person.person_id,
-                evaluator_id=person.leader_id or "", status=UnitStatus.WAITING_CONFIRMATION)
             ai_row = ai_rows.get((day, log.log_id))
+            ai_state = None
             if ai_row is not None and ai_row["person_id"] == person.person_id:
-                state.evaluator_id = ai_row["evaluator_id"]
-                state.record_id = ai_row["record_id"]
-                state.evaluation_id = ai_row["key"]
-                state.positive_ai = ai_row["positive"]
-                state.improvement_ai = ai_row["improvement"]
-                state.ai_evaluated_at = ai_row["evaluated_at"]
-                state.evaluated_at = ai_row["evaluated_at"]
-                human_row = human_rows.get((day, log.log_id))
-                finalized = self._finalize(human_row, ai_row)
+                ai_state = AiEvaluationState(
+                    log_id=log.log_id,
+                    status=UnitStatus.WAITING_CONFIRMATION,
+                    positive_ai=ai_row["positive"],
+                    improvement_ai=ai_row["improvement"],
+                    record_id=ai_row["record_id"],
+                    evaluation_id=ai_row["key"],
+                    evaluated_at=ai_row["evaluated_at"],
+                    ai_evaluated_at=ai_row["evaluated_at"],
+                )
+                ai_evaluations[log.log_id] = ai_state
+            by_evaluator: dict[str, list[str]] = {}
+            for membership in memberships:
+                if not membership.leader_id:
+                    continue
+                by_evaluator.setdefault(membership.leader_id, []).append(
+                    membership.department_id)
+            for evaluator_id, department_ids in by_evaluator.items():
+                unit = LogEvaluationState(
+                    log_id=log.log_id, person_id=person.person_id,
+                    evaluator_id=evaluator_id,
+                    department_ids=sorted(set(department_ids)),
+                    status=UnitStatus.WAITING_CONFIRMATION)
+                human_row = human_rows.get((day, log.log_id, evaluator_id))
+                finalized = self._finalize(human_row, ai_state)
                 if finalized is not None:
                     positive, improvement, evaluated_at = finalized
-                    state.positive_final = positive
-                    state.improvement_final = improvement
-                    state.source = "HUMAN"
-                    state.confirmed_at = evaluated_at or state.evaluated_at
-                    state.status = UnitStatus.CONFIRMED
-                elif auto_confirmed and ai_row["positive"] and ai_row["improvement"]:
-                    state.positive_final = ai_row["positive"]
-                    state.improvement_final = ai_row["improvement"]
-                    state.source = "AI"
-                    state.manual_skipped = True
-                    state.status = UnitStatus.CONFIRMED
-            log_evaluations[log.log_id] = state
-            if state.evaluator_id:
+                    unit.positive_final = positive
+                    unit.improvement_final = improvement
+                    unit.source = "HUMAN"
+                    unit.confirmed_at = evaluated_at or (
+                        ai_state.evaluated_at if ai_state else None)
+                    unit.status = UnitStatus.CONFIRMED
+                elif (auto_confirmed and ai_state is not None
+                      and ai_state.positive_ai and ai_state.improvement_ai):
+                    unit.source = "AI"
+                    unit.manual_skipped = True
+                    unit.status = UnitStatus.CONFIRMED
+                evaluation_units[unit_key(log.log_id, evaluator_id)] = unit
                 progress = evaluators.setdefault(
-                    state.evaluator_id,
-                    EvaluatorProgress(evaluator_id=state.evaluator_id))
-                progress.log_ids.append(log.log_id)
-                progress.closed = state.status == UnitStatus.CONFIRMED
+                    evaluator_id, EvaluatorProgress(evaluator_id=evaluator_id))
+                progress.unit_keys.append(unit_key(log.log_id, evaluator_id))
+                if log.log_id not in progress.log_ids:
+                    progress.log_ids.append(log.log_id)
+                progress.closed = progress.closed or unit.status == UnitStatus.CONFIRMED
+        for progress in evaluators.values():
+            progress.closed = all(
+                evaluation_units[key].status == UnitStatus.CONFIRMED
+                for key in progress.unit_keys if key in evaluation_units)
         return DailySnapshot(
-            schema_version=2, workflow_run_id=f"feishu-rebuild:{day.isoformat()}",
+            schema_version=3, workflow_run_id=f"feishu-rebuild:{day.isoformat()}",
             target_date=day, organization=organization, logs=logs,
-            submission_status=submission_status, log_evaluations=log_evaluations,
+            submission_status=submission_status,
+            ai_evaluations=ai_evaluations,
+            evaluation_units=evaluation_units,
             evaluators=evaluators, evaluations_published=True, issues={},
             created_at=now, updated_at=now)
 
     @staticmethod
-    def _finalize(human_row: dict | None, ai_row: dict) -> tuple[str, str, Any] | None:
+    def _finalize(human_row: dict | None,
+                  ai_state: AiEvaluationState | None) -> tuple[str, str, Any] | None:
         """Resolve the human row against the AI texts, mirroring W1 confirmation."""
-        if human_row is None or human_row["evaluator_id"] != ai_row["evaluator_id"]:
+        if human_row is None:
             return None
-        positive = ai_row["positive"] if human_row["positive"] == _AI_SENTINEL else human_row["positive"]
-        improvement = (ai_row["improvement"] if human_row["improvement"] == _AI_SENTINEL
-                       else human_row["improvement"])
+        positive = (ai_state.positive_ai if ai_state is not None else "") \
+            if human_row["positive"] == _AI_SENTINEL else human_row["positive"]
+        improvement = (ai_state.improvement_ai if ai_state is not None else "") \
+            if human_row["improvement"] == _AI_SENTINEL else human_row["improvement"]
         if not positive or not improvement:
             return None
         return positive, improvement, human_row["evaluated_at"]
@@ -157,7 +202,8 @@ class SnapshotRebuilder:
             if person.role == "基层学生" and person.active)
         for record in self.bitable.list_records(table.table_id):
             values = record_fields(record)
-            parts = self._eval_key(scalar(values.get(key_field)))
+            raw_key = scalar(values.get(key_field))
+            parts = parse_evaluation_key(raw_key)
             if parts is None:
                 continue  # 未填写 marker rows and malformed keys are never material
             day, evaluator_id, log_id = parts
@@ -165,32 +211,49 @@ class SnapshotRebuilder:
             legacy_ref = resolve_reference(values.get(f["person_ref"]), people)
             if name and legacy_ref and legacy_ref != basic_names.get(name):
                 continue
-            person_id = (basic_names.get(name, "") if name else
-                         legacy_ref)
+            person_id = (basic_names.get(name, "") if name else legacy_ref)
             if not person_id:
                 continue
-            rows.setdefault((day, log_id), {
-                "key": scalar(values.get(key_field)),
-                "evaluator_id": evaluator_id, "person_id": person_id,
+            row = {
+                "key": raw_key, "person_id": person_id,
                 "positive": scalar(values.get(f["positive_ai"])),
                 "improvement": scalar(values.get(f["improvement_ai"])),
                 "source_log": scalar(values.get(f["source_log"])),
                 "evaluated_at": self._timestamp(values.get(f.get("evaluated_at"))),
                 "record_id": str(record.get("record_id", "")) or None,
-            })
+            }
+            existing = rows.get((day, log_id))
+            if existing is None or self._ai_key_priority(evaluator_id) < \
+                    self._ai_key_priority(self._ai_key_evaluator(existing["key"])):
+                rows[(day, log_id)] = row
         return rows
 
+    @staticmethod
+    def _ai_key_evaluator(raw: str) -> str | None:
+        parts = parse_evaluation_key(raw)
+        return parts[1] if parts else None
+
+    @staticmethod
+    def _ai_key_priority(evaluator_id: str | None) -> tuple[int, str]:
+        # AI key (no evaluator) wins over legacy EVAL; among legacy rows the
+        # smallest evaluator id is stable and deterministic.
+        if evaluator_id is None:
+            return (0, "")
+        return (1, evaluator_id)
+
     def _read_human_rows(self, organization: Organization,
-                         ai_rows: dict[tuple[date, str], dict]) -> dict[tuple[date, str], dict]:
-        rows: dict[tuple[date, str], dict] = {}
+                         ai_rows: dict[tuple[date, str], dict],
+                         ) -> dict[tuple[date, str, str], dict]:
+        rows: dict[tuple[date, str, str], dict] = {}
         for table in human_evaluation_tables(self.tables).values():
             for key, value in self._read_human_table(table, organization, ai_rows).items():
                 rows.setdefault(key, value)
         return rows
 
     def _read_human_table(self, table, organization: Organization,
-                          ai_rows: dict[tuple[date, str], dict]) -> dict[tuple[date, str], dict]:
-        rows: dict[tuple[date, str], dict] = {}
+                          ai_rows: dict[tuple[date, str], dict],
+                          ) -> dict[tuple[date, str, str], dict]:
+        rows: dict[tuple[date, str, str], dict] = {}
         if table is None or not table.table_id.strip():
             return rows
         f = table.fields
@@ -211,26 +274,27 @@ class SnapshotRebuilder:
                              f.get("backbone_ref") or f.get("person_ref", "")), people))
             author_id = resolve_reference(values.get(f["submitted_by"]), people)
             original = scalar(values.get(f.get("source_log", ""))).strip()
-            parts = self._eval_key(scalar(values.get(f["evaluation_id"])))
-            if parts is None:
+            parts = parse_evaluation_key(scalar(values.get(f["evaluation_id"])))
+            if parts is not None:
+                day, evaluator_id, log_id = parts
+                if evaluator_id is None:
+                    continue  # AI key is not a human row key
+            else:
                 if ":EVAL:" in scalar(values.get(f["evaluation_id"])):
                     continue
                 evaluator_id = author_id
                 candidates = [(day, log_id) for (day, log_id), ai in ai_rows.items()
                               if ai["person_id"] == person_id
-                              and ai["evaluator_id"] == evaluator_id
                               and (not original or ai["source_log"] == original)
-                               and self._human_within_window(day, submitted_at)]
+                              and self._human_within_window(day, submitted_at)]
                 if len(candidates) != 1:
                     continue
                 day, log_id = candidates[0]
-            else:
-                day, evaluator_id, log_id = parts
             # A copied business key does not establish who submitted the form.
             # Check the same identities and source as the live daily workflow.
             ai = ai_rows.get((day, log_id))
             if (ai is None or ai["person_id"] != person_id
-                    or ai["evaluator_id"] != evaluator_id or author_id != evaluator_id
+                    or author_id != evaluator_id
                     or (original and ai["source_log"].strip() != original)):
                 continue
             reviewer = resolve_reference(values.get(f.get("evaluator_ref", "")), people)
@@ -242,7 +306,7 @@ class SnapshotRebuilder:
             improvement = self._final_text(values, f, "improvement_confirmed", "improvement_final")
             if positive is None or improvement is None:
                 continue  # half-filled or invalid rows never finalize
-            rows.setdefault((day, log_id), {
+            rows.setdefault((day, log_id, evaluator_id), {
                 "evaluator_id": evaluator_id, "positive": positive,
                 "improvement": improvement,
                 "evaluated_at": self._timestamp(values.get(f.get("evaluated_at"))),

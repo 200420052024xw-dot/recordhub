@@ -30,7 +30,6 @@ REQUIRED_FIELDS = {
         "leader_ref",
         "minister_ref",
         "department_ref",
-        "remark",
         "mobile",
     },
     "logs": {
@@ -74,6 +73,15 @@ REQUIRED_FIELDS = {
 }
 
 HUMAN_EVALUATION_TABLES = ("human_evaluations", "human_evaluations_backbone")
+
+# Tables that may be absent. When configured with a non-empty table_id they
+# must carry these field mappings; when absent/empty the single-department
+# fallback is used.
+OPTIONAL_TABLES = {
+    "person_departments": {
+        "person_ref", "role", "department_ref", "leader_ref",
+    },
+}
 
 
 def human_evaluation_tables(config: TableConfig) -> dict:
@@ -125,6 +133,24 @@ def load_table_config(path: str | Path) -> TableConfig:
             name
             for name in required_fields
             if not config.tables[table_name].fields[name].strip()
+        )
+        if empty_fields:
+            raise ValueError(
+                f"Feishu table {table_name} has empty field mappings: "
+                f"{', '.join(empty_fields)}"
+            )
+    for table_name, optional_fields in OPTIONAL_TABLES.items():
+        table = config.tables.get(table_name)
+        if table is None or not table.table_id.strip():
+            continue
+        missing_fields = sorted(optional_fields - set(table.fields))
+        if missing_fields:
+            raise ValueError(
+                f"Feishu table {table_name} is missing field mappings: "
+                f"{', '.join(missing_fields)}"
+            )
+        empty_fields = sorted(
+            name for name in optional_fields if not table.fields[name].strip()
         )
         if empty_fields:
             raise ValueError(

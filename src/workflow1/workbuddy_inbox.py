@@ -63,9 +63,36 @@ def _safe(value: str) -> str:
     return "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in value)
 
 
+_SCOPE_BY_ROLE = {"基层学生": "self", "骨干学生": "group",
+                  "部长": "department", "团队负责人": "all"}
+
+
+def _member_roles(person: Person) -> set[str]:
+    roles = {person.role} if person.role else set()
+    roles.update(item.role for item in person.membership_list())
+    return roles
+
+
 def _department_name(person: Person, organization: Organization) -> str:
     department = organization.department_map().get(person.department_id or "")
     return department.name if department else ""
+
+
+def _departments(person: Person, organization: Organization) -> list[dict[str, Any]]:
+    result = []
+    departments = organization.department_map()
+    for membership in person.membership_list():
+        department = departments.get(membership.department_id)
+        if department is None:
+            continue
+        result.append({
+            "department_id": membership.department_id,
+            "department_name": department.name,
+            "role": membership.role,
+            "primary": membership.primary,
+            "scope": _SCOPE_BY_ROLE.get(membership.role, "self"),
+        })
+    return result
 
 
 class WorkBuddyInbox:
@@ -144,12 +171,13 @@ class LogSubmitService:
                                name, [person.person_id for person in matches])
             return {"code": NO_PERSON, "name": name.strip()}
         person = matches[0]
-        if person.role not in SUPPORTED_ROLES:
+        if not (_member_roles(person) & set(SUPPORTED_ROLES)):
             return {"code": ROLE_NOT_SUPPORTED, "person_id": person.person_id,
                     "name": person.name, "role": person.role}
         return {"code": OK, "person_id": person.person_id, "name": person.name,
                 "role": person.role,
                 "department_name": _department_name(person, organization),
+                "departments": _departments(person, organization),
                 "submit_window": self.submit_window(),
                 "fallback_form_url": self.fallback_form_url}
 
@@ -222,7 +250,7 @@ class LogSubmitService:
                                    name, [person.person_id for person in matches])
                 return None, {"code": NO_PERSON, "name": name}
             person = matches[0]
-        if person.role not in SUPPORTED_ROLES:
+        if not (_member_roles(person) & set(SUPPORTED_ROLES)):
             return None, {"code": ROLE_NOT_SUPPORTED, "person_id": person.person_id,
                           "name": person.name, "role": person.role}
         return person, None

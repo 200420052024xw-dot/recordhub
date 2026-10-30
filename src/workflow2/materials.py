@@ -4,6 +4,7 @@ from datetime import date, timedelta
 
 from data.store import FileStateStore
 from workflow1.models import UnitStatus
+from workflow1.units import effective_text, units_for_log
 from workflow2.models import MaterialStatistics, PreparedMaterial
 from workflow2.skills import AvailableResource, EvaluationText, MaterialScope, SkillInput, TextRecord
 
@@ -71,18 +72,31 @@ class MaterialPreparer:
             if snapshot is None:
                 missing.append(f"{day} 每日检查快照缺失")
                 continue
-            if snapshot.schema_version != 2:
+            if snapshot.schema_version != 3:
                 missing.append(f"{day} 每日检查快照需迁移")
                 continue
             people = snapshot.organization.person_map()
             departments = snapshot.organization.department_map()
             member_set = set(member_filter) if member_filter else None
-            eligible = sorted((person for person in people.values()
-                if person.active and person.department_id in department_ids
-                and person.role in {"基层学生", "骨干学生"}
-                and (member_set is None or person.person_id in member_set)),
-                key=lambda person: person.person_id)
-            for person in eligible:
+            team_scope = len(department_ids) > 1
+            selected: list[tuple[object, object]] = []
+            for person in sorted(people.values(), key=lambda item: item.person_id):
+                if not person.active:
+                    continue
+                if member_set is not None and person.person_id not in member_set:
+                    continue
+                memberships = [item for item in person.membership_list()
+                               if item.department_id in department_ids
+                               and item.role in {"基层学生", "骨干学生"}]
+                if not memberships:
+                    continue
+                # 每次 prepare 内每人每天只能生成一条记录，避免 record_id 冲突；
+                # 多部门批次优先主部门，否则取排序后的第一个部门。
+                membership = (next((item for item in memberships if item.primary),
+                                   sorted(memberships, key=lambda item: item.department_id)[0])
+                              if team_scope else memberships[0])
+                selected.append((person, membership))
+            for person, membership in selected:
                 expected.add((day, person.person_id))
                 status = snapshot.submission_status.get(person.person_id)
                 if status is None:
@@ -93,10 +107,12 @@ class MaterialPreparer:
                 if bool(logs) != status.submitted or set(status.log_ids) != {log.log_id for log in logs}:
                     missing.append(f"{day} {person.person_id} 日志与提交核算不一致")
                     continue
+                department = departments.get(membership.department_id)
                 common = dict(person_id=person.person_id, name=person.name,
-                    department_id=person.department_id,
-                    department_name=departments[person.department_id].name,
-                    role=person.role, work_start=day, work_end=day)
+                    department_id=membership.department_id,
+                    department_name=(department.name if department
+                                     else membership.department_id),
+                    role=membership.role, work_start=day, work_end=day)
                 if not logs:
                     record = TextRecord(record_id=f"missing:{day}:{person.person_id}",
                                         submitted=False, confirmed=True, **common)
@@ -104,40 +120,50 @@ class MaterialPreparer:
                     continue
                 submitted.add((day, person.person_id))
                 for log in logs:
-                    state = snapshot.log_evaluations.get(log.log_id)
-                    confirmed = state is not None and state.status == UnitStatus.CONFIRMED
+                    units = units_for_log(snapshot, log.log_id)
+                    if not team_scope:
+                        units = [unit for unit in units
+                                 if membership.department_id in unit.department_ids]
+                    confirmed = bool(units) and all(
+                        unit.status == UnitStatus.CONFIRMED for unit in units)
                     reviews: list[EvaluationText] = []
                     # 不带评价的材料（S04）只要求日志原文：日志当天归档，
                     # 评价却要等到次日人工确认，等它会让阶段汇总无谓地推迟一天。
                     if with_evaluations:
-                        if state is None or state.status not in {UnitStatus.WAITING_CONFIRMATION, UnitStatus.CONFIRMED}:
+                        if not units:
                             missing.append(f"{day} 日志 {log.log_id} 生成错误：无可用评价")
-                            state = None
-                        elif (state.person_id != person.person_id or state.log_id != log.log_id
-                                or state.evaluator_id != person.leader_id):
-                            missing.append(f"{day} 日志 {log.log_id} 的评价身份与当日组织关系不一致")
-                            state = None
-                        if state and not (state.positive_final or state.positive_ai):
-                            missing.append(f"{day} 日志 {log.log_id} 缺少最终评价")
-                        evaluator = people.get(state.evaluator_id) if state else None
-                        if state and evaluator is None:
-                            missing.append(f"{day} 日志 {log.log_id} 评价人缺失")
-                        # Only the effective (finalized) evaluation reaches the Skills:
-                        # the human text when the evaluator edited it, otherwise the AI text.
-                        if state and evaluator and state.source == "HUMAN":
-                            reviews = [EvaluationText(evaluator_id=evaluator.person_id,
+                        for unit in units:
+                            evaluator = people.get(unit.evaluator_id)
+                            if unit.status not in {UnitStatus.WAITING_CONFIRMATION,
+                                                   UnitStatus.CONFIRMED}:
+                                missing.append(f"{day} 日志 {log.log_id} 生成错误：无可用评价")
+                                continue
+                            source, positive, improvement = effective_text(snapshot, unit)
+                            if source == "FAILED":
+                                missing.append(f"{day} 日志 {log.log_id} 缺少最终评价")
+                                continue
+                            if evaluator is None:
+                                missing.append(f"{day} 日志 {log.log_id} 评价人缺失")
+                                continue
+                            review = EvaluationText(
+                                evaluator_id=evaluator.person_id,
                                 evaluator_role=evaluator.role,
-                                evaluated_at=state.confirmed_at or state.evaluated_at,
-                                positive=state.positive_final or "", improvement=state.improvement_final or "",
-                                source="HUMAN")]
-                        elif state and evaluator and state.positive_ai and state.improvement_ai:
-                            reviews = [EvaluationText(evaluator_id=evaluator.person_id,
-                                evaluator_role=evaluator.role,
-                                evaluated_at=state.ai_evaluated_at or state.evaluated_at,
-                                positive=state.positive_ai or state.positive_final or "",
-                                improvement=state.improvement_ai or state.improvement_final or "",
-                                source="AI")]
-                        reviews = _without_placeholders(reviews, state.fallback if state else "")
+                                evaluated_at=unit.confirmed_at or unit.evaluated_at,
+                                positive=positive, improvement=improvement,
+                                source=source,
+                                department_ids=list(unit.department_ids),
+                                department_name=departments[
+                                    unit.department_ids[0]].name
+                                if unit.department_ids and unit.department_ids[0] in departments
+                                else "")
+                            if source == "AI":
+                                ai_state = snapshot.ai_evaluations.get(unit.log_id)
+                                cleaned = _without_placeholders(
+                                    [review], ai_state.fallback if ai_state else "")
+                                if not cleaned:
+                                    continue
+                                review = cleaned[0]
+                            reviews.append(review)
                     record = TextRecord(record_id=log.source_record_id or log.log_id,
                         confirmed=confirmed, progress=log.progress, difficulties=log.difficulties,
                         reflection=log.reflection, other=log.other, full_log=log.full_log,

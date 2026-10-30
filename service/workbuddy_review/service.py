@@ -21,12 +21,13 @@ from schema import TableConfig
 from schema.domain import Organization, Person
 from service.workbuddy_query.cursor import decode_cursor, encode_cursor
 from service.workbuddy_query.models import QueryError
-from service.workbuddy_query.permissions import ROLE_MINISTER
+from service.workbuddy_query.permissions import ROLE_MINISTER, member_roles
 from tool.bitable_fields import (alias_index, field_datetime, record_fields,
                                  record_submission_time, references,
                                  resolve_reference, scalar)
 from tool.feishu import BitableService
 from workflow1.models import DailySnapshot, LogEvaluationState, UnitStatus
+from workflow1.units import ai_for, evaluation_table_for, unit_key, units_for_evaluator
 
 from service.workbuddy_review.models import (
     CLOSED,
@@ -202,43 +203,53 @@ class ReviewService:
     # --------------------------------------------------------- 日志评价队列
 
     def _pending_logs(self, person: Person, today: date) -> tuple[list[dict], list[dict]]:
-        """审核日看昨天日志的 AI 评价快照，取「等人工确认」的。"""
+        """审核日看昨天日志的 AI 评价快照，按评价单元取「等人工确认」的。"""
         snapshot = self.snapshot_store.load_snapshot(today - timedelta(days=1))
         if snapshot is None:
             return [], []
         people = snapshot.organization.person_map()
-        progress = snapshot.evaluators.get(person.person_id)
+        departments = snapshot.organization.department_map()
         items: list[dict] = []
-        if progress is not None:
-            logs = {log.log_id: log for log in snapshot.logs}
-            for log_id in progress.log_ids:
-                state = snapshot.log_evaluations.get(log_id)
-                log = logs.get(log_id)
-                if state is None or log is None:
-                    continue
-                if state.status != UnitStatus.WAITING_CONFIRMATION:
-                    continue
-                items.append(self._log_item(log, state, people, snapshot.target_date))
+        for unit in units_for_evaluator(snapshot, person.person_id):
+            if unit.status != UnitStatus.WAITING_CONFIRMATION:
+                continue
+            log = next((item for item in snapshot.logs
+                        if item.log_id == unit.log_id), None)
+            if log is None:
+                continue
+            items.append(self._log_item(log, unit, ai_for(snapshot, unit.log_id),
+                                        people, departments, snapshot.target_date))
+        items.sort(key=lambda item: item["item_id"])
         return items, self._missing(snapshot, people, person)
 
     @staticmethod
-    def _log_item(log, state: LogEvaluationState, people: dict,
-                  target_date: date) -> dict:
-        person = people.get(log.person_id)
-        failed = state.fallback == "failed"
+    def _log_item(log, unit: LogEvaluationState, ai_state, people: dict,
+                  departments: dict, target_date: date) -> dict:
+        person = people.get(unit.person_id)
+        evaluator = people.get(unit.evaluator_id)
+        failed = unit.fallback == "failed" or ai_state is None or ai_state.fallback == "failed"
+        department_names = []
+        for department_id in unit.department_ids:
+            department = departments.get(department_id)
+            department_names.append(department.name if department else department_id)
         item: dict = {
-            "item_id": log.log_id,
+            "item_id": f"{log.log_id}:{unit.evaluator_id}",
             "kind": "log_evaluation",
             "date": target_date.isoformat(),
             "name": person.name if person else log.person_id,
             "log": {"progress": log.progress, "difficulties": log.difficulties,
                     "reflection": log.reflection, "other": log.other},
             "ai_status": "failed" if failed else "ok",
+            "department_id": unit.department_ids[0] if unit.department_ids else "",
+            "department_name": department_names[0] if department_names else "",
+            "departments": department_names,
+            "evaluator_role": evaluator.role if evaluator else "",
+            "subject_role": person.role if person else "",
         }
-        if not failed:
+        if not failed and ai_state is not None:
             # 生成失败的条目没有 AI 原文可念，让老师现场说。
-            item["positive"] = state.positive_ai or ""
-            item["improvement"] = state.improvement_ai or ""
+            item["positive"] = ai_state.positive_ai or ""
+            item["improvement"] = ai_state.improvement_ai or ""
         return item
 
     @staticmethod
@@ -260,7 +271,7 @@ class ReviewService:
     def _pending_reports(self, person: Person, kind: str,
                          today: date) -> tuple[list[dict], list[dict]]:
         """报告类只由部长确认：读本部门草稿表里还没确认的那一份。"""
-        if person.role != ROLE_MINISTER:
+        if ROLE_MINISTER not in member_roles(person):
             return [], []
         items = [item for item, owner in self._report_rows(kind)
                  if owner == person.person_id]
@@ -298,8 +309,10 @@ class ReviewService:
             if day is None or not sections:
                 continue
             minister = people.get(owner)
-            department = (departments.get(minister.department_id or "")
-                          if minister else None)
+            department_id = (task_id.rsplit(":", 1)[-1]
+                             if ":" in task_id else
+                             (minister.department_id if minister else None))
+            department = departments.get(department_id or "")
             name = (department.name if department
                     else (minister.name if minister else owner))
             item = {"item_id": task_id, "kind": _ITEM_KIND[kind],
@@ -361,16 +374,24 @@ class ReviewService:
         review_day = log_date + timedelta(days=1)
         written = 0
         for document in self.inbox.documents(KIND_LOG):
-            for log_id, payload in (document.get("items") or {}).items():
-                state = snapshot.log_evaluations.get(log_id)
-                if state is None or log_id not in logs:
+            reviewer_id = str(document.get("reviewer_id") or "")
+            for item_id, payload in (document.get("items") or {}).items():
+                log_id, separator, evaluator_id = item_id.rpartition(":")
+                if separator and log_id:
+                    unit = snapshot.evaluation_units.get(
+                        unit_key(log_id, evaluator_id))
+                else:
+                    # legacy item_id = log_id；按暂存文件里的审核人定位单元。
+                    unit = next((candidate for candidate in snapshot.evaluation_units.values()
+                                 if candidate.log_id == item_id
+                                 and candidate.evaluator_id == reviewer_id), None)
+                if unit is None or unit.log_id not in logs:
                     continue
-                person = people.get(state.person_id)
-                evaluator = people.get(state.evaluator_id)
+                person = people.get(unit.person_id)
+                evaluator = people.get(unit.evaluator_id)
                 if person is None or evaluator is None:
                     continue
-                table_name = ("human_evaluations" if person.role == "骨干学生"
-                              else "human_evaluations_backbone")
+                table_name = evaluation_table_for(unit, snapshot.organization)
                 fields = self._log_row(table_name, person, evaluator, payload)
                 if self._upsert_log_row(table_name, person, evaluator, review_day,
                                         fields, payload):
@@ -538,14 +559,24 @@ class ReviewService:
         snapshot = self.snapshot_store.load_snapshot(today - timedelta(days=1))
         if snapshot is None:
             return None
-        state = snapshot.log_evaluations.get(item_id)
-        if state is None or state.status != UnitStatus.WAITING_CONFIRMATION:
+        log_id, separator, evaluator_id = item_id.rpartition(":")
+        if separator and log_id:
+            unit = snapshot.evaluation_units.get(unit_key(log_id, evaluator_id))
+        else:
+            # legacy: item_id is the raw log id; 单评价人时代直接按 log_id 找。
+            candidates = [unit for unit in snapshot.evaluation_units.values()
+                          if unit.log_id == item_id]
+            unit = candidates[0] if len(candidates) == 1 else None
+        if unit is None or unit.status != UnitStatus.WAITING_CONFIRMATION:
             return None
-        log = next((item for item in snapshot.logs if item.log_id == item_id), None)
+        log = next((item for item in snapshot.logs if item.log_id == unit.log_id), None)
         if log is None:
             return None
         people = snapshot.organization.person_map()
-        return self._log_item(log, state, people, snapshot.target_date), state.evaluator_id
+        departments = snapshot.organization.department_map()
+        item = self._log_item(log, unit, ai_for(snapshot, unit.log_id),
+                              people, departments, snapshot.target_date)
+        return item, unit.evaluator_id
 
     def _lookup_report(self, kind: str, item_id: str, today: date) -> tuple[dict, str] | None:
         for item, owner in self._report_rows(kind):

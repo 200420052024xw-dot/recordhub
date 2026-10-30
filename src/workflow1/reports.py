@@ -66,6 +66,7 @@ class WorkflowReportRepository:
             parts = key.split(":", 2)
             scope = parts[1]
             scope_id = parts[2] if len(parts) > 2 else "TEAM"
+            role = None
             if scope == "TEAM":
                 person_id = snapshot.organization.team_leader_id
                 title = f"{snapshot.target_date:%m-%d} 团队日志"
@@ -74,9 +75,24 @@ class WorkflowReportRepository:
                 person_id = department.minister_id
                 title = f"{snapshot.target_date:%m-%d} {department.name}日志"
             else:
-                person_id = scope_id
-                title = (f"{snapshot.target_date:%m-%d} "
-                         f"{people[scope_id].name}同学小组日志")
+                sub = scope_id.split(":", 1)
+                if len(sub) == 2:
+                    # 4-part key: {date}:MEMBERS:{department_id}:{backbone_id}
+                    department_id, backbone_id = sub
+                    backbone = people.get(backbone_id)
+                    department = departments.get(department_id)
+                    membership = (snapshot.organization.membership(backbone_id, department_id)
+                                  if backbone else None)
+                    role = membership.role if membership is not None else (
+                        backbone.role if backbone else "骨干学生")
+                    dept_name = department.name if department else department_id
+                    person_id = backbone_id
+                    title = (f"{snapshot.target_date:%m-%d} "
+                             f"{dept_name}·{backbone.name if backbone else backbone_id}同学小组日志")
+                else:
+                    person_id = scope_id
+                    title = (f"{snapshot.target_date:%m-%d} "
+                             f"{people[scope_id].name}同学小组日志")
             if not person_id:
                 raise ValueError(f"报告 {key} 缺少报告人")
             if not people[person_id].open_id:
@@ -86,7 +102,7 @@ class WorkflowReportRepository:
                 continue
             fields = {
                 f["reporter_ref"]: [{"id": people[person_id].open_id}],
-                f["role"]: people[person_id].role,
+                f["role"]: role or people[person_id].role,
                 f["reported_at"]: int(datetime.now().timestamp() * 1000),
             }
             if url_type:
