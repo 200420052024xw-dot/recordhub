@@ -46,6 +46,8 @@ RecordHub 把「学生写日志 → 骨干/部长评价 → 部门汇总 → 团
 
 ## 架构
 
+完整的业务组织架构、系统分层、流程、部署拓扑和数据模型图见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，其中包含可直接用于汇报的 PNG 图片。
+
 ```text
 飞书开放平台                          DeepSeek
   │  Bitable / 消息 / 长连接事件          │  Chat Completions
