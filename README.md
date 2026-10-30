@@ -274,8 +274,10 @@ python -m unittest discover -s tests -v
 
 ## 安全与数据
 
-- `.env`、`config/tables.toml` 中的真实表 ID、`docs/` 下的交付文档、`data/state/`、`logs/`、`data/backups/` 均不应提交到公开仓库。
-- `data/backups/` 中的名单导入备份可能包含姓名、手机号等个人信息，已在 `.gitignore` 中排除；不要用 `git add -f` 强行加入。
+- `.env`（密钥）、`data/state/`、`logs/`、`data/backups/` 不应提交；它们已在 `.gitignore` 中排除。
+- `data/backups/` 中的名单导入备份可能包含姓名、手机号等个人信息，不要用 `git add -f` 强行加入。
+- `docs/` 下的交付文档可能包含接口 Token，部署分支已在 `.gitignore` 中整体排除。
+- `config/tables.toml` 保存真实表 ID 和字段名，本身不是凭证。如果仓库需要对外公开，建议只保留空白的 `config/tables.example.toml`，部署时在本地生成 `config/tables.toml`；注意它一旦进入过 Git 历史，删除当前文件并不能抹掉历史内容。
 - 接口 Token 按入口隔离：管理员、确认回调、提交、查询、批改各用各的 Token；泄露一个不会直接拿到 `/admin`。
 - 大模型只接收业务所需文本；告警分析提示词明确把资料当数据而非指令。
 
